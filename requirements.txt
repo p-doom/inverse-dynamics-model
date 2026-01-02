@@ -1,0 +1,6 @@
+huggingface_hub
+pandas
+opencv-python
+pillow
+torch
+torchvision
