@@ -30,10 +30,8 @@ def get_dataloaders(data_root, batch_size, seq_len, frame_mode="diff", is_distri
     train_videos = all_videos[:split_idx]
     val_videos = all_videos[split_idx:]
 
-    predecoded_root = "/data"
-
-    train_ds = SequenceDataset(train_videos, data_root, seq_len, frame_mode, predecoded_root=predecoded_root)
-    val_ds = SequenceDataset(val_videos, data_root, seq_len, frame_mode, predecoded_root=predecoded_root)
+    train_ds = SequenceDataset(train_videos, data_root, seq_len, frame_mode, predecoded_root=data_root)
+    val_ds = SequenceDataset(val_videos, data_root, seq_len, frame_mode, predecoded_root=data_root)
 
     train_sampler = DistributedSampler(train_ds) if is_distributed else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if is_distributed else None
@@ -147,4 +145,4 @@ class SequenceDataset(Dataset):
 
         actions = torch.from_numpy(action_all[local_idx : local_idx + self.seq_len])
 
-        return {"frames": frames, "actions": actions}
+        return {"frames": frames, "actions": actions, "video_path": str(v_path), "start_idx": local_idx}
