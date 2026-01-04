@@ -10,6 +10,7 @@ import json
 
 from sequence_dataset import get_dataloaders, ACTION_DICT
 from idm_video import KeystrokeIDM
+from utils import compute_training_accuracy
 
 NUM_ACTIONS = len(ACTION_DICT)
 
@@ -25,62 +26,6 @@ def setup_dist():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
-
-def get_acc(metrics, conf_matrix, data_loader, local_rank):
-    avg_loss = metrics[0] / (len(data_loader) * dist.get_world_size())
-    avg_acc = metrics[1] / metrics[2]
-
-    if dist.get_rank() == 0:
-        print("\nPer-Class Accuracy:")
-        for c in range(NUM_ACTIONS):
-            gt_total = conf_matrix[c].sum().item()
-            correct_c = conf_matrix[c,c].item()
-            acc_c = correct_c / gt_total if gt_total > 0 else 0.0
-            print(f"  class {c:2d}: {acc_c:6.2%}  ({int(correct_c)}/{int(gt_total)})")
-    return avg_loss, avg_acc
-
-def log_val_predictions(model, val_loader, device, local_rank, epoch, log_path="val_predictions.jsonl"):
-    model.eval()
-    all_predictions = []
-    
-    global_rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    
-    with torch.no_grad():
-        for batch in val_loader:
-            frames = batch["frames"].to(device, non_blocking=True).float()
-            targets = batch["actions"].to(device, non_blocking=True).long()
-            video_paths = batch["video_path"]
-            start_indices = batch["start_idx"]
-            
-            logits = model(frames)
-            preds = logits.argmax(dim=-1) 
-            
-            preds_cpu = preds.cpu().tolist()
-            targets_cpu = targets.cpu().tolist()
-            
-            for i in range(len(video_paths)):
-                all_predictions.append({
-                    "video_path": video_paths[i],
-                    "start_idx": start_indices[i].item() if torch.is_tensor(start_indices[i]) else start_indices[i],
-                    "predictions": preds_cpu[i],
-                    "targets": targets_cpu[i],
-                })
-    
-    if world_size > 1:
-        if global_rank == 0:
-            gathered_results = [None] * world_size
-            dist.gather_object(all_predictions, object_gather_list=gathered_results, dst=0)
-            all_predictions = [item for sublist in gathered_results for item in sublist]
-        else:
-            dist.gather_object(all_predictions, dst=0)
-    
-    if global_rank == 0:
-        with open(log_path, 'a') as f:
-            f.write(f"# Epoch {epoch + 1}\n")
-            for pred_entry in all_predictions:
-                f.write(json.dumps(pred_entry) + "\n")
-        print(f"Logged {len(all_predictions)} validation predictions to {log_path}")
 
 
 def train(model, dataloader, criterion, optimizer, scheduler, device, local_rank):
@@ -129,7 +74,7 @@ def train(model, dataloader, criterion, optimizer, scheduler, device, local_rank
     dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
     dist.all_reduce(conf_matrix, op=dist.ReduceOp.SUM)
 
-    avg_loss, avg_acc = get_acc(metrics, conf_matrix, dataloader, local_rank)
+    avg_loss, avg_acc = compute_training_accuracy(metrics, conf_matrix, dataloader, local_rank, NUM_ACTIONS)
 
     return avg_loss, avg_acc
 
@@ -169,7 +114,7 @@ def validate(model, val_loader, criterion, device, local_rank):
     dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
     dist.all_reduce(conf_matrix, op=dist.ReduceOp.SUM)
 
-    avg_loss, avg_acc = get_acc(metrics, conf_matrix, val_loader, local_rank)
+    avg_loss, avg_acc = compute_training_accuracy(metrics, conf_matrix, val_loader, local_rank, NUM_ACTIONS)
 
     return avg_loss, avg_acc
 
@@ -202,12 +147,11 @@ if __name__ == "__main__":
         print(f"Model Rank 0: {num_params:,} parameters")
 
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-    
     total_steps = len(train_loader) * EPOCHS
     scheduler = OneCycleLR(optimizer, max_lr=LR,  total_steps=total_steps, pct_start=0.1, anneal_strategy='cos')
     
     # NOTE: should be calculated from loaders
-    counts = torch.tensor([48775, 296828, 565192, 170724, 179830, 14303, 1334684, 14661, 539], dtype=torch.float)
+    counts = torch.tensor([2000000, 48775, 296828, 565192, 170724, 179830, 14303, 1334684, 14661, 539], dtype=torch.float)
     weights = 1.0 / torch.sqrt(counts + 1) 
     weights = weights / weights.sum() * len(counts)
     weights = weights.to(device)
@@ -220,20 +164,19 @@ if __name__ == "__main__":
         train_loss, train_acc = train(model, train_loader, criterion, optimizer, scheduler, device, local_rank)
         val_loss, val_acc = validate(model, val_loader, criterion, device, local_rank)
 
-        #log_val_predictions(model, val_loader, device, local_rank, epoch)
-
         if dist.get_rank() == 0:
             print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2%} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2%}")
             
-            try:
-                save_path = f"idm_checkpoint_ep{epoch+1}.pth"
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.module.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_acc': val_acc,
-                }, save_path)
-            except RuntimeError as e:
-                print(f"Warning: Could not save checkpoint at epoch {epoch+1}: {e}")
+            if epoch % 10 == 0:
+                try:
+                    save_path = f"idm_checkpoint_ep{epoch+1}.pth"
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.module.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_acc': val_acc,
+                    }, save_path)
+                except RuntimeError as e:
+                    print(f"Warning: Could not save checkpoint at epoch {epoch+1}: {e}")
 
     dist.destroy_process_group()

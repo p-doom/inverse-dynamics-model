@@ -10,16 +10,17 @@ from torch.utils.data.distributed import DistributedSampler
 from collections import OrderedDict
 
 ACTION_DICT = {
-    "tab": 0,
-    "content": 1,
-    "selection_command": 2,
-    "selection_mouse": 3,
-    "selection_keyboard": 4,
-    "terminal_command": 5,
-    "terminal_output": 6,
-    "terminal_focus": 7,
-    "git_branch_checkout": 8
-} 
+    "noop": 0,
+    "tab": 1,
+    "content": 2,
+    "selection_command": 3,
+    "selection_mouse": 4,
+    "selection_keyboard": 5,
+    "terminal_command": 6,
+    "terminal_output": 7,
+    "terminal_focus": 8,
+    "git_branch_checkout": 9
+}
 
 def get_dataloaders(data_root, batch_size, seq_len, frame_mode="diff", is_distributed=True):
     all_videos = sorted(list(Path(data_root).glob("*.mp4")))
@@ -49,8 +50,8 @@ class SequenceDataset(Dataset):
         self.label_root = Path(label_root)
         self.video_paths = video_files
         self.predecoded_root = Path(predecoded_root)
-        self.frame_before_all = []
-        self.frame_after_all = []
+        
+        self.frame_indices_all = [] 
         self.action_id_all = []
         self.cumulative_sequences = [0]
         
@@ -67,28 +68,26 @@ class SequenceDataset(Dataset):
 
             actual_frame_count = self._get_frame_count(v_path)
             
-            frame_before = []
-            frame_after = []
-            action_id = []
-
+            action_map = {}
             for l in vid_labels:
                 fb = int(l.get("video_frame_before", 0))
                 fa = int(l.get("video_frame_after", 0))
                 if fb >= actual_frame_count or fa >= actual_frame_count:
                     continue
-                frame_before.append(fb)
-                frame_after.append(fa)
-                action_id.append(ACTION_DICT[l["action_type"]])
+                action_map[(fb, fa)] = ACTION_DICT[l["action_type"]]
+            
+            frame_indices = []
+            action_ids = []
+            
+            for i in range(actual_frame_count - 1):
+                fb, fa = i, i + 1
+                frame_indices.append((fb, fa))
+                action_ids.append(action_map.get((fb, fa), ACTION_DICT["noop"]))
+            
+            self.frame_indices_all.append(np.asarray(frame_indices, dtype=np.int64))
+            self.action_id_all.append(np.asarray(action_ids, dtype=np.int64))
 
-            frame_before_arr = np.asarray(frame_before, dtype=np.int64)
-            frame_after_arr = np.asarray(frame_after, dtype=np.int64)
-            action_id_arr = np.asarray(action_id, dtype=np.int64)
-
-            self.frame_before_all.append(frame_before_arr)
-            self.frame_after_all.append(frame_after_arr)
-            self.action_id_all.append(action_id_arr)
-
-            num_sequences = max(0, len(action_id_arr) - seq_len + 1)
+            num_sequences = max(0, len(action_ids) - seq_len + 1)
             total_valid_sequences += num_sequences
             self.cumulative_sequences.append(total_valid_sequences)
 
@@ -120,16 +119,17 @@ class SequenceDataset(Dataset):
         local_idx = idx - self.cumulative_sequences[video_idx]
         
         v_path = str(self.video_paths[video_idx])
-        fb_all = self.frame_before_all[video_idx]
-        fa_all = self.frame_after_all[video_idx]
+        frame_indices = self.frame_indices_all[video_idx]
         action_all = self.action_id_all[video_idx]
         pre = self._get_frames(v_path)
         
+        seq_frame_indices = frame_indices[local_idx : local_idx + self.seq_len]
+        
         indices = np.empty(self.seq_len * 2, dtype=np.int64)
-        indices[0::2] = fb_all[local_idx : local_idx + self.seq_len]
-        indices[1::2] = fa_all[local_idx : local_idx + self.seq_len]
+        indices[0::2] = seq_frame_indices[:, 0] 
+        indices[1::2] = seq_frame_indices[:, 1] 
 
-        all_frames = torch.from_numpy(pre[indices])
+        all_frames = torch.from_numpy(pre[indices].copy())
 
         all_frames = all_frames.permute(0, 3, 1, 2)
         all_frames = all_frames.view(self.seq_len, 2, all_frames.shape[1], all_frames.shape[2], all_frames.shape[3])
@@ -143,6 +143,6 @@ class SequenceDataset(Dataset):
         else:
             raise NotImplementedError(f"Unknown frame_mode: {self.frame_mode}")
 
-        actions = torch.from_numpy(action_all[local_idx : local_idx + self.seq_len])
+        actions = torch.from_numpy(action_all[local_idx : local_idx + self.seq_len].copy())
 
         return {"frames": frames, "actions": actions, "video_path": str(v_path), "start_idx": local_idx}
