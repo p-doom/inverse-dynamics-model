@@ -4,18 +4,22 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+import yaml
 
 from idm_video import KeystrokeIDM
-from sequence_dataset import ACTION_DICT
+from actions import ACTION_DICT, NUM_ACTIONS, NUM_KEYS
 from utils import render_annotated_video, compute_accuracy, print_results
 
 ID_TO_ACTION = {v: k for k, v in ACTION_DICT.items()}
-NUM_ACTIONS = len(ACTION_DICT)
+
+with open('configs/default.yaml', 'r') as f:
+    config = yaml.safe_load(f)
 
 def load_model(checkpoint_path, device, frame_mode="concat"):
     model = KeystrokeIDM(
         num_actions=NUM_ACTIONS,
-        d_model=512,
+        num_keys=NUM_KEYS,
+        d_model=config["model"]["d_model"],
         num_transformer_layers=4,
         num_heads=8,
         ff_dim=4096,
@@ -117,28 +121,25 @@ def run_inference(model, frames, frame_indices, device, frame_mode="concat", seq
 
 
 if __name__ == "__main__":
-    VIDEO_ID = "59814d20919e0b1"
-    DATA_ROOT = "/data"
-    OUTPUT_ROOT = "."
+    VIDEO_ID = "b0916880d3f8ca2" #"59814d20919e0b1" #"6d9d58028817a37"
+    DATA_ROOT = config["data_dir"]
+    OUTPUT_ROOT = config["output_dir"]
     
     npy_path = f"{DATA_ROOT}/vid_{VIDEO_ID}_frames_128.npy"
     video_path = f"{DATA_ROOT}/vid_{VIDEO_ID}.mp4"
     checkpoint = f"{OUTPUT_ROOT}/idm_checkpoint_ep1.pth"
     output_video_path = f"{OUTPUT_ROOT}/annotated_{VIDEO_ID}_predictions.mp4"
     
-    FRAME_MODE = "concat"
-    SEQ_LEN = 16
-    
     RENDER = True
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    model = load_model(checkpoint, device, FRAME_MODE)
+    model = load_model(checkpoint, device, config["model"]["frame_mode"])
     
     frames = np.load(npy_path)
     frame_indices, ground_truth = load_ground_truth(npy_path)
     
-    predictions, logits = run_inference(model, frames, frame_indices, device, FRAME_MODE, SEQ_LEN)
+    predictions, logits = run_inference(model, frames, frame_indices, device, config["model"]["frame_mode"], config["model"]["seq_len"])
     
     print(f"Generated {len(predictions)} predictions")
     
