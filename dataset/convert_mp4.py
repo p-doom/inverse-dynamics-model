@@ -105,7 +105,7 @@ def create_frame(width, height, content, cursor_pos, scroll_y, active_file, stat
     return np.array(img)
 
 def render_video(filepath, output_file, speed_factor, width=1280, height=720, 
-                 fps=30, long_pause_threshold=120000, save_labels=True):
+                 fps=30, long_pause_threshold=120000, save_labels=True, labels_only=False):
     """Main loop to process data and write MP4 with keystroke labels."""
     
     print(f"Processing {filepath}...")
@@ -115,11 +115,12 @@ def render_video(filepath, output_file, speed_factor, width=1280, height=720,
         print(f"Error: File {filepath} not found.")
         return
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_out = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
-    
     font = get_monospaced_font(size=18)
     char_w, char_h, ascent, baseline_offset = get_font_metrics(font)
+    
+    if not labels_only:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_out = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
     
     file_states = {}
     scroll_states = {}
@@ -128,14 +129,14 @@ def render_video(filepath, output_file, speed_factor, width=1280, height=720,
     
     labels = []
     label_idx = 0
-    current_video_frame = 0  # Track the current video frame number
+    current_video_frame = 0
     
     if save_labels:
         output_path = Path(output_file)
         labels_dir = output_path.parent / f"{output_path.stem}_labels"
         labels_dir.mkdir(parents=True, exist_ok=True)
     
-    print("Rendering frames... this may take a while.")
+    print("Processing events..." if labels_only else "Rendering frames... this may take a while.")
     
     for i in range(len(df)):
         event = df.iloc[i]
@@ -152,7 +153,6 @@ def render_video(filepath, output_file, speed_factor, width=1280, height=720,
         new_text = str(event['Text']) if pd.notna(event['Text']) else ""
         new_text_clean = new_text.replace('\\n', '\n').replace('\\r', '\r')
         
-        # Record frame number BEFORE applying change
         video_frame_before = current_video_frame
         
         if active_file == "TERMINAL":
@@ -179,56 +179,48 @@ def render_video(filepath, output_file, speed_factor, width=1280, height=720,
         
         scroll_states[active_file] = scroll_y
         
-        if next_event is not None:
-            time_delta_ms = next_event['Time'] - event['Time']
-        else:
-            time_delta_ms = 0
-        
         action = event["Type"]
         
-        status_text = f"File: {active_file} | Time: {event['Time']/1000:.1f}s | Speed: {speed_factor}x"
-        
-        # Calculate frames to write for this event
         if next_event is not None:
             real_delta_ms = next_event['Time'] - event['Time']
             is_long_pause = real_delta_ms > long_pause_threshold
             
             if is_long_pause:
-                pause_message = "Long pause detected. User might be googling, thinking or might have gone for a coffee..."
-                
-                frame_with_pause = create_frame(
-                    width, height, content, (cursor_y, cursor_x), 
-                    scroll_y, active_file, status_text, font, char_w, char_h, 
-                    ascent, baseline_offset, pause_message=pause_message
-                )
-                
                 pause_display_frames = fps * 3
-                for _ in range(pause_display_frames):
-                    video_out.write(frame_with_pause)
-                    current_video_frame += 1
-                
+                current_video_frame += pause_display_frames
                 frames_to_write = fps
             else:
                 video_delta_ms = real_delta_ms / speed_factor
                 frames_to_write = max(1, int((video_delta_ms / 1000.0) * fps))
-                
                 if frames_to_write < 1 and video_delta_ms > 10: 
                     frames_to_write = 1
         else:
             frames_to_write = fps * 2
             is_long_pause = False
 
-        frame_image = create_frame(
-            width, height, content, (cursor_y, cursor_x), 
-            scroll_y, active_file, status_text, font, char_w, char_h, 
-            ascent, baseline_offset
-        )
+        if not labels_only:
+            status_text = f"File: {active_file} | Time: {event['Time']/1000:.1f}s | Speed: {speed_factor}x"
+            
+            if next_event is not None and is_long_pause:
+                pause_message = "Long pause detected. User might be googling, thinking or might have gone for a coffee..."
+                frame_with_pause = create_frame(
+                    width, height, content, (cursor_y, cursor_x), 
+                    scroll_y, active_file, status_text, font, char_w, char_h, 
+                    ascent, baseline_offset, pause_message=pause_message
+                )
+                for _ in range(fps * 3):
+                    video_out.write(frame_with_pause)
+            
+            frame_image = create_frame(
+                width, height, content, (cursor_y, cursor_x), 
+                scroll_y, active_file, status_text, font, char_w, char_h, 
+                ascent, baseline_offset
+            )
+            for _ in range(frames_to_write):
+                video_out.write(frame_image)
         
-        for _ in range(frames_to_write):
-            video_out.write(frame_image)
-            current_video_frame += 1
+        current_video_frame += frames_to_write
         
-        # Save label with video frame numbers
         if save_labels:
             labels.append({
                 "label_idx": label_idx,
@@ -236,48 +228,25 @@ def render_video(filepath, output_file, speed_factor, width=1280, height=720,
                 "timestamp_ms": int(event['Time']),
                 "file": active_file,
                 "action_type": action,
+                "text": new_text,
+                "range_offset": offset,
+                "range_length": length,
                 "cursor": {"y": cursor_y, "x": cursor_x},
                 "video_frame_before": video_frame_before,
-                "video_frame_after": video_frame_before+frames_to_write,
+                "video_frame_after": current_video_frame,
             })
             label_idx += 1
             
         if i % 100 == 0:
             print(f"Processed {i}/{len(df)} events...", end='\r')
 
-    video_out.release()
+    if not labels_only:
+        video_out.release()
     
     if save_labels and labels:
         with open(labels_dir / "keystrokes.jsonl", 'w') as f:
             for label in labels:
                 f.write(json.dumps(label) + '\n')
           
-        print(f"\nSaved {len(labels)} insertion labels to {labels_dir}")
+        print(f"\nSaved {len(labels)} labels to {labels_dir}")
         print(f"Total video frames: {current_video_frame}")
-    
-    print(f"Done! Video saved to {output_file}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Render coding traces to MP4.")
-    parser.add_argument("filepath", help="The path to the source CSV file.")
-    parser.add_argument("output", help="The output path for the MP4 file.")
-    parser.add_argument("--speed", type=float, default=20.0, help="Playback speed multiplier.")
-    parser.add_argument("--width", type=int, default=1280, help="Video width.")
-    parser.add_argument("--height", type=int, default=720, help="Video height.")
-    parser.add_argument("--long_pause_threshold", type=int, default=120000, 
-                        help="Threshold for long pause in milliseconds.")
-    parser.add_argument("--no_labels", action="store_true", 
-                        help="Disable saving keystroke labels.")
-    
-    args = parser.parse_args()
-    
-    render_video(
-        args.filepath, 
-        args.output, 
-        args.speed, 
-        args.width, 
-        args.height, 
-        long_pause_threshold=args.long_pause_threshold,
-        save_labels=not args.no_labels
-    )
