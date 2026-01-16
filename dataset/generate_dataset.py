@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser.add_argument("--speed", type=float, default=20.0, help="Playback speed multiplier.")
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
     parser.add_argument("--height", type=int, default=720, help="Video height.")
-    parser.add_argument("--num_videos", type=int, default=1, help="Number of videos to generate from the dataset.")
+    parser.add_argument("--num_videos", type=int, default=350, help="Number of videos to generate from the dataset.")
 
     args = parser.parse_args()
 
@@ -41,6 +41,6 @@ if __name__ == "__main__":
         )
 
         output_filename = f"/data/vid_{hashlib.sha256(csv_file.replace('/', '_').replace('.csv', '').encode()).hexdigest()[:15]}.mp4"
-        render_video(file_path, output_filename, args.speed, args.width, args.height)
+        render_video(file_path, output_filename, args.speed, args.width, args.height, labels_only=True)
 
     print(f"\nCompleted processing {args.num_videos} CSV files")

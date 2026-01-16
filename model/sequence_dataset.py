@@ -8,19 +8,26 @@ import bisect
 import random
 from torch.utils.data.distributed import DistributedSampler
 from collections import OrderedDict
+from actions import ACTION_DICT, KEY_DICT, NUM_ACTIONS, NUM_KEYS
 
-ACTION_DICT = {
-    "noop": 0,
-    "tab": 1,
-    "content": 2,
-    "selection_command": 3,
-    "selection_mouse": 4,
-    "selection_keyboard": 5,
-    "terminal_command": 6,
-    "terminal_output": 7,
-    "terminal_focus": 8,
-    "git_branch_checkout": 9
-}
+def text_to_key_id(text):
+    if not text or text == "":
+        return KEY_DICT["<pad>"]
+    
+    if text == "\\n" or text == "\n":
+        return KEY_DICT["<enter>"]
+    if text == "\\t" or text == "\t":
+        return KEY_DICT["<tab>"]
+    if text == "\\r" or text == "\r":
+        return KEY_DICT["<enter>"]
+    if text == " ":
+        return KEY_DICT["<space>"]
+    
+    if len(text) == 1:
+        return KEY_DICT.get(text, KEY_DICT["<unk>"])
+    
+    return KEY_DICT["<unk>"]
+
 
 def get_dataloaders(data_root, batch_size, seq_len, frame_mode="diff", is_distributed=True):
     all_videos = sorted(list(Path(data_root).glob("*.mp4")))
@@ -42,6 +49,7 @@ def get_dataloaders(data_root, batch_size, seq_len, frame_mode="diff", is_distri
 
     return train_loader, val_loader, train_sampler, val_sampler
 
+
 class SequenceDataset(Dataset):
     def __init__(self, video_files, label_root, seq_len, frame_mode, predecoded_root, cache_size=2):
         super().__init__()
@@ -53,6 +61,8 @@ class SequenceDataset(Dataset):
         
         self.frame_indices_all = [] 
         self.action_id_all = []
+        self.cursor_pos_all = []
+        self.key_id_all = []
         self.cumulative_sequences = [0]
         
         self.frame_cache = OrderedDict()
@@ -69,23 +79,44 @@ class SequenceDataset(Dataset):
             actual_frame_count = self._get_frame_count(v_path)
             
             action_map = {}
+            cursor_map = {}
+            key_map = {}
+            
             for l in vid_labels:
                 fb = int(l.get("video_frame_before", 0))
                 fa = int(l.get("video_frame_after", 0))
                 if fb >= actual_frame_count or fa >= actual_frame_count:
                     continue
-                action_map[(fb, fa)] = ACTION_DICT[l["action_type"]]
+                    
+                action_type = l["action_type"]
+                action_map[(fb, fa)] = ACTION_DICT[action_type]
+                
+                cursor_x = float(l.get("cursor", {}).get("x", 0.0))
+                cursor_y = float(l.get("cursor", {}).get("y", 0.0))
+                cursor_map[(fb, fa)] = (cursor_x, cursor_y)
+                
+                if action_type == "content":
+                    text = l.get("text", "")
+                    key_map[(fb, fa)] = text_to_key_id(text)
+                else:
+                    key_map[(fb, fa)] = KEY_DICT["<pad>"]
             
             frame_indices = []
             action_ids = []
+            cursor_positions = []
+            key_ids = []
             
             for i in range(actual_frame_count - 1):
                 fb, fa = i, i + 1
                 frame_indices.append((fb, fa))
                 action_ids.append(action_map.get((fb, fa), ACTION_DICT["noop"]))
+                cursor_positions.append(cursor_map.get((fb, fa), (0.0, 0.0)))
+                key_ids.append(key_map.get((fb, fa), KEY_DICT["<pad>"]))
             
             self.frame_indices_all.append(np.asarray(frame_indices, dtype=np.int64))
             self.action_id_all.append(np.asarray(action_ids, dtype=np.int64))
+            self.cursor_pos_all.append(np.asarray(cursor_positions, dtype=np.float32))
+            self.key_id_all.append(np.asarray(key_ids, dtype=np.int64))
 
             num_sequences = max(0, len(action_ids) - seq_len + 1)
             total_valid_sequences += num_sequences
@@ -93,13 +124,13 @@ class SequenceDataset(Dataset):
 
     def _get_frame_count(self, v_path):
         n = len(str(v_path))
-        p = f"{str(v_path)[:n-4]}_frames_128.npy"
+        p = f"{str(v_path)[:n-4]}_frames_512.npy"
         arr = np.load(p, mmap_mode="r")
         return int(arr.shape[0])
 
     def _get_frames(self, v_path):
         n = len(str(v_path))
-        p = f"{str(v_path)[:n-4]}_frames_128.npy"
+        p = f"{str(v_path)[:n-4]}_frames_512.npy"
 
         if p in self.frame_cache:
             self.frame_cache.move_to_end(p)
@@ -121,6 +152,8 @@ class SequenceDataset(Dataset):
         v_path = str(self.video_paths[video_idx])
         frame_indices = self.frame_indices_all[video_idx]
         action_all = self.action_id_all[video_idx]
+        cursor_all = self.cursor_pos_all[video_idx]
+        key_all = self.key_id_all[video_idx]
         pre = self._get_frames(v_path)
         
         seq_frame_indices = frame_indices[local_idx : local_idx + self.seq_len]
@@ -144,5 +177,7 @@ class SequenceDataset(Dataset):
             raise NotImplementedError(f"Unknown frame_mode: {self.frame_mode}")
 
         actions = torch.from_numpy(action_all[local_idx : local_idx + self.seq_len].copy())
+        cursor = torch.from_numpy(cursor_all[local_idx : local_idx + self.seq_len].copy())
+        keys = torch.from_numpy(key_all[local_idx : local_idx + self.seq_len].copy())
 
-        return {"frames": frames, "actions": actions, "video_path": str(v_path), "start_idx": local_idx}
+        return {"frames": frames, "actions": actions, "cursor": cursor, "keys": keys, "video_path": str(v_path), "start_idx": local_idx}

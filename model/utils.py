@@ -1,20 +1,28 @@
 import cv2
 import numpy as np
 import torch.distributed as dist
-
-COLOR_CORRECT = (0, 255, 0)
-COLOR_INCORRECT = (0, 0, 255)
-COLOR_NOOP = (128, 128, 128)
-COLOR_GT = (255, 255, 0)
 COLOR_WHITE = (255, 255, 255)
+COLOR_GT = (255, 200, 100)  # Light blue for ground truth
+COLOR_CORRECT = (0, 255, 0)  # Green for correct predictions
+COLOR_INCORRECT = (0, 0, 255)  # Red for incorrect predictions
+COLOR_NOOP = (128, 128, 128)  # Gray for noop/no key
 
-def render_annotated_video(input_video_path, output_video_path, predictions, ground_truth, frame_indices, id_to_action, action_dict):
+
+def render_annotated_video(input_video_path,  output_video_path, key_predictions, key_ground_truth, frame_indices, id_to_key=None, display_duration=10):
     cap = cv2.VideoCapture(input_video_path)
     
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    print(f"Video info: {width}x{height} @ {fps}fps, {total_frames} frames")
+    print(f"Predictions: {len(key_predictions)}, GT: {len(key_ground_truth)}, Frame indices: {len(frame_indices)}")
+    print(f"Display duration: {display_duration} frames (~{display_duration/fps:.1f}s)")
+    
+    non_zero_gt = (np.array(key_ground_truth) != 0).sum()
+    non_zero_pred = (np.array(key_predictions) != 0).sum()
+    print(f"Non-zero GT keys: {non_zero_gt}, Non-zero predicted keys: {non_zero_pred}")
     
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
@@ -24,21 +32,42 @@ def render_annotated_video(input_video_path, output_video_path, predictions, gro
     thickness = 2
     margin = 10
     
-    frame_annotations = {}
+    annotations_list = []
     
-    for idx, (fb, fa) in enumerate(frame_indices):
-        gt = ground_truth[idx]
-        pred = predictions[idx]
+    for idx in range(len(key_predictions)):
+        key_gt = key_ground_truth[idx]
+        key_pred = key_predictions[idx]
         
-        if gt == action_dict["noop"] and pred == action_dict["noop"]:
+        if isinstance(frame_indices[idx], (list, tuple, np.ndarray)):
+            frame_num = int(frame_indices[idx][0])
+        else:
+            frame_num = int(frame_indices[idx])
+        
+        if key_gt == 0 and key_pred == 0:
             continue
         
-        if fa not in frame_annotations:
-            frame_annotations[fa] = []
+        ann = {
+            'start_frame': frame_num,
+            'end_frame': frame_num + display_duration,
+            'key_pred': int(key_pred),
+            'key_gt': int(key_gt),
+            'key_correct': int(key_pred) == int(key_gt)
+        }
         
-        frame_annotations[fa].append({'gt': gt, 'pred': pred, 'gt_name': id_to_action[gt], 'pred_name': id_to_action[pred], 'correct': gt == pred})
+        if id_to_key:
+            ann['key_pred_name'] = id_to_key.get(int(key_pred), f"key_{key_pred}")
+            ann['key_gt_name'] = id_to_key.get(int(key_gt), f"key_{key_gt}")
+        else:
+            ann['key_pred_name'] = str(key_pred)
+            ann['key_gt_name'] = str(key_gt)
+        
+        annotations_list.append(ann)
+    
+    print(f"Total annotations to render: {len(annotations_list)}")
     
     frame_idx = 0
+    rendered_annotations = 0
+    
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -46,39 +75,66 @@ def render_annotated_video(input_video_path, output_video_path, predictions, gro
         
         y_offset = margin + 20
         
-        cv2.putText(frame, f"Frame: {frame_idx}/{total_frames}", (margin, y_offset), font, font_scale, COLOR_WHITE, thickness, cv2.LINE_AA)
+        # Frame counter
+        cv2.putText(
+            frame, f"Frame: {frame_idx}/{total_frames}", 
+            (margin, y_offset), font, font_scale, COLOR_WHITE, thickness, cv2.LINE_AA
+        )
         y_offset += 25
         
-        if frame_idx in frame_annotations:
-            for ann in frame_annotations[frame_idx]:
-                gt_name = ann['gt_name']
-                pred_name = ann['pred_name']
-                correct = ann['correct']
-                
-                if ann['gt'] == action_dict["noop"] and ann['pred'] == action_dict["noop"]:
-                    color = COLOR_NOOP
-                elif correct:
-                    color = COLOR_CORRECT
-                else:
-                    color = COLOR_INCORRECT
-                
-                gt_text = f"GT: {gt_name}"
-                cv2.putText(frame, gt_text, (margin, y_offset), font, font_scale, COLOR_GT, thickness, cv2.LINE_AA)
-                y_offset += 25
-                
-                pred_text = f"Pred: {pred_name}"
-                cv2.putText(frame, pred_text, (margin, y_offset), font, font_scale, color, thickness, cv2.LINE_AA)
-                y_offset += 25
-                
-                status = "CORRECT" if correct else "WRONG"
-                cv2.putText(frame, status, (margin, y_offset), font, font_scale, color, thickness, cv2.LINE_AA)
-                y_offset += 30
+        active_annotations = [ann for ann in annotations_list if ann['start_frame'] <= frame_idx < ann['end_frame']]
+        
+        for ann in active_annotations:
+            rendered_annotations += 1
+            key_correct = ann['key_correct']
+            key_gt = ann['key_gt']
+            key_pred = ann['key_pred']
+            
+            frames_remaining = ann['end_frame'] - frame_idx
+            alpha = min(1.0, frames_remaining / 10.0)  # Fade in last 10 frames
+            
+            if key_gt == 0 and key_pred == 0:
+                color = COLOR_NOOP
+            elif key_correct:
+                color = COLOR_CORRECT
+            else:
+                color = COLOR_INCORRECT
+            
+            box_height = 70
+            overlay = frame.copy()
+            cv2.rectangle(
+                overlay, 
+                (margin - 5, y_offset - 15), 
+                (margin + 300, y_offset + box_height), 
+                (0, 0, 0), 
+                -1
+            )
+            cv2.addWeighted(overlay, 0.6 * alpha, frame, 1 - 0.6 * alpha, 0, frame)
+            
+            # Key ground truth
+            key_gt_text = f"GT Key: {ann['key_gt_name']}"
+            cv2.putText(frame, key_gt_text, (margin, y_offset), font, font_scale, COLOR_GT, thickness, cv2.LINE_AA)
+            y_offset += 22
+            
+            # Key prediction
+            key_pred_text = f"Pred Key: {ann['key_pred_name']}"
+            cv2.putText(frame, key_pred_text, (margin, y_offset), font, font_scale, color, thickness, cv2.LINE_AA)
+            y_offset += 22
+            
+            # Status
+            status = "KEY: OK" if key_correct else "KEY: WRONG"
+            cv2.putText(frame, status, (margin, y_offset), font, font_scale, color, thickness, cv2.LINE_AA)
+            y_offset += 30
         
         out.write(frame)
         frame_idx += 1
     
     cap.release()
     out.release()
+    print(f"Rendered {rendered_annotations} annotation instances across {frame_idx} frames")
+    print(f"Annotated video saved to: {output_video_path}")
+
+
 
 def compute_accuracy(predictions, ground_truth, id_to_action, action_dict):
     predictions = np.array(predictions)

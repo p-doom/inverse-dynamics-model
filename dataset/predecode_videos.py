@@ -12,14 +12,15 @@ if __name__ == "__main__":
     root = Path("/data")
 
     mp4s = sorted(root.glob("*.mp4"))
+    size = 512
 
     for mp4 in mp4s:
         vid_id = mp4.stem
-        out_path = root / f"{vid_id}_frames_128.npy"
+        out_path = root / f"{vid_id}_frames_{size}.npy"
 
-        vr = VideoReader(str(mp4), ctx=cpu(0), width=128, height=128, num_threads=4)
+        vr = VideoReader(str(mp4), ctx=cpu(0), width=size, height=size, num_threads=4)
         n = len(vr)
-        mm = open_npy_memmap(out_path, shape=(n, 128, 128, 3), dtype=np.uint8)
+        mm = open_npy_memmap(out_path, shape=(n, size, size, 3), dtype=np.uint8)
 
         chunk = 1024
         for start in range(0, n, chunk):

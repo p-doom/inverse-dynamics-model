@@ -3,4 +3,5 @@ pandas
 opencv-python
 pillow
 torch
+decord
 torchvision
