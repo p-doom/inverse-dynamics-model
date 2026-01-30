@@ -5,6 +5,9 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 import yaml
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
 
 from idm_video import KeystrokeIDM
 from actions import ACTION_DICT, NUM_ACTIONS, NUM_KEYS, KEY_DICT
@@ -15,14 +18,31 @@ ID_TO_ACTION = {v: k for k, v in ACTION_DICT.items()}
 with open('default.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
+def plot_confusion_matrix(y_true, y_pred, num_keys, output_path):
+    """Generates and saves a confusion matrix heatmap."""
+    # Compute confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=range(num_keys))
+    cm[0, 0] = 0
+    
+    # Plotting
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=False, fmt='d', cmap='Blues', 
+                xticklabels=range(num_keys), yticklabels=range(num_keys))
+    plt.xlabel('Predicted Key')
+    plt.ylabel('True Key')
+    plt.title('Keystroke Prediction Confusion Matrix')
+    
+    plt.savefig(output_path)
+    plt.close()
+    print(f"Confusion matrix saved to {output_path}")
 
-def load_model(checkpoint_path, device, frame_mode="concat"):
+
+def load_model(checkpoint_path, device, frame_mode):
     """Load the trained KeystrokeIDM model from a checkpoint."""
     model = KeystrokeIDM(
-        num_actions=NUM_ACTIONS,
         num_keys=NUM_KEYS,
         d_model=config["model"]["d_model"],
-        num_transformer_layers=4,
+        num_transformer_layers=3,
         num_heads=8,
         ff_dim=4096,
         frame_mode=frame_mode
@@ -48,7 +68,7 @@ def load_model(checkpoint_path, device, frame_mode="concat"):
 
 def load_ground_truth(video_path):
     """Load ground truth labels from the corresponding JSONL file."""
-    video_stem = Path(video_path).stem.replace('_frame_512', '')
+    video_stem = Path(video_path).stem.replace('_frames_512', '')
     label_file = Path(os.path.dirname(video_path)) / f"{video_stem}_labels" / "keystrokes.jsonl"
     
     frames = np.load(video_path, mmap_mode='r')
@@ -62,9 +82,11 @@ def load_ground_truth(video_path):
                 label = json.loads(line)
                 fb = int(label.get("video_frame_before", 0))
                 fa = int(label.get("video_frame_after", 0))
+                print(label, fb, fa)
                 if fb < num_frames and fa < num_frames:
-                    if "key" in label:
-                        key_map[(fb, fa)] = label["key"]
+                    print("LABEL: ", label)
+                    if "text" in label and len(label["text"]) == 1:
+                        key_map[(fb, fa)] = KEY_DICT.get(label["text"], 0)
                     else:
                         key_map[(fb, fa)] = 0
     
@@ -169,7 +191,7 @@ def compute_per_key_accuracy(key_predictions, key_ground_truth, num_keys=NUM_KEY
     return per_key_acc, per_key_counts
 
 
-def print_detailed_results(predictions, ground_truth):
+def print_detailed_results(predictions, ground_truth, output_dir=None):
     """Print detailed results for key predictions."""
     print("\n" + "="*60)
     print("INFERENCE RESULTS")
@@ -199,6 +221,14 @@ def print_detailed_results(predictions, ground_truth):
     print(f"Total Frames Processed: {len(predictions['key_predictions'])}")
     non_zero = (predictions['key_predictions'] != 0).sum()
     print(f"Non-Zero Key Predictions: {non_zero}")
+
+    cm_path = os.path.join(output_dir, "confusion_matrix.png")
+    plot_confusion_matrix(
+        ground_truth['keys'], 
+        predictions['key_predictions'], 
+        NUM_KEYS, 
+        cm_path
+    )
     
     return {
         'key_accuracy': key_acc,
@@ -232,7 +262,7 @@ if __name__ == "__main__":
     OUTPUT_ROOT = config["output_dir"]
     
     npy_path = f"{DATA_ROOT}/vid_{VIDEO_ID}_frames_512.npy"
-    checkpoint = f"{OUTPUT_ROOT}/idm_checkpoint_ep5.pth"
+    checkpoint = f"{OUTPUT_ROOT}/idm_checkpoint_ep9.pth"
     output_json_path = f"{OUTPUT_ROOT}/predictions_{VIDEO_ID}.json"
     
     SAVE_JSON = True
@@ -265,18 +295,14 @@ if __name__ == "__main__":
     
     print(f"Generated {len(predictions['key_predictions'])} predictions")
     
-    # Print detailed results
-    results = print_detailed_results(predictions, ground_truth)
+    results = print_detailed_results(predictions, ground_truth, output_dir=OUTPUT_ROOT)
     
-    # Save predictions to JSON
     if SAVE_JSON:
         save_predictions(predictions, ground_truth, output_json_path)
     if RENDER:
         video_path = f"{DATA_ROOT}/vid_{VIDEO_ID}.mp4"
         output_video_path = f"{OUTPUT_ROOT}/annotated_{VIDEO_ID}_keys.mp4"
         
-        # Optional: create id_to_key mapping if you have key names
-        # id_to_key = {0: "none", 1: "a", 2: "b", ...}
         ID_TO_KEY = {v: k for k, v in KEY_DICT.items()}
         
         print(f"\nRendering annotated video to {output_video_path}...")

@@ -8,7 +8,7 @@ import bisect
 import random
 from torch.utils.data.distributed import DistributedSampler
 from collections import OrderedDict
-from actions import ACTION_DICT, KEY_DICT, NUM_ACTIONS, NUM_KEYS
+from actions import ACTION_DICT, KEY_DICT, NUM_KEYS
 
 def text_to_key_id(text):
     if not text or text == "":
@@ -16,8 +16,6 @@ def text_to_key_id(text):
     
     if text == "\\n" or text == "\n":
         return KEY_DICT["<enter>"]
-    if text == "\\t" or text == "\t":
-        return KEY_DICT["<tab>"]
     if text == "\\r" or text == "\r":
         return KEY_DICT["<enter>"]
     if text == " ":

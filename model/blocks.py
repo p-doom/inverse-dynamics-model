@@ -55,6 +55,7 @@ class Encoder(nn.Module):
         
         self.flat_dim = 32 * 16 * 16 
         self.fc1 = nn.Linear(self.flat_dim, d_model)
+        self.norm_fc = nn.LayerNorm(d_model)
         
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=ff_dim, batch_first=True, dropout=0.3)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
@@ -73,6 +74,6 @@ class Encoder(nn.Module):
         x = self.bottleneck(x) # [B*T, 32, 16, 16]
         x = x.reshape(B * T, -1)
         
-        x = F.relu(self.fc1(x))
+        x = self.norm_fc(F.relu(self.fc1(x)))
         x = x.view(B, T, -1)
         return self.transformer(x)

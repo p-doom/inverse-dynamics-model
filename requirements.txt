@@ -5,3 +5,7 @@ pillow
 torch
 decord
 torchvision
+wandb
+matplotlib
+seaborn
+scikit-learn

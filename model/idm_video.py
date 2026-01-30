@@ -2,7 +2,7 @@ import torch.nn as nn
 from blocks import Encoder
 
 class KeystrokeIDM(nn.Module):
-    def __init__(self, num_actions, num_keys, d_model=4096, num_transformer_layers=4, num_heads=32, ff_dim=16384, frame_mode="diff"):
+    def __init__(self, num_keys, d_model=4096, num_transformer_layers=4, num_heads=32, ff_dim=16384, frame_mode="diff"):
         super().__init__()
         self.encoder = Encoder(
             d_model=d_model,
