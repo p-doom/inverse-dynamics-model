@@ -180,7 +180,7 @@ if __name__ == "__main__":
 
     train_loader, val_loader, train_sampler, val_sampler = get_dataloaders(config["data_dir"], config["training"]["batch_size"], config["model"]["seq_len"], frame_mode=config["model"]["frame_mode"], is_distributed=True, only_ops=config["model"]["only_ops"])
 
-    model = KeystrokeIDM(num_keys=NUM_KEYS, d_model=config["model"]["d_model"], num_transformer_layers=3, num_heads=8, ff_dim=4096, frame_mode=config["model"]["frame_mode"]).to(device)
+    model = KeystrokeIDM(num_keys=NUM_KEYS, d_model=config["model"]["d_model"], num_transformer_layers=3, num_heads=8, ff_dim=4096, frame_mode=config["model"]["frame_mode"], pretrained=config["model"]["pretrained"], pretrained_model_path=config["model"].get("pretrained_model_path", None)).to(device)
     
     model = DDP(model, device_ids=[local_rank])
 
