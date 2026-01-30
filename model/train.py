@@ -178,7 +178,7 @@ if __name__ == "__main__":
     with open('default.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
-    train_loader, val_loader, train_sampler, val_sampler = get_dataloaders(config["data_dir"], config["training"]["batch_size"], config["model"]["seq_len"], frame_mode=config["model"]["frame_mode"], is_distributed=True)
+    train_loader, val_loader, train_sampler, val_sampler = get_dataloaders(config["data_dir"], config["training"]["batch_size"], config["model"]["seq_len"], frame_mode=config["model"]["frame_mode"], is_distributed=True, only_ops=config["model"]["only_ops"])
 
     model = KeystrokeIDM(num_keys=NUM_KEYS, d_model=config["model"]["d_model"], num_transformer_layers=3, num_heads=8, ff_dim=4096, frame_mode=config["model"]["frame_mode"]).to(device)
     
@@ -193,7 +193,10 @@ if __name__ == "__main__":
     total_steps = len(train_loader) * config["training"]["epochs"]
     scheduler = OneCycleLR(optimizer, max_lr=config["training"]["lr"], total_steps=total_steps, pct_start=0.1, anneal_strategy='cos')
     
-    counts = torch.tensor([5000, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+    if config["model"]["only_ops"]:
+        counts = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+    else: 
+        counts = torch.tensor([5000, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
     weights = 1.0 / torch.sqrt(counts + 1) 
     weights = weights / weights.sum() * len(counts)
     weights = weights.to(device)

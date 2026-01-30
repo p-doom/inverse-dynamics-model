@@ -45,7 +45,9 @@ def load_model(checkpoint_path, device, frame_mode):
         num_transformer_layers=3,
         num_heads=8,
         ff_dim=4096,
-        frame_mode=frame_mode
+        frame_mode=frame_mode,
+        pretrained=config["model"]["pretrained"],
+        pretrained_model_path=config["model"].get("pretrained_model_path", None)
     ).to(device)
     
     checkpoint = torch.load(checkpoint_path, map_location=device)

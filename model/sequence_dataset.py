@@ -27,7 +27,7 @@ def text_to_key_id(text):
     return KEY_DICT["<unk>"]
 
 
-def get_dataloaders(data_root, batch_size, seq_len, frame_mode="diff", is_distributed=True):
+def get_dataloaders(data_root, batch_size, seq_len, frame_mode="diff", is_distributed=True, only_ops=False):
     all_videos = sorted(list(Path(data_root).glob("*.mp4")))
     random.seed(42) 
     random.shuffle(all_videos)
@@ -36,8 +36,8 @@ def get_dataloaders(data_root, batch_size, seq_len, frame_mode="diff", is_distri
     train_videos = all_videos[:split_idx]
     val_videos = all_videos[split_idx:]
 
-    train_ds = SequenceDataset(train_videos, data_root, seq_len, frame_mode, predecoded_root=data_root)
-    val_ds = SequenceDataset(val_videos, data_root, seq_len, frame_mode, predecoded_root=data_root)
+    train_ds = SequenceDataset(train_videos, data_root, seq_len, frame_mode, predecoded_root=data_root, only_ops=only_ops)
+    val_ds = SequenceDataset(val_videos, data_root, seq_len, frame_mode, predecoded_root=data_root, only_ops=only_ops)
 
     train_sampler = DistributedSampler(train_ds) if is_distributed else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if is_distributed else None
@@ -49,7 +49,7 @@ def get_dataloaders(data_root, batch_size, seq_len, frame_mode="diff", is_distri
 
 
 class SequenceDataset(Dataset):
-    def __init__(self, video_files, label_root, seq_len, frame_mode, predecoded_root, cache_size=2):
+    def __init__(self, video_files, label_root, seq_len, frame_mode, predecoded_root, cache_size=2, only_ops=False):
         super().__init__()
         self.seq_len = seq_len
         self.frame_mode = frame_mode
@@ -106,10 +106,15 @@ class SequenceDataset(Dataset):
             
             for i in range(actual_frame_count - 1):
                 fb, fa = i, i + 1
+                key_id = key_map.get((fb, fa), KEY_DICT["<pad>"])
+                
+                if key_id == KEY_DICT["<pad>"] or only_ops == False:
+                    continue
+                
                 frame_indices.append((fb, fa))
                 action_ids.append(action_map.get((fb, fa), ACTION_DICT["noop"]))
                 cursor_positions.append(cursor_map.get((fb, fa), (0.0, 0.0)))
-                key_ids.append(key_map.get((fb, fa), KEY_DICT["<pad>"]))
+                key_ids.append(key_id)
             
             self.frame_indices_all.append(np.asarray(frame_indices, dtype=np.int64))
             self.action_id_all.append(np.asarray(action_ids, dtype=np.int64))
