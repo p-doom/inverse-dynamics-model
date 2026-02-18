@@ -389,23 +389,29 @@ def preprocess_video(
             target_fps=target_fps,
         )
 
-        original_count = len(frames)
-        frames, actions = _filter_black_frames(frames, actions)
-        if len(frames) < original_count:
-            print(f"Filtered {original_count - len(frames)} black frames from video {idx}")
+        segments = _filter_black_frames(frames, actions)
         
-        if len(frames) < chunk_size:
-            print(f"Warning: After filtering, video has {len(frames)} frames, skipping (need {chunk_size})")
-            return [], _failed_result(video_info, "too_short_after_filter")
-
-
-        chunk_records = _chunk_video_records(
-            video_tensor=frames,
-            video_info=video_info,
-            chunk_size=chunk_size,
-            actions=actions,
-        )
-        return chunk_records, []
+        if len(segments) > 1:
+            print(f"Split video {idx} into {len(segments)} segments at black frames")
+        
+        all_chunk_records = []
+        for seg_idx, (seg_frames, seg_actions) in enumerate(segments):
+            if len(seg_frames) < chunk_size:
+                print(f"Segment {seg_idx} of video {idx} has {len(seg_frames)} frames, skipping (need {chunk_size})")
+                continue
+            
+            chunk_records = _chunk_video_records(
+                video_tensor=seg_frames,
+                video_info=video_info,
+                chunk_size=chunk_size,
+                actions=seg_actions,
+            )
+            all_chunk_records.extend(chunk_records)
+        
+        if not all_chunk_records:
+            return [], _failed_result(video_info, "all_segments_too_short")
+        
+        return all_chunk_records, []
     except Exception as e:
         print(f"Error processing video {idx} ({in_filename}): {e}")
         return [], _failed_result(video_info, f"decode_error:{e}")
@@ -496,9 +502,9 @@ def _filter_black_frames(
     actions: list[str] | None,
     threshold: float = 10.0,
     black_ratio: float = 0.95,
-) -> tuple[np.ndarray, list[str] | None]:
+) -> list[tuple[np.ndarray, list[str] | None]]:
     """
-    Remove nearly-black frames from video and corresponding actions.
+    Split video at nearly-black frame sequences.
     
     Args:
         frames: Video frames of shape (N, H, W, 3)
@@ -507,20 +513,40 @@ def _filter_black_frames(
         black_ratio: Fraction of pixels that must be below threshold
     
     Returns:
-        Filtered frames and actions
+        List of (frames, actions) tuples for each non-black segment
     """
-    keep_indices = [
-        i for i in range(len(frames))
-        if not _is_nearly_black(frames[i], threshold, black_ratio)
-    ]
+    n_frames = len(frames)
+    if n_frames == 0:
+        return []
     
-    if len(keep_indices) == len(frames):
-        return frames, actions
+    is_black = np.array([
+        _is_nearly_black(frames[i], threshold, black_ratio)
+        for i in range(n_frames)
+    ])
     
-    filtered_frames = frames[keep_indices]
-    filtered_actions = [actions[i] for i in keep_indices] if actions else None
+    if not is_black.any():
+        return [(frames, actions)]
     
-    return filtered_frames, filtered_actions
+    segments = []
+    start_idx = None
+    
+    for i in range(n_frames):
+        if not is_black[i]:
+            if start_idx is None:
+                start_idx = i
+        else:
+            if start_idx is not None:
+                seg_frames = frames[start_idx:i]
+                seg_actions = actions[start_idx:i] if actions else None
+                segments.append((seg_frames, seg_actions))
+                start_idx = None
+    
+    if start_idx is not None:
+        seg_frames = frames[start_idx:]
+        seg_actions = actions[start_idx:] if actions else None
+        segments.append((seg_frames, seg_actions))
+    
+    return segments
 
 def save_split(pool_args, num_workers: int):
     if not pool_args:
