@@ -1,0 +1,37 @@
+[project]
+name = "idm"
+version = "0.1.0"
+authors = [
+  { email = "nikolas.rieger@tum.de" },
+  { email = "franz@pdoom.org" },
+  { email = "alfred@pdoom.org" },
+  { email = "mihir@pdoom.org" },
+]
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "array-record>=0.7.2",
+  "msgpack>=1.0.8",
+  "grain>=0.2.10",
+  "numpy",
+  "peft",
+  "pillow",
+  "safetensors",
+  "torch",
+  "transformers @ git+https://github.com/huggingface/transformers.git",
+  "tyro>=0.8.5",
+  "wandb",
+  "torchvision>=0.25.0",
+  "ffmpeg-python==0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["idm*"]
