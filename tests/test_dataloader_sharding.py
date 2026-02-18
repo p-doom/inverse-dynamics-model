@@ -15,7 +15,7 @@ def _write_dummy_arrayrecord(path: Path, n_records: int = 12, T: int = 4, H: int
         rec_d = {
             "raw_video": frames_THWC.tobytes(),
             "sequence_length": T,
-            "relative_path": f"r{r_i}.mp4",
+            "path": f"r{r_i}.mp4",
             "actions": [f"a{r_i}_{t_i}" for t_i in range(T)],
         }
         writer.write(pickle.dumps(rec_d))
@@ -23,7 +23,7 @@ def _write_dummy_arrayrecord(path: Path, n_records: int = 12, T: int = 4, H: int
 
 
 def _keys_from_batch(batch_d):
-    keys = batch_d["record_key"]
+    keys = batch_d["target_text"]
     if isinstance(keys, np.ndarray):
         return {str(x) for x in keys.tolist()}
     return {str(x) for x in keys}

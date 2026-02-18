@@ -43,7 +43,6 @@ def _batch():
     return {
         "frames": np.stack([frames0_SHWC, frames1_SHWC], axis=0),
         "target_text": ["Frame 0: left", "Frame 0: right"],
-        "meta": [{"record_key": "k0"}, {"record_key": "k1"}],
     }
 
 

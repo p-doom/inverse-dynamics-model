@@ -117,7 +117,7 @@ def _trainable_count(model: torch.nn.Module) -> tuple[int, int]:
 def _to_device(batch_d: dict[str, Any], device: torch.device) -> dict[str, Any]:
     out_d: dict[str, Any] = {}
     for key_s, val in batch_d.items():
-        if key_s in {"videos", "prompt_lens", "meta", "record_key"}:
+        if key_s in {"videos", "prompt_lens", "meta"}:
             continue
         out_d[key_s] = val.to(device, non_blocking=True) if hasattr(val, "to") else val
     return out_d
@@ -164,8 +164,7 @@ def _build_model(args: Args, dtype: torch.dtype, device: torch.device) -> torch.
 
 def main() -> None:
     args = tyro.cli(Args)
-    if not args.data_root:
-        raise ValueError("--data_root is required.")
+    assert args.data_root, "--data_root is required."
 
     rank_i = int(os.environ.get("RANK", 0))
     world_i = int(os.environ.get("WORLD_SIZE", 1))

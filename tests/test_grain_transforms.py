@@ -19,7 +19,7 @@ def _make_record_bytes(T: int = 6, H: int = 2, W: int = 2, C: int = 3, with_acti
     rec_d = {
         "raw_video": frames_THWC.tobytes(),
         "sequence_length": T,
-        "relative_path": "foo/bar.mp4",
+        "path": "foo/bar.mp4",
     }
     if with_actions:
         rec_d["actions"] = [f"a{t_i}" for t_i in range(T)]

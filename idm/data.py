@@ -12,30 +12,11 @@ import numpy as np
 
 
 def derive_record_key(rec_d: dict[str, Any]) -> str:
-    rel_path_s = rec_d.get("relative_path")
-    if isinstance(rel_path_s, str) and rel_path_s:
-        return rel_path_s
+    path_s = rec_d.get("path")
+    if isinstance(path_s, str) and path_s:
+        return path_s
 
-    seg_idx = rec_d.get("seg_idx")
-    user_id = rec_d.get("user_id")
-    session_id = rec_d.get("session_id")
-    if (
-        isinstance(user_id, str)
-        and user_id
-        and isinstance(session_id, str)
-        and session_id
-        and seg_idx is not None
-    ):
-        return f"{user_id}|{session_id}|{int(seg_idx)}"
-
-    video_name_s = rec_d.get("video_file_name")
-    if isinstance(video_name_s, str) and video_name_s and seg_idx is not None:
-        return f"{video_name_s}|{int(seg_idx)}"
-
-    raise ValueError(
-        "Cannot derive stable record key. Need relative_path, "
-        "(user_id,session_id,seg_idx), or (video_file_name,seg_idx)."
-    )
+    raise ValueError("Cannot derive record key. Need non-empty `path`.")
 
 
 def _record_actions(rec_d: dict[str, Any], key_s: str) -> list[str]:
@@ -134,15 +115,6 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         return {
             "frames": frames_THWC[start_i:end_i],
             "actions": list(actions_L[start_i:end_i]),
-            "meta": {
-                "record_key": key_s,
-                "relative_path": rec_d.get("relative_path", ""),
-                "user_id": rec_d.get("user_id", ""),
-                "session_id": rec_d.get("session_id", ""),
-                "seg_idx": rec_d.get("seg_idx", -1),
-                "video_file_name": rec_d.get("video_file_name", ""),
-                "start_idx": start_i,
-            },
         }
 
 
@@ -155,12 +127,9 @@ class BuildSFTExampleFromFrames(grain.transforms.Map):
             raise ValueError("Expected actions as list[str].")
 
         target_text = "\n".join(f"Frame {i}: {a}" for i, a in enumerate(actions_L))
-        meta_d = element.get("meta", {})
         return {
             "frames": element["frames"],
             "target_text": target_text,
-            "meta": meta_d,
-            "record_key": meta_d.get("record_key", ""),
         }
 
 

@@ -1,22 +1,10 @@
-# IDM SFT (Qwen3-VL + ArrayRecord + Grain + torchrun)
+# Inverse Dynamics Model for Screen Recordings
 
-Minimal PyTorch DDP fine-tuning code for:
-- `Qwen/Qwen3-VL-2B-Instruct`
-- `Qwen/Qwen3-VL-4B-Instruct`
-
-Task:
-- Video (multi-frame contiguous sequence) + text SFT.
-- Input: `seq_len` contiguous frames.
-- Target: action text for all `seq_len` frames in order.
-
-Constraints:
-- No TRL / bitsandbytes / accelerate / Trainer.
-- Uses `torch`, `transformers`, `peft`, `grain`, `array_record`, `numpy`, `pickle`.
+This repository contains the code for training an Inverse Dynamics Model for keylog prediction from screen recordings.
 
 ## Install
 
 ```bash
-git clone git@github.com:p-doom/inverse-dynamics-model.git
 cd inverse-dynamics-model
 uv sync
 # for tests:
@@ -38,12 +26,10 @@ data_root/
 Each record is bytes that decode with `pickle.loads` into dict with:
 - required: `raw_video` (bytes), `sequence_length` (int)
 - required: `actions: list[str]` length `T`
-- optional metadata: `relative_path`, `user_id`, `session_id`, `seg_idx`, `video_file_name`
+- required metadata: `path`
 
-Stable key derivation priority:
-1. `relative_path`
-2. `user_id|session_id|seg_idx`
-3. `video_file_name|seg_idx`
+Stable key derivation:
+1. `path` only (no fallback keys)
 
 ## Launch
 
