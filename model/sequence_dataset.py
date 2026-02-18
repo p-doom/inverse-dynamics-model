@@ -108,7 +108,7 @@ class SequenceDataset(Dataset):
                 fb, fa = i, i + 1
                 key_id = key_map.get((fb, fa), KEY_DICT["<pad>"])
                 
-                if key_id == KEY_DICT["<pad>"] or only_ops == False:
+                if key_id == KEY_DICT["<pad>"] and only_ops:
                     continue
                 
                 frame_indices.append((fb, fa))
