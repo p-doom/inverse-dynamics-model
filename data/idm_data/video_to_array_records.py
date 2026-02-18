@@ -578,8 +578,11 @@ def main():
                 )
             )
 
+    print("\n========= Processing split: train =========\n")
     train_episode_metadata = save_split(pool_args["train"], args.num_workers)
+    print("\n========= Processing split: val =========\n")
     val_episode_metadata = save_split(pool_args["val"], args.num_workers)
+    print("\n========= Processing split: test =========\n")
     test_episode_metadata = save_split(pool_args["test"], args.num_workers)
 
     print("Done converting video to array_record files")
