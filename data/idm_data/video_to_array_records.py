@@ -335,7 +335,7 @@ def preprocess_video(
     target_width,
     target_height,
     target_fps,
-    chunk_size,
+    chunk_size
 ):
     """
     Preprocess a video file by reading it, resizing, changing its frame rate,
@@ -388,6 +388,16 @@ def preprocess_video(
             n_frames=n_frames,
             target_fps=target_fps,
         )
+
+        original_count = len(frames)
+        frames, actions = _filter_black_frames(frames, actions)
+        if len(frames) < original_count:
+            print(f"Filtered {original_count - len(frames)} black frames from video {idx}")
+        
+        if len(frames) < chunk_size:
+            print(f"Warning: After filtering, video has {len(frames)} frames, skipping (need {chunk_size})")
+            return [], _failed_result(video_info, "too_short_after_filter")
+
 
         chunk_records = _chunk_video_records(
             video_tensor=frames,
@@ -463,6 +473,54 @@ def _process_video_shard(
 
     return shard_results
 
+def _is_nearly_black(frame: np.ndarray, threshold: float = 10.0, black_ratio: float = 0.95) -> bool:
+    """
+    Check if a frame is nearly black.
+    
+    Args:
+        frame: RGB frame of shape (H, W, 3)
+        threshold: Pixel brightness threshold (0-255)
+        black_ratio: Fraction of pixels that must be below threshold
+    
+    Returns:
+        True if frame is nearly black
+    """
+    brightness = frame.mean(axis=2)
+    black_pixels = (brightness < threshold).sum()
+    total_pixels = brightness.size
+    return (black_pixels / total_pixels) >= black_ratio
+
+
+def _filter_black_frames(
+    frames: np.ndarray,
+    actions: list[str] | None,
+    threshold: float = 10.0,
+    black_ratio: float = 0.95,
+) -> tuple[np.ndarray, list[str] | None]:
+    """
+    Remove nearly-black frames from video and corresponding actions.
+    
+    Args:
+        frames: Video frames of shape (N, H, W, 3)
+        actions: List of action labels (or None)
+        threshold: Pixel brightness threshold
+        black_ratio: Fraction of pixels that must be below threshold
+    
+    Returns:
+        Filtered frames and actions
+    """
+    keep_indices = [
+        i for i in range(len(frames))
+        if not _is_nearly_black(frames[i], threshold, black_ratio)
+    ]
+    
+    if len(keep_indices) == len(frames):
+        return frames, actions
+    
+    filtered_frames = frames[keep_indices]
+    filtered_actions = [actions[i] for i in keep_indices] if actions else None
+    
+    return filtered_frames, filtered_actions
 
 def save_split(pool_args, num_workers: int):
     if not pool_args:
