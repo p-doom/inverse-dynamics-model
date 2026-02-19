@@ -33,8 +33,8 @@ class Args:
     image_h: int = 90
     image_w: int = 160
     image_c: int = 3
-    video_fps: float = 10.0
-    seq_len: int = 32
+    video_fps: float = 30.0
+    seq_len: int = 128
     global_batch_size: int = 8
     grad_accum: int = 1
     max_steps: int = 1000
