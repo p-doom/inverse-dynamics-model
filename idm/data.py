@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import glob
-import json
 import os
 import pickle
 from typing import Any
@@ -139,34 +138,6 @@ def find_array_record_paths(data_root: str, split: str) -> list[str]:
     if not paths:
         raise ValueError(f"No .array_record files found in {split_dir}")
     return paths
-
-
-def load_metadata_json(data_root: str) -> dict[str, Any]:
-    meta_path = os.path.join(data_root, "metadata.json")
-    if not os.path.exists(meta_path):
-        raise ValueError(f"metadata.json not found in {data_root}")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def infer_image_hwc(
-    meta_d: dict[str, Any],
-    image_h: int | None,
-    image_w: int | None,
-    image_c: int | None,
-) -> tuple[int, int, int]:
-    if image_h and image_w and image_c:
-        return int(image_h), int(image_w), int(image_c)
-
-    h = image_h or meta_d.get("target_height")
-    w = image_w or meta_d.get("target_width")
-    c = image_c or meta_d.get("target_channels", 3)
-    if h is None or w is None or c is None:
-        raise ValueError(
-            "Could not infer image dims. Pass --image_h/--image_w/--image_c "
-            "or add target_height/target_width in metadata.json."
-        )
-    return int(h), int(w), int(c)
 
 
 def get_dataloader(

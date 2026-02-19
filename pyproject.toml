@@ -1,6 +1,12 @@
 [project]
 name = "idm"
 version = "0.1.0"
+authors = [
+  { email = "nikolas.rieger@tum.de" },
+  { email = "franz@pdoom.org" },
+  { email = "alfred@pdoom.org" },
+  { email = "mihir@pdoom.org" },
+]
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "array-record>=0.7.2",
@@ -8,7 +14,6 @@ dependencies = [
   "grain>=0.2.10",
   "numpy",
   "peft",
-  "pillow",
   "safetensors",
   "torch",
   "transformers @ git+https://github.com/huggingface/transformers.git",
@@ -20,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "pre-commit",
   "pytest",
 ]
 

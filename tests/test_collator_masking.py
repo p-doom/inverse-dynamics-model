@@ -24,9 +24,33 @@ class _FakeProcessor:
             return f"U:{user_s}\nA:"
         return f"U:{user_s}\nA:{messages[1]['content']}"
 
-    def __call__(self, text, videos, padding, return_tensors):
-        del videos, padding, return_tensors
+    def __call__(self, text, videos, padding, return_tensors, video_metadata=None):
+        del videos, padding, return_tensors, video_metadata
         ids_LL = [[ord(c) for c in t] for t in text]
+        max_len = max(len(x) for x in ids_LL)
+        ids_BS = np.zeros((len(ids_LL), max_len), dtype=np.int64)
+        attn_BS = np.zeros((len(ids_LL), max_len), dtype=np.int64)
+        type_BS = np.ones((len(ids_LL), max_len), dtype=np.int64)
+        for b_i, ids_L in enumerate(ids_LL):
+            ids_BS[b_i, : len(ids_L)] = ids_L
+            attn_BS[b_i, : len(ids_L)] = 1
+        return {"input_ids": ids_BS, "attention_mask": attn_BS, "token_type_ids": type_BS}
+
+
+class _FakeVideoExpandingProcessor(_FakeProcessor):
+    def apply_chat_template(self, messages, tokenize: bool, add_generation_prompt: bool):
+        del tokenize, add_generation_prompt
+        user_s = messages[0]["content"][1]["text"]
+        if len(messages) == 1:
+            return f"U:[VIDEO]{user_s}\nA:"
+        return f"U:[VIDEO]{user_s}\nA:{messages[1]['content']}"
+
+    def __call__(self, text, videos, padding, return_tensors, video_metadata=None):
+        del padding, return_tensors, video_metadata
+        expanded_text = []
+        for text_s, frames_L in zip(text, videos):
+            expanded_text.append(text_s.replace("[VIDEO]", "<V>" * len(frames_L)))
+        ids_LL = [[ord(c) for c in t] for t in expanded_text]
         max_len = max(len(x) for x in ids_LL)
         ids_BS = np.zeros((len(ids_LL), max_len), dtype=np.int64)
         attn_BS = np.zeros((len(ids_LL), max_len), dtype=np.int64)
@@ -67,3 +91,27 @@ def test_collator_preserves_batch_size():
     out_d = collator(_batch())
     assert out_d["input_ids"].shape[0] == 2
     assert len(out_d["videos"]) == 2
+
+
+def test_collator_prompt_len_tracks_video_expansion():
+    processor = _FakeVideoExpandingProcessor()
+    collator = VideoSFTCollator(
+        processor=processor,
+        instruction_text="Predict actions.",
+        video_fps=10.0,
+    )
+    out_d = collator(_batch())
+
+    prompt_msgs, _ = collator._messages("Frame 0: left")
+    prompt_s = processor.apply_chat_template(
+        prompt_msgs,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    naive_prompt_len = len(processor.tokenizer(prompt_s, add_special_tokens=False)["input_ids"])
+    assert out_d["prompt_lens"][0] > naive_prompt_len
+
+    labels_S = out_d["labels"][0]
+    supervised_idx = np.where(labels_S != -100)[0]
+    assert supervised_idx.size > 0
+    assert int(supervised_idx[0]) == out_d["prompt_lens"][0]

@@ -17,6 +17,10 @@ def test_train_args_does_not_expose_actions_path():
     assert "actions_path" not in _TRAIN_MOD.Args.__annotations__
 
 
+def test_train_args_does_not_expose_split():
+    assert "split" not in _TRAIN_MOD.Args.__annotations__
+
+
 def test_get_dataloader_does_not_accept_actions_map():
     sig = inspect.signature(data.get_dataloader)
     assert "actions_map_d" not in sig.parameters
