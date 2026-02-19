@@ -544,8 +544,6 @@ def main() -> None:
     log_loss_sum = 0.0
     log_micro_n = 0
     log_tok_n = 0
-    log_action_correct_n = 0
-    log_action_total_n = 0
     log_step_n = 0
     t0 = time.time()
 
@@ -576,21 +574,11 @@ def main() -> None:
             tok_n = int((model_batch_d["labels"] != -100).sum().item())
 
             with torch.autocast("cuda", dtype=dtype):
-                outputs = ddp_model(**model_batch_d)
-                loss = outputs.loss
+                loss = ddp_model(**model_batch_d).loss
 
             log_loss_sum += float(loss.detach().item())
             log_micro_n += 1
             log_tok_n += tok_n
-            if "target_text" in raw_batch_d and hasattr(outputs, "logits"):
-                correct_i, total_i = _action_accuracy_counts_from_logits(
-                    logits_BSV=outputs.logits.detach(),
-                    labels_BS=model_batch_d["labels"],
-                    target_text_B=raw_batch_d["target_text"],
-                    tokenizer=collator.tokenizer,
-                )
-                log_action_correct_n += correct_i
-                log_action_total_n += total_i
 
             micro_in_accum_i += 1
             loss = loss / args.grad_accum
@@ -625,27 +613,20 @@ def main() -> None:
                     log_loss_sum / max(log_micro_n, 1), device=device
                 )
                 tok_t = torch.tensor(float(log_tok_n), device=device)
-                action_correct_t = torch.tensor(
-                    float(log_action_correct_n), device=device
-                )
-                action_total_t = torch.tensor(float(log_action_total_n), device=device)
                 if world_i > 1:
                     dist.all_reduce(mean_loss_t, op=dist.ReduceOp.SUM)
                     mean_loss_t /= world_i
                     dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(action_correct_t, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(action_total_t, op=dist.ReduceOp.SUM)
 
                 dt = max(time.time() - t0, 1e-9)
                 steps_per_s = log_step_n / dt
                 toks_per_s = tok_t.item() / dt
-                action_acc_f = action_correct_t.item() / max(action_total_t.item(), 1.0)
                 lr_f = optimizer.param_groups[0]["lr"]
                 if rank_i == 0:
                     print(
                         f"step={global_step} loss={mean_loss_t.item():.6f} "
                         f"lr={lr_f:.3e} steps_per_s={steps_per_s:.3f} "
-                        f"tokens_per_s={toks_per_s:.1f} action_acc={action_acc_f:.6f}"
+                        f"tokens_per_s={toks_per_s:.1f}"
                     )
                     if wandb_run is not None:
                         wandb_run.log(
@@ -654,7 +635,6 @@ def main() -> None:
                                 "train/lr": lr_f,
                                 "train/steps_per_s": steps_per_s,
                                 "train/tokens_per_s": toks_per_s,
-                                "train/action_acc": action_acc_f,
                                 "train/epoch_estimate": epoch_i,
                             },
                             step=global_step,
@@ -662,8 +642,6 @@ def main() -> None:
                 log_loss_sum = 0.0
                 log_micro_n = 0
                 log_tok_n = 0
-                log_action_correct_n = 0
-                log_action_total_n = 0
                 log_step_n = 0
                 t0 = time.time()
 
