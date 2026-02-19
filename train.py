@@ -5,7 +5,7 @@ import json
 import os
 import random
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from peft import LoraConfig, get_peft_model
@@ -55,6 +55,8 @@ class Args:
     num_workers: int = 0
     prefetch_buffer_size: int = 1
     log_every: int = 10
+    val_every: int = 0
+    val_steps: int = 1
     save_every: int = 100
     out_dir: str = "./runs/default"
     resume_from: str = ""
@@ -125,6 +127,172 @@ def _to_device(batch_d: dict[str, Any], device: torch.device) -> dict[str, Any]:
             continue
         out_d[key_s] = val.to(device, non_blocking=True) if hasattr(val, "to") else val
     return out_d
+
+
+def _actions_from_target_text(target_s: str) -> list[str]:
+    actions_L = []
+    for line_s in target_s.splitlines():
+        line_s = line_s.strip()
+        if not line_s.startswith("Frame "):
+            continue
+        parts_L = line_s.split(":", 1)
+        if len(parts_L) != 2:
+            continue
+        actions_L.append(parts_L[1].strip())
+    return actions_L
+
+
+def _decode_pred_text_B_from_logits(
+    logits_BSV: torch.Tensor,
+    labels_BS: torch.Tensor,
+    tokenizer: Any,
+) -> list[str]:
+    if logits_BSV.ndim != 3 or labels_BS.ndim != 2:
+        raise ValueError("Expected logits [B,S,V] and labels [B,S].")
+    if logits_BSV.shape[:2] != labels_BS.shape:
+        raise ValueError("logits and labels must align on [B,S].")
+
+    pred_ids_B: list[list[int]] = []
+    for b_i in range(labels_BS.shape[0]):
+        supervised_pos_S = torch.nonzero(
+            labels_BS[b_i] != -100, as_tuple=False
+        ).flatten()
+        supervised_pos_S = supervised_pos_S[supervised_pos_S > 0]
+        if supervised_pos_S.numel() <= 0:
+            pred_ids_B.append([])
+            continue
+        pred_ids_S = logits_BSV[b_i, supervised_pos_S - 1].argmax(dim=-1)
+        pred_ids_B.append([int(x) for x in pred_ids_S.detach().cpu().tolist()])
+
+    if hasattr(tokenizer, "batch_decode"):
+        try:
+            return [
+                str(x)
+                for x in tokenizer.batch_decode(pred_ids_B, skip_special_tokens=True)
+            ]
+        except TypeError:
+            return [str(x) for x in tokenizer.batch_decode(pred_ids_B)]
+
+    if hasattr(tokenizer, "decode"):
+        out_B = []
+        for pred_ids_L in pred_ids_B:
+            try:
+                out_B.append(
+                    str(tokenizer.decode(pred_ids_L, skip_special_tokens=True))
+                )
+            except TypeError:
+                out_B.append(str(tokenizer.decode(pred_ids_L)))
+        return out_B
+
+    raise ValueError("Tokenizer must implement decode or batch_decode.")
+
+
+def _action_accuracy_counts_from_texts(
+    pred_text_B: list[str], target_text_B: list[str]
+) -> tuple[int, int]:
+    if len(pred_text_B) != len(target_text_B):
+        raise ValueError(
+            "pred_text_B and target_text_B length mismatch: "
+            f"{len(pred_text_B)} != {len(target_text_B)}."
+        )
+
+    correct_n = 0
+    total_n = 0
+    for pred_s, target_s in zip(pred_text_B, target_text_B):
+        pred_actions_L = _actions_from_target_text(pred_s)
+        target_actions_L = _actions_from_target_text(target_s)
+        total_n += len(target_actions_L)
+        for idx_i, target_action_s in enumerate(target_actions_L):
+            if idx_i < len(pred_actions_L) and pred_actions_L[idx_i] == target_action_s:
+                correct_n += 1
+    return correct_n, total_n
+
+
+def _action_accuracy_counts_from_logits(
+    logits_BSV: torch.Tensor,
+    labels_BS: torch.Tensor,
+    target_text_B: Any,
+    tokenizer: Any,
+) -> tuple[int, int]:
+    pred_text_B = _decode_pred_text_B_from_logits(logits_BSV, labels_BS, tokenizer)
+    if isinstance(target_text_B, np.ndarray):
+        target_text_L = [str(x) for x in target_text_B.tolist()]
+    else:
+        target_text_L = [str(x) for x in target_text_B]
+    return _action_accuracy_counts_from_texts(pred_text_B, target_text_L)
+
+
+def _should_run_validation(global_step: int, val_every: int) -> bool:
+    if val_every <= 0:
+        return False
+    return global_step % val_every == 0
+
+
+def _run_validation_steps(
+    ddp_model: torch.nn.Module,
+    collator: VideoSFTCollator,
+    val_it: Any,
+    make_val_iter: Callable[[int], Any],
+    val_epoch_i: int,
+    val_steps: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[float, int, int, int, Any, int]:
+    if val_steps <= 0:
+        raise ValueError("--val_steps must be >= 1.")
+
+    was_training = bool(getattr(ddp_model, "training", False))
+    ddp_model.eval()
+    val_loss_sum = 0.0
+    val_tok_n = 0
+    val_action_correct_n = 0
+    val_action_total_n = 0
+
+    with torch.no_grad():
+        for _ in range(val_steps):
+            try:
+                raw_batch_d = next(val_it)
+            except StopIteration:
+                val_epoch_i += 1
+                val_it = make_val_iter(val_epoch_i)
+                try:
+                    raw_batch_d = next(val_it)
+                except StopIteration as e:
+                    raise ValueError(
+                        "Validation dataloader yielded no batches. "
+                        "Check val split size and global_batch_size/world_size."
+                    ) from e
+
+            model_batch_d = _to_device(collator(raw_batch_d), device)
+            val_tok_n += int((model_batch_d["labels"] != -100).sum().item())
+            with torch.autocast(
+                device_type=device.type,
+                dtype=dtype,
+                enabled=(device.type == "cuda"),
+            ):
+                outputs = ddp_model(**model_batch_d)
+                loss = outputs.loss
+            val_loss_sum += float(loss.detach().item())
+            if "target_text" in raw_batch_d and hasattr(outputs, "logits"):
+                correct_i, total_i = _action_accuracy_counts_from_logits(
+                    logits_BSV=outputs.logits.detach(),
+                    labels_BS=model_batch_d["labels"],
+                    target_text_B=raw_batch_d["target_text"],
+                    tokenizer=collator.tokenizer,
+                )
+                val_action_correct_n += correct_i
+                val_action_total_n += total_i
+
+    if was_training:
+        ddp_model.train()
+    return (
+        val_loss_sum / val_steps,
+        val_tok_n,
+        val_action_correct_n,
+        val_action_total_n,
+        val_it,
+        val_epoch_i,
+    )
 
 
 def _resolve_resume_dir(args: Args) -> str:
@@ -224,6 +392,10 @@ def main() -> None:
         raise ValueError("--grad_accum must be >= 1.")
     if args.log_every <= 0:
         raise ValueError("--log_every must be >= 1.")
+    if args.val_every < 0:
+        raise ValueError("--val_every must be >= 0.")
+    if args.val_steps <= 0:
+        raise ValueError("--val_steps must be >= 1.")
     if args.save_every <= 0:
         raise ValueError("--save_every must be >= 1.")
     if args.video_fps <= 0:
@@ -255,6 +427,21 @@ def main() -> None:
             "does not match the preprocessed data, or records are missing in-record `actions`."
         )
 
+    val_enabled = args.val_every > 0
+    val_array_paths: list[str] = []
+    if val_enabled:
+        val_array_paths = find_array_record_paths(args.data_root, "val")
+        valid_val_n = count_valid_records(
+            val_array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
+        )
+        if valid_val_n <= 0:
+            raise ValueError(
+                "No valid records found in val split after checks. "
+                "Ensure val data matches --image-h/--image-w/--image-c and --seq-len."
+            )
+        if rank_i == 0:
+            print(f"valid_val_records={valid_val_n}")
+
     per_rank_bs = args.global_batch_size // world_i
     micro_per_epoch = (valid_n // world_i) // per_rank_bs
     opt_per_epoch = max(micro_per_epoch // max(args.grad_accum, 1), 1)
@@ -284,6 +471,26 @@ def main() -> None:
         instruction_text=args.instruction_text,
         video_fps=args.video_fps,
     )
+    val_epoch_i = 0
+
+    def _make_val_iter(epoch_for_val_i: int):
+        val_loader = get_dataloader(
+            array_record_paths=val_array_paths,
+            seq_len=args.seq_len,
+            global_batch_size=args.global_batch_size,
+            image_h=args.image_h,
+            image_w=args.image_w,
+            image_c=args.image_c,
+            rank=rank_i,
+            world_size=world_i,
+            seed=args.seed,
+            epoch_i=epoch_for_val_i,
+            num_workers=args.num_workers,
+            prefetch_buffer_size=args.prefetch_buffer_size,
+        )
+        return iter(val_loader)
+
+    val_it = _make_val_iter(val_epoch_i) if val_enabled else None
     optimizer = torch.optim.AdamW(
         (p for p in ddp_model.parameters() if p.requires_grad),
         lr=args.lr,
@@ -337,6 +544,8 @@ def main() -> None:
     log_loss_sum = 0.0
     log_micro_n = 0
     log_tok_n = 0
+    log_action_correct_n = 0
+    log_action_total_n = 0
     log_step_n = 0
     t0 = time.time()
 
@@ -367,11 +576,21 @@ def main() -> None:
             tok_n = int((model_batch_d["labels"] != -100).sum().item())
 
             with torch.autocast("cuda", dtype=dtype):
-                loss = ddp_model(**model_batch_d).loss
+                outputs = ddp_model(**model_batch_d)
+                loss = outputs.loss
 
             log_loss_sum += float(loss.detach().item())
             log_micro_n += 1
             log_tok_n += tok_n
+            if "target_text" in raw_batch_d and hasattr(outputs, "logits"):
+                correct_i, total_i = _action_accuracy_counts_from_logits(
+                    logits_BSV=outputs.logits.detach(),
+                    labels_BS=model_batch_d["labels"],
+                    target_text_B=raw_batch_d["target_text"],
+                    tokenizer=collator.tokenizer,
+                )
+                log_action_correct_n += correct_i
+                log_action_total_n += total_i
 
             micro_in_accum_i += 1
             loss = loss / args.grad_accum
@@ -406,20 +625,27 @@ def main() -> None:
                     log_loss_sum / max(log_micro_n, 1), device=device
                 )
                 tok_t = torch.tensor(float(log_tok_n), device=device)
+                action_correct_t = torch.tensor(
+                    float(log_action_correct_n), device=device
+                )
+                action_total_t = torch.tensor(float(log_action_total_n), device=device)
                 if world_i > 1:
                     dist.all_reduce(mean_loss_t, op=dist.ReduceOp.SUM)
                     mean_loss_t /= world_i
                     dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(action_correct_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(action_total_t, op=dist.ReduceOp.SUM)
 
                 dt = max(time.time() - t0, 1e-9)
                 steps_per_s = log_step_n / dt
                 toks_per_s = tok_t.item() / dt
+                action_acc_f = action_correct_t.item() / max(action_total_t.item(), 1.0)
                 lr_f = optimizer.param_groups[0]["lr"]
                 if rank_i == 0:
                     print(
                         f"step={global_step} loss={mean_loss_t.item():.6f} "
                         f"lr={lr_f:.3e} steps_per_s={steps_per_s:.3f} "
-                        f"tokens_per_s={toks_per_s:.1f}"
+                        f"tokens_per_s={toks_per_s:.1f} action_acc={action_acc_f:.6f}"
                     )
                     if wandb_run is not None:
                         wandb_run.log(
@@ -428,6 +654,7 @@ def main() -> None:
                                 "train/lr": lr_f,
                                 "train/steps_per_s": steps_per_s,
                                 "train/tokens_per_s": toks_per_s,
+                                "train/action_acc": action_acc_f,
                                 "train/epoch_estimate": epoch_i,
                             },
                             step=global_step,
@@ -435,8 +662,66 @@ def main() -> None:
                 log_loss_sum = 0.0
                 log_micro_n = 0
                 log_tok_n = 0
+                log_action_correct_n = 0
+                log_action_total_n = 0
                 log_step_n = 0
                 t0 = time.time()
+
+            if _should_run_validation(global_step, args.val_every):
+                assert val_it is not None
+                val_t0 = time.time()
+                (
+                    val_loss_f,
+                    val_tok_n,
+                    val_action_correct_n,
+                    val_action_total_n,
+                    val_it,
+                    val_epoch_i,
+                ) = _run_validation_steps(
+                    ddp_model=ddp_model,
+                    collator=collator,
+                    val_it=val_it,
+                    make_val_iter=_make_val_iter,
+                    val_epoch_i=val_epoch_i,
+                    val_steps=args.val_steps,
+                    device=device,
+                    dtype=dtype,
+                )
+                val_loss_t = torch.tensor(val_loss_f, device=device)
+                val_tok_t = torch.tensor(float(val_tok_n), device=device)
+                val_action_correct_t = torch.tensor(
+                    float(val_action_correct_n), device=device
+                )
+                val_action_total_t = torch.tensor(
+                    float(val_action_total_n), device=device
+                )
+                if world_i > 1:
+                    dist.all_reduce(val_loss_t, op=dist.ReduceOp.SUM)
+                    val_loss_t /= world_i
+                    dist.all_reduce(val_tok_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(val_action_correct_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(val_action_total_t, op=dist.ReduceOp.SUM)
+                val_dt = max(time.time() - val_t0, 1e-9)
+                val_toks_per_s = val_tok_t.item() / val_dt
+                val_action_acc_f = val_action_correct_t.item() / max(
+                    val_action_total_t.item(), 1.0
+                )
+                if rank_i == 0:
+                    print(
+                        f"step={global_step} val_loss={val_loss_t.item():.6f} "
+                        f"val_steps={args.val_steps} val_tokens_per_s={val_toks_per_s:.1f} "
+                        f"val_action_acc={val_action_acc_f:.6f}"
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "val/loss": val_loss_t.item(),
+                                "val/tokens_per_s": val_toks_per_s,
+                                "val/action_acc": val_action_acc_f,
+                                "val/epoch_estimate": val_epoch_i,
+                            },
+                            step=global_step,
+                        )
 
             if global_step % args.save_every == 0 or global_step == args.max_steps:
                 save_checkpoint(
