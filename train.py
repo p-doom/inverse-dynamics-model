@@ -14,6 +14,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 import tyro
+import wandb
 
 from idm.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
 from idm.collator import VideoSFTCollator
@@ -57,7 +58,9 @@ class Args:
     save_every: int = 100
     out_dir: str = "./runs/default"
     resume_from: str = ""
-    instruction_text: str = "Given the video frames, output the action text for each frame in order."
+    instruction_text: str = (
+        "Given the video frames, output the action text for each frame in order."
+    )
     wandb_enable: bool = True
     wandb_project: str = "idm"
     wandb_entity: str = ""
@@ -70,7 +73,9 @@ def _rng_state_d() -> dict[str, Any]:
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch_cpu": torch.get_rng_state(),
-        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        ),
     }
 
 
@@ -165,7 +170,9 @@ def _assert_image_hwc_matches_metadata(args: Args) -> None:
         )
 
 
-def _build_model(args: Args, dtype: torch.dtype, device: torch.device) -> torch.nn.Module:
+def _build_model(
+    args: Args, dtype: torch.dtype, device: torch.device
+) -> torch.nn.Module:
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_id,
         torch_dtype=dtype,
@@ -206,9 +213,13 @@ def main() -> None:
     if torch.cuda.device_count() == 0:
         raise RuntimeError("No CUDA devices found.")
     if world_i <= 0 or rank_i < 0 or rank_i >= world_i:
-        raise ValueError(f"Invalid distributed env rank={rank_i}, world_size={world_i}.")
+        raise ValueError(
+            f"Invalid distributed env rank={rank_i}, world_size={world_i}."
+        )
     if args.global_batch_size % world_i != 0:
-        raise ValueError(f"global_batch_size ({args.global_batch_size}) must divide world_size ({world_i}).")
+        raise ValueError(
+            f"global_batch_size ({args.global_batch_size}) must divide world_size ({world_i})."
+        )
     if args.grad_accum <= 0:
         raise ValueError("--grad_accum must be >= 1.")
     if args.log_every <= 0:
@@ -234,7 +245,9 @@ def main() -> None:
     _assert_image_hwc_matches_metadata(args)
 
     array_paths = find_array_record_paths(args.data_root, "train")
-    valid_n = count_valid_records(array_paths, args.seq_len, args.image_h, args.image_w, args.image_c)
+    valid_n = count_valid_records(
+        array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
+    )
     if valid_n <= 0:
         raise ValueError(
             "No valid records after checks. "
@@ -256,9 +269,16 @@ def main() -> None:
     model = _build_model(args, dtype, device)
     if rank_i == 0:
         train_n, total_n = _trainable_count(model)
-        print(f"trainable_params={train_n} total_params={total_n} ratio={train_n/max(total_n,1):.6f}")
+        print(
+            f"trainable_params={train_n} total_params={total_n} ratio={train_n/max(total_n,1):.6f}"
+        )
 
-    ddp_model = DDP(model, device_ids=[local_rank_i], output_device=local_rank_i, find_unused_parameters=False)
+    ddp_model = DDP(
+        model,
+        device_ids=[local_rank_i],
+        output_device=local_rank_i,
+        find_unused_parameters=False,
+    )
     collator = VideoSFTCollator(
         processor=processor,
         instruction_text=args.instruction_text,
@@ -275,8 +295,6 @@ def main() -> None:
 
     wandb_run = None
     if rank_i == 0 and args.wandb_enable:
-        import wandb
-
         wandb_run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity or None,
@@ -310,7 +328,9 @@ def main() -> None:
         if state_d.get("rng_state_d") is not None:
             _set_rng_state(state_d["rng_state_d"])
         if rank_i == 0:
-            print(f"Resumed from {resume_dir} at global_step={global_step}, epoch_i={epoch_i}")
+            print(
+                f"Resumed from {resume_dir} at global_step={global_step}, epoch_i={epoch_i}"
+            )
 
     optimizer.zero_grad(set_to_none=True)
     micro_in_accum_i = 0
@@ -382,7 +402,9 @@ def main() -> None:
             log_step_n += 1
 
             if global_step % args.log_every == 0:
-                mean_loss_t = torch.tensor(log_loss_sum / max(log_micro_n, 1), device=device)
+                mean_loss_t = torch.tensor(
+                    log_loss_sum / max(log_micro_n, 1), device=device
+                )
                 tok_t = torch.tensor(float(log_tok_n), device=device)
                 if world_i > 1:
                     dist.all_reduce(mean_loss_t, op=dist.ReduceOp.SUM)
@@ -424,7 +446,9 @@ def main() -> None:
                     use_lora=args.use_lora,
                     optimizer=optimizer,
                     scheduler=scheduler,
-                    scaler_state=scaler.state_dict() if args.precision == "fp16" else None,
+                    scaler_state=(
+                        scaler.state_dict() if args.precision == "fp16" else None
+                    ),
                     train_state_d={
                         "global_step": global_step,
                         "epoch_i": epoch_i,

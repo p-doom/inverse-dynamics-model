@@ -8,6 +8,7 @@ Train an inverse dynamics model that predicts per-frame actions from screen-reco
 uv sync
 # optional test deps
 uv sync --extra dev
+uv run pre-commit install
 ```
 
 ## Data
