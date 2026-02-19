@@ -14,7 +14,6 @@ dependencies = [
   "grain>=0.2.10",
   "numpy",
   "peft",
-  "pillow",
   "safetensors",
   "torch",
   "transformers @ git+https://github.com/huggingface/transformers.git",

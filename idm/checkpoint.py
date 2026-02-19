@@ -51,8 +51,11 @@ def _save_model(ckpt_dir: Path, model: Any, use_lora: bool) -> None:
 def _load_model(ckpt_dir: Path, model: Any, use_lora: bool) -> None:
     if use_lora:
         adapter_dir = ckpt_dir / "adapter"
-        if adapter_dir.exists() and hasattr(model, "load_adapter"):
-            model.load_adapter(str(adapter_dir), adapter_name="default")
+        if not adapter_dir.exists():
+            raise ValueError(f"LoRA adapter directory missing: {adapter_dir}")
+        if not hasattr(model, "load_adapter"):
+            raise ValueError("LoRA load requires model.load_adapter.")
+        model.load_adapter(str(adapter_dir), adapter_name="default", is_trainable=True)
         return
 
     with open(ckpt_dir / "model_state.pkl", "rb") as f:

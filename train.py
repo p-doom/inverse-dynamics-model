@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 import os
 import random
 import time
@@ -20,8 +21,6 @@ from idm.data import (
     count_valid_records,
     find_array_record_paths,
     get_dataloader,
-    infer_image_hwc,
-    load_metadata_json,
 )
 from idm.lr_schedules import LRScheduleArgs, lr_at_step
 
@@ -30,10 +29,10 @@ from idm.lr_schedules import LRScheduleArgs, lr_at_step
 class Args:
     model_id: str = "Qwen/Qwen3-VL-2B-Instruct"
     data_root: str = ""
-    split: str = "train"
-    image_h: int | None = None
-    image_w: int | None = None
-    image_c: int | None = 3
+    image_h: int = 90
+    image_w: int = 160
+    image_c: int = 3
+    video_fps: float = 10.0
     seq_len: int = 32
     global_batch_size: int = 8
     grad_accum: int = 1
@@ -131,6 +130,41 @@ def _resolve_resume_dir(args: Args) -> str:
     return args.resume_from
 
 
+def _load_metadata_json(data_root: str) -> dict[str, Any]:
+    meta_path = os.path.join(data_root, "metadata.json")
+    if not os.path.exists(meta_path):
+        raise ValueError(
+            f"metadata.json not found in {data_root}. "
+            "Run preprocessing first and keep metadata.json in --data-root."
+        )
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_d = json.load(f)
+    if not isinstance(meta_d, dict):
+        raise ValueError(f"metadata.json must contain a JSON object: {meta_path}")
+    return meta_d
+
+
+def _assert_image_hwc_matches_metadata(args: Args) -> None:
+    meta_d = _load_metadata_json(args.data_root)
+    missing_L = [k for k in ("target_height", "target_width") if meta_d.get(k) is None]
+    if missing_L:
+        raise ValueError(
+            f"metadata.json is missing required keys: {', '.join(missing_L)}. "
+            "Expected target_height/target_width and optional target_channels."
+        )
+
+    meta_h = int(meta_d["target_height"])
+    meta_w = int(meta_d["target_width"])
+    meta_c = int(meta_d.get("target_channels", 3))
+    if (args.image_h, args.image_w, args.image_c) != (meta_h, meta_w, meta_c):
+        raise ValueError(
+            "Image shape mismatch with metadata.json. "
+            f"metadata HxWxC={meta_h}x{meta_w}x{meta_c}, "
+            f"args HxWxC={args.image_h}x{args.image_w}x{args.image_c}. "
+            "Pass matching --image-h/--image-w/--image-c."
+        )
+
+
 def _build_model(args: Args, dtype: torch.dtype, device: torch.device) -> torch.nn.Module:
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_id,
@@ -175,22 +209,38 @@ def main() -> None:
         raise ValueError(f"Invalid distributed env rank={rank_i}, world_size={world_i}.")
     if args.global_batch_size % world_i != 0:
         raise ValueError(f"global_batch_size ({args.global_batch_size}) must divide world_size ({world_i}).")
+    if args.grad_accum <= 0:
+        raise ValueError("--grad_accum must be >= 1.")
+    if args.log_every <= 0:
+        raise ValueError("--log_every must be >= 1.")
+    if args.save_every <= 0:
+        raise ValueError("--save_every must be >= 1.")
+    if args.video_fps <= 0:
+        raise ValueError("--video_fps must be > 0.")
+
+    print(f"Rank {rank_i} initializing process group...")
+    print(f"Local rank: {local_rank_i}")
+    if rank_i == 0:
+        print(
+            f"World size: {world_i}\n"
+            f"CUDA devices: {torch.cuda.device_count()}\n"
+            f"CUDA device: {torch.cuda.get_device_name(local_rank_i)}"
+        )
 
     dist.init_process_group("nccl")
     torch.cuda.set_device(local_rank_i)
     device = torch.device(f"cuda:{local_rank_i}")
     _seed_all(args.seed, rank_i)
+    _assert_image_hwc_matches_metadata(args)
 
-    image_h, image_w, image_c = infer_image_hwc(
-        load_metadata_json(args.data_root),
-        args.image_h,
-        args.image_w,
-        args.image_c,
-    )
-    array_paths = find_array_record_paths(args.data_root, args.split)
-    valid_n = count_valid_records(array_paths, args.seq_len, image_h, image_w, image_c)
+    array_paths = find_array_record_paths(args.data_root, "train")
+    valid_n = count_valid_records(array_paths, args.seq_len, args.image_h, args.image_w, args.image_c)
     if valid_n <= 0:
-        raise ValueError("No valid records after checks. Ensure records contain in-record `actions`.")
+        raise ValueError(
+            "No valid records after checks. "
+            "This usually means your explicit --image-h/--image-w/--image-c or --seq-len "
+            "does not match the preprocessed data, or records are missing in-record `actions`."
+        )
 
     per_rank_bs = args.global_batch_size // world_i
     micro_per_epoch = (valid_n // world_i) // per_rank_bs
@@ -209,14 +259,18 @@ def main() -> None:
         print(f"trainable_params={train_n} total_params={total_n} ratio={train_n/max(total_n,1):.6f}")
 
     ddp_model = DDP(model, device_ids=[local_rank_i], output_device=local_rank_i, find_unused_parameters=False)
-    collator = VideoSFTCollator(processor=processor, instruction_text=args.instruction_text)
+    collator = VideoSFTCollator(
+        processor=processor,
+        instruction_text=args.instruction_text,
+        video_fps=args.video_fps,
+    )
     optimizer = torch.optim.AdamW(
         (p for p in ddp_model.parameters() if p.requires_grad),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
     scheduler = _build_scheduler(optimizer, args)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.precision == "fp16")
+    scaler = torch.amp.GradScaler(enabled=args.precision == "fp16")
     os.makedirs(args.out_dir, exist_ok=True)
 
     wandb_run = None
@@ -272,9 +326,9 @@ def main() -> None:
             array_record_paths=array_paths,
             seq_len=args.seq_len,
             global_batch_size=args.global_batch_size,
-            image_h=image_h,
-            image_w=image_w,
-            image_c=image_c,
+            image_h=args.image_h,
+            image_w=args.image_w,
+            image_c=args.image_c,
             rank=rank_i,
             world_size=world_i,
             seed=args.seed,
@@ -288,6 +342,7 @@ def main() -> None:
             pending_state_b = None
 
         for raw_batch_d in it:
+            ddp_model.train()
             model_batch_d = _to_device(collator(raw_batch_d), device)
             tok_n = int((model_batch_d["labels"] != -100).sum().item())
 
@@ -300,11 +355,19 @@ def main() -> None:
 
             micro_in_accum_i += 1
             loss = loss / args.grad_accum
-            if args.precision == "fp16":
-                scaler.scale(loss).backward()
+            should_step_b = micro_in_accum_i >= args.grad_accum
+            if not should_step_b and world_i > 1:
+                with ddp_model.no_sync():
+                    if args.precision == "fp16":
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
             else:
-                loss.backward()
-            if micro_in_accum_i < args.grad_accum:
+                if args.precision == "fp16":
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            if not should_step_b:
                 continue
 
             micro_in_accum_i = 0
