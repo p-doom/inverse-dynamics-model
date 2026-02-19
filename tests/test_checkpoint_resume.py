@@ -1,6 +1,8 @@
 import pickle
 from pathlib import Path
 
+import pytest
+
 from idm.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
 
 
@@ -116,3 +118,27 @@ def test_checkpoint_payload_is_pickle_readable(tmp_path: Path):
     payload_d = pickle.loads(payload_p.read_bytes())
     assert payload_d["train_state_d"]["global_step"] == 3
     assert payload_d["args_d"]["seed"] == 42
+
+
+def test_lora_load_raises_when_adapter_missing(tmp_path: Path):
+    ckpt_dir = save_checkpoint(
+        out_dir=str(tmp_path),
+        step_i=11,
+        model=_FakeModel(),
+        use_lora=True,
+        optimizer=_FakeOpt(),
+        scheduler=_FakeOpt(),
+        scaler_state=None,
+        train_state_d={"global_step": 11},
+        grain_state_b=b"abc",
+        args_d={"seed": 7},
+        save_model=False,
+    )
+    with pytest.raises(ValueError, match="adapter"):
+        load_checkpoint(
+            ckpt_dir=ckpt_dir,
+            model=_FakeModel(),
+            use_lora=True,
+            optimizer=_FakeOpt(),
+            scheduler=_FakeOpt(),
+        )

@@ -4,25 +4,20 @@ from typing import Any
 
 import numpy as np
 
-try:
-    from PIL import Image
-except Exception:  # pragma: no cover
-    Image = None
-
 
 class VideoSFTCollator:
     def __init__(
         self,
         processor: Any,
         instruction_text: str,
-        convert_frames_to_pil: bool = True,
+        video_fps: float | None = None,
     ):
         self.processor = processor
         self.tokenizer = getattr(processor, "tokenizer", None)
         if self.tokenizer is None:
             raise ValueError("Processor must expose `tokenizer`.")
         self.instruction_text = instruction_text
-        self.convert_frames_to_pil = convert_frames_to_pil
+        self.video_fps = video_fps
 
     def _messages(self, target_s: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         prompt_msgs = [
@@ -38,18 +33,16 @@ class VideoSFTCollator:
         return prompt_msgs, full_msgs
 
     def _video_input(self, frames_SHWC: np.ndarray) -> list[Any]:
-        frames_L = [frames_SHWC[i] for i in range(frames_SHWC.shape[0])]
-        if self.convert_frames_to_pil and Image is not None:
-            return [Image.fromarray(frame_HWC) for frame_HWC in frames_L]
-        return frames_L
+        return [frames_SHWC[i] for i in range(frames_SHWC.shape[0])]
 
     def __call__(self, batch_d: dict[str, Any]) -> dict[str, Any]:
         frames_BSHWC = batch_d["frames"]
         target_B = batch_d["target_text"]
 
         videos_B = []
+        prompt_text_B = []
         full_text_B = []
-        prompt_lens_B = []
+        video_metadata_B = []
         for frames_SHWC, target_s in zip(frames_BSHWC, target_B):
             prompt_msgs, full_msgs = self._messages(target_s)
             prompt_s = self.processor.apply_chat_template(
@@ -62,20 +55,47 @@ class VideoSFTCollator:
                 tokenize=False,
                 add_generation_prompt=False,
             )
-            prompt_len = len(
-                self.tokenizer(prompt_s, add_special_tokens=False)["input_ids"]
-            )
             videos_B.append(self._video_input(frames_SHWC))
+            prompt_text_B.append(prompt_s)
             full_text_B.append(full_s)
-            prompt_lens_B.append(prompt_len)
+            if self.video_fps is not None:
+                video_metadata_B.append(
+                    {
+                        "total_num_frames": int(frames_SHWC.shape[0]),
+                        "fps": float(self.video_fps),
+                        "frames_indices": list(range(int(frames_SHWC.shape[0]))),
+                    }
+                )
 
-        enc_d = self.processor(
-            text=full_text_B,
-            videos=videos_B,
-            padding=True,
-            return_tensors="pt",
-        )
+        processor_kwargs = {
+            "text": full_text_B,
+            "videos": videos_B,
+            "padding": True,
+            "return_tensors": "pt",
+        }
+        prompt_kwargs = {
+            "text": prompt_text_B,
+            "videos": videos_B,
+            "padding": True,
+            "return_tensors": "pt",
+        }
+        if self.video_fps is not None:
+            processor_kwargs["video_metadata"] = video_metadata_B
+            prompt_kwargs["video_metadata"] = video_metadata_B
+
+        enc_d = self.processor(**processor_kwargs)
         enc_d.pop("token_type_ids", None)
+        prompt_enc_d = self.processor(**prompt_kwargs)
+        prompt_enc_d.pop("token_type_ids", None)
+
+        if "attention_mask" in prompt_enc_d:
+            prompt_mask_BS = prompt_enc_d["attention_mask"]
+            if hasattr(prompt_mask_BS, "sum") and hasattr(prompt_mask_BS, "dim"):
+                prompt_lens_B = [int(x) for x in prompt_mask_BS.sum(dim=1).tolist()]
+            else:
+                prompt_lens_B = [int(x) for x in prompt_mask_BS.sum(axis=1).tolist()]
+        else:
+            raise ValueError("Processor output is missing `attention_mask`; cannot mask prompt tokens reliably.")
 
         input_ids_BS = enc_d["input_ids"]
         labels_BS = (
