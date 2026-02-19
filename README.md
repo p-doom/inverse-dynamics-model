@@ -30,6 +30,8 @@ uv run python data/idm_data/video_to_array_records.py \
   --target-width 160 \
   --target-height 90 \
   --target-fps 10 \
+  --top-bar-fraction 0.15 \
+  --black-ratio 0.95 \
   --chunk-size 160 \
   --chunks-per-file 100 \
   --num-workers 16

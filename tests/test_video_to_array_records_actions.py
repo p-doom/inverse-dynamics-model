@@ -23,12 +23,15 @@ _actions_from_keylog_file = _MODULE._actions_from_keylog_file
 _chunk_video_records = _MODULE._chunk_video_records
 _write_chunk_records = _MODULE._write_chunk_records
 _get_keylog_path = _MODULE._get_keylog_path
+_filter_black_frames = _MODULE._filter_black_frames
 
 
 def test_get_keylog_path() -> None:
     filename_s = "/tmp/uploads/0.1.0/u123/recordings/recording_abc-def_seg0007.mp4"
     out_p = _get_keylog_path(filename_s)
-    assert out_p == Path("/tmp/uploads/0.1.0/u123/keylogs/input_abc-def_seg0007.msgpack")
+    assert out_p == Path(
+        "/tmp/uploads/0.1.0/u123/keylogs/input_abc-def_seg0007.msgpack"
+    )
 
 
 def test_actions_from_keylog_file_aligns_to_target_fps(tmp_path: Path) -> None:
@@ -112,6 +115,32 @@ def test_write_chunk_records_can_mix_multiple_videos(tmp_path: Path) -> None:
     assert {rec0_d["path"], rec1_d["path"]} == {"/abs/v0.mp4", "/abs/v1.mp4"}
 
 
+def test_filter_black_frames_ignores_top_bar_fraction() -> None:
+    frames_THWC = np.full((3, 4, 4, 3), 255, dtype=np.uint8)
+    frames_THWC[1, 1:, :, :] = 0
+    actions_L = ["a0", "a1", "a2"]
+
+    no_crop_segments = _filter_black_frames(
+        frames=frames_THWC,
+        actions=actions_L,
+        threshold=10.0,
+        black_ratio=0.95,
+        top_bar_fraction=0.0,
+    )
+    with_crop_segments = _filter_black_frames(
+        frames=frames_THWC,
+        actions=actions_L,
+        threshold=10.0,
+        black_ratio=0.95,
+        top_bar_fraction=0.25,
+    )
+
+    assert len(no_crop_segments) == 1
+    assert len(with_crop_segments) == 2
+    assert with_crop_segments[0][1] == ["a0"]
+    assert with_crop_segments[1][1] == ["a2"]
+
+
 def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
     original_preprocess = _MODULE.preprocess_video
 
@@ -122,8 +151,18 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
         target_height: int,
         target_fps: int,
         chunk_size: int,
+        top_bar_fraction: float,
+        black_ratio: float,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-        del idx, target_width, target_height, target_fps, chunk_size
+        del (
+            idx,
+            target_width,
+            target_height,
+            target_fps,
+            chunk_size,
+            top_bar_fraction,
+            black_ratio,
+        )
         chunk_d = {
             "raw_video": np.zeros((4, 2, 2, 3), dtype=np.uint8).tobytes(),
             "sequence_length": 4,
@@ -135,8 +174,30 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
     try:
         _MODULE.preprocess_video = _fake_preprocess
         shard_args = [
-            (0, {"filename": "/a.mp4", "path": "/abs/a.mp4"}, str(tmp_path), 160, 90, 10, 4, 4),
-            (1, {"filename": "/b.mp4", "path": "/abs/b.mp4"}, str(tmp_path), 160, 90, 10, 4, 4),
+            (
+                0,
+                {"filename": "/a.mp4", "path": "/abs/a.mp4"},
+                str(tmp_path),
+                160,
+                90,
+                10,
+                4,
+                4,
+                0.15,
+                0.95,
+            ),
+            (
+                1,
+                {"filename": "/b.mp4", "path": "/abs/b.mp4"},
+                str(tmp_path),
+                160,
+                90,
+                10,
+                4,
+                4,
+                0.15,
+                0.95,
+            ),
         ]
         out_rows_L = _MODULE._process_video_shard(worker_idx=0, shard_args=shard_args)
     finally:
