@@ -84,6 +84,55 @@ def test_chunk_video_records_embeds_action_slices() -> None:
     assert rec1_d["actions"] == ["a4", "a5", "a6", "a7"]
 
 
+def test_chunk_video_records_filters_pure_noop_chunks_when_enabled() -> None:
+    frames_THWC = np.arange(8 * 2 * 2 * 3, dtype=np.uint8).reshape(8, 2, 2, 3)
+    actions_L = [
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+        "KEY_DOWN:W",
+        "NO_OP",
+        "NO_OP",
+    ]
+    video_info_d = {
+        "filename": "/tmp/v.mp4",
+        "path": "x/v.mp4",
+    }
+
+    chunks_L = _chunk_video_records(
+        video_tensor=frames_THWC,
+        video_info=video_info_d,
+        chunk_size=4,
+        actions=actions_L,
+        filter_pure_noop_chunks=True,
+    )
+
+    assert len(chunks_L) == 1
+    assert chunks_L[0]["actions"] == ["NO_OP", "KEY_DOWN:W", "NO_OP", "NO_OP"]
+
+
+def test_chunk_video_records_keeps_pure_noop_chunks_by_default() -> None:
+    frames_THWC = np.arange(8 * 2 * 2 * 3, dtype=np.uint8).reshape(8, 2, 2, 3)
+    actions_L = ["NO_OP"] * 8
+    video_info_d = {
+        "filename": "/tmp/v.mp4",
+        "path": "x/v.mp4",
+    }
+
+    chunks_L = _chunk_video_records(
+        video_tensor=frames_THWC,
+        video_info=video_info_d,
+        chunk_size=4,
+        actions=actions_L,
+    )
+
+    assert len(chunks_L) == 2
+    assert chunks_L[0]["actions"] == ["NO_OP"] * 4
+    assert chunks_L[1]["actions"] == ["NO_OP"] * 4
+
+
 def test_write_chunk_records_can_mix_multiple_videos(tmp_path: Path) -> None:
     chunk0_d = {
         "raw_video": np.zeros((4, 2, 2, 3), dtype=np.uint8).tobytes(),
@@ -143,6 +192,7 @@ def test_filter_black_frames_ignores_top_bar_fraction() -> None:
 
 def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
     original_preprocess = _MODULE.preprocess_video
+    seen_filter_flags: list[bool] = []
 
     def _fake_preprocess(
         idx: int,
@@ -153,6 +203,7 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
         chunk_size: int,
         top_bar_fraction: float,
         black_ratio: float,
+        filter_pure_noop_chunks: bool = False,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
             idx,
@@ -163,6 +214,7 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
             top_bar_fraction,
             black_ratio,
         )
+        seen_filter_flags.append(filter_pure_noop_chunks)
         chunk_d = {
             "raw_video": np.zeros((4, 2, 2, 3), dtype=np.uint8).tobytes(),
             "sequence_length": 4,
@@ -211,3 +263,58 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
     rec1_d = pickle.loads(reader.read())
     reader.close()
     assert {rec0_d["path"], rec1_d["path"]} == {"/abs/a.mp4", "/abs/b.mp4"}
+    assert seen_filter_flags == [False, False]
+
+
+def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
+    original_preprocess = _MODULE.preprocess_video
+    seen_filter_flags: list[bool] = []
+
+    def _fake_preprocess(
+        idx: int,
+        video_info: dict[str, object],
+        target_width: int,
+        target_height: int,
+        target_fps: int,
+        chunk_size: int,
+        top_bar_fraction: float,
+        black_ratio: float,
+        filter_pure_noop_chunks: bool = False,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        del (
+            idx,
+            video_info,
+            target_width,
+            target_height,
+            target_fps,
+            chunk_size,
+            top_bar_fraction,
+            black_ratio,
+        )
+        seen_filter_flags.append(filter_pure_noop_chunks)
+        return [], []
+
+    try:
+        _MODULE.preprocess_video = _fake_preprocess
+        _MODULE._process_video_shard(
+            worker_idx=0,
+            shard_args=[
+                (
+                    0,
+                    {"filename": "/a.mp4", "path": "/abs/a.mp4"},
+                    str(tmp_path),
+                    160,
+                    90,
+                    10,
+                    4,
+                    4,
+                    0.15,
+                    0.95,
+                    True,
+                )
+            ],
+        )
+    finally:
+        _MODULE.preprocess_video = original_preprocess
+
+    assert seen_filter_flags == [True]
