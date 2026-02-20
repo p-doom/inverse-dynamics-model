@@ -9,9 +9,17 @@ from idm.collator import VideoSFTCollator
 class _FakeTokenizer:
     pad_token_id = 0
 
-    def __call__(self, text: str, add_special_tokens: bool = False):
+    def __call__(
+        self,
+        text: str,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = False,
+    ):
         del add_special_tokens
-        return {"input_ids": [ord(c) for c in text]}
+        tok_d = {"input_ids": [ord(c) for c in text]}
+        if return_offsets_mapping:
+            tok_d["offset_mapping"] = [(i, i + 1) for i in range(len(text))]
+        return tok_d
 
 
 class _FakeProcessor:
@@ -83,6 +91,24 @@ def _batch():
     }
 
 
+def _single_item_batch(frames_n: int, target_s: str):
+    frames_SHWC = np.zeros((frames_n, 2, 2, 3), dtype=np.uint8)
+    return {
+        "frames": np.expand_dims(frames_SHWC, axis=0),
+        "target_text": [target_s],
+    }
+
+
+def _action_slice(
+    prompt_len_i: int,
+    target_s: str,
+    action_s: str,
+) -> slice:
+    start_i = target_s.index(action_s)
+    end_i = start_i + len(action_s)
+    return slice(prompt_len_i + start_i, prompt_len_i + end_i)
+
+
 def test_collator_masks_prompt_and_padding_tokens():
     collator = VideoSFTCollator(
         processor=_FakeProcessor(), instruction_text="Predict actions."
@@ -136,3 +162,51 @@ def test_collator_prompt_len_tracks_video_expansion():
     supervised_idx = torch.nonzero(labels_S != -100, as_tuple=False).flatten()
     assert int(supervised_idx.numel()) > 0
     assert int(supervised_idx[0].item()) == out_d["prompt_lens"][0]
+
+
+def test_collator_mask_no_op_masks_only_no_op_actions():
+    target_s = "Frame 0: NO_OP\nFrame 1: KEY_DOWN:W"
+    collator = VideoSFTCollator(
+        processor=_FakeProcessor(),
+        instruction_text="Predict actions.",
+        mask_no_op_actions=True,
+    )
+    out_d = collator(_single_item_batch(frames_n=2, target_s=target_s))
+
+    labels_S = out_d["labels"][0]
+    input_ids_S = out_d["input_ids"][0]
+    prompt_len_i = out_d["prompt_lens"][0]
+
+    noop_slice = _action_slice(prompt_len_i, target_s, "NO_OP")
+    key_slice = _action_slice(prompt_len_i, target_s, "KEY_DOWN:W")
+    assert torch.all(labels_S[noop_slice] == -100)
+    assert torch.all(labels_S[key_slice] == input_ids_S[key_slice])
+
+
+def test_collator_mask_mouse_masks_all_mouse_actions():
+    target_s = (
+        "Frame 0: KEY_DOWN:W + MOUSE_MOVE\n"
+        "Frame 1: MOUSE_DOWN:Left\n"
+        "Frame 2: MOUSE_SCROLL\n"
+        "Frame 3: KEY_UP:W"
+    )
+    collator = VideoSFTCollator(
+        processor=_FakeProcessor(),
+        instruction_text="Predict actions.",
+        mask_mouse_actions=True,
+    )
+    out_d = collator(_single_item_batch(frames_n=4, target_s=target_s))
+
+    labels_S = out_d["labels"][0]
+    input_ids_S = out_d["input_ids"][0]
+    prompt_len_i = out_d["prompt_lens"][0]
+
+    mixed_slice = _action_slice(prompt_len_i, target_s, "KEY_DOWN:W + MOUSE_MOVE")
+    down_slice = _action_slice(prompt_len_i, target_s, "MOUSE_DOWN:Left")
+    scroll_slice = _action_slice(prompt_len_i, target_s, "MOUSE_SCROLL")
+    key_slice = _action_slice(prompt_len_i, target_s, "KEY_UP:W")
+
+    assert torch.all(labels_S[mixed_slice] == -100)
+    assert torch.all(labels_S[down_slice] == -100)
+    assert torch.all(labels_S[scroll_slice] == -100)
+    assert torch.all(labels_S[key_slice] == input_ids_S[key_slice])
