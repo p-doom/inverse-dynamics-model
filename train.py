@@ -5,7 +5,7 @@ import json
 import os
 import random
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from peft import LoraConfig, get_peft_model
@@ -64,8 +64,8 @@ class Args:
     instruction_text: str = (
         "Given the video frames, output the action text for each frame in order."
     )
-    zero_weight_no_op_actions: bool = False
-    zero_weight_mouse_actions: bool = False
+    mask_no_op_actions: bool = False
+    mask_mouse_actions: bool = False
     wandb_enable: bool = True
     wandb_project: str = "idm"
     wandb_entity: str = ""
@@ -165,15 +165,21 @@ def _decode_pred_text_B_from_generated_ids(
 
 
 def _action_accuracy_counts_from_texts(
-    pred_text_B: list[str], target_text_B: list[str]
+    pred_text_B: list[str],
+    target_text_B: list[str],
+    action_is_counted_fn: Callable[[str], bool] | None = None,
 ) -> tuple[int, int]:
     correct_n = 0
     total_n = 0
+    if action_is_counted_fn is None:
+        action_is_counted_fn = lambda _: True
     for pred_s, target_s in zip(pred_text_B, target_text_B):
         pred_actions_L = _actions_from_target_text(pred_s)
         target_actions_L = _actions_from_target_text(target_s)
-        total_n += len(target_actions_L)
         for idx_i, target_action_s in enumerate(target_actions_L):
+            if not action_is_counted_fn(target_action_s):
+                continue
+            total_n += 1
             if idx_i < len(pred_actions_L) and pred_actions_L[idx_i] == target_action_s:
                 correct_n += 1
     return correct_n, total_n
@@ -193,6 +199,26 @@ def _run_validation_steps(
     val_tok_n = 0
     val_action_correct_n = 0
     val_action_total_n = 0
+    action_is_counted_fn: Callable[[str], bool] | None = None
+    mask_no_op_actions = bool(getattr(collator, "mask_no_op_actions", False))
+    mask_mouse_actions = bool(getattr(collator, "mask_mouse_actions", False))
+    if mask_no_op_actions or mask_mouse_actions:
+        should_mask_action_fn = getattr(collator, "_should_mask_action", None)
+        if callable(should_mask_action_fn):
+            action_is_counted_fn = lambda action_s: not bool(
+                should_mask_action_fn(action_s)
+            )
+        else:
+            # Keep validation action-accuracy masking aligned with label masking.
+            def _fallback_action_is_counted(action_s: str) -> bool:
+                action_s = action_s.strip()
+                if mask_no_op_actions and action_s == "NO_OP":
+                    return False
+                if mask_mouse_actions and "MOUSE_" in action_s:
+                    return False
+                return True
+
+            action_is_counted_fn = _fallback_action_is_counted
 
     with torch.no_grad():
         for _ in range(val_steps):
@@ -246,6 +272,7 @@ def _run_validation_steps(
             correct_i, total_i = _action_accuracy_counts_from_texts(
                 pred_text_B=pred_text_B,
                 target_text_B=target_text_L,
+                action_is_counted_fn=action_is_counted_fn,
             )
             val_action_correct_n += correct_i
             val_action_total_n += total_i
@@ -428,8 +455,8 @@ def main() -> None:
         processor=processor,
         instruction_text=args.instruction_text,
         video_fps=args.video_fps,
-        zero_weight_no_op_actions=args.zero_weight_no_op_actions,
-        zero_weight_mouse_actions=args.zero_weight_mouse_actions,
+        mask_no_op_actions=args.mask_no_op_actions,
+        mask_mouse_actions=args.mask_mouse_actions,
     )
     val_it = None
     if args.val_every > 0:

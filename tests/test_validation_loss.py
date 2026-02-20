@@ -67,6 +67,8 @@ class _FakeTokenizer:
         2: "Frame 0: b",
         3: "Frame 0: c",
         4: "Frame 0: z",
+        5: "Frame 0: NO_OP\nFrame 1: b",
+        6: "Frame 0: x\nFrame 1: b",
     }
 
     def batch_decode(self, ids_B, skip_special_tokens: bool = True):
@@ -90,6 +92,24 @@ class _IdentityCollator:
             "attention_mask": torch.ones((batch_n, 1), dtype=torch.long),
             "prompt_lens": [1 for _ in range(batch_n)],
         }
+
+
+class _MaskingIdentityCollator(_IdentityCollator):
+    def __init__(
+        self,
+        mask_no_op_actions: bool = False,
+        mask_mouse_actions: bool = False,
+    ):
+        self.mask_no_op_actions = mask_no_op_actions
+        self.mask_mouse_actions = mask_mouse_actions
+
+    def _should_mask_action(self, action_s: str) -> bool:
+        action_s = action_s.strip()
+        if self.mask_no_op_actions and action_s == "NO_OP":
+            return True
+        if self.mask_mouse_actions and "MOUSE_" in action_s:
+            return True
+        return False
 
 
 def _logits_for_pred(pred_tok_i: int, vocab_n: int = 8) -> torch.Tensor:
@@ -205,3 +225,83 @@ def test_action_accuracy_counts_from_texts():
     )
     assert correct_n == 1
     assert total_n == 2
+
+
+def test_action_accuracy_counts_from_texts_filters_no_op_and_mouse_actions():
+    pred_text = [
+        "Frame 0: NO_OP\nFrame 1: b\nFrame 2: MOUSE_MOVE\nFrame 3: z",
+    ]
+    target_text = [
+        "Frame 0: NO_OP\nFrame 1: b\nFrame 2: MOUSE_MOVE\nFrame 3: a",
+    ]
+
+    def action_is_counted(action_s: str) -> bool:
+        action_s = action_s.strip()
+        return action_s != "NO_OP" and "MOUSE_" not in action_s
+
+    correct_n, total_n = _TRAIN_MOD._action_accuracy_counts_from_texts(
+        pred_text_B=pred_text,
+        target_text_B=target_text,
+        action_is_counted_fn=action_is_counted,
+    )
+    assert correct_n == 1
+    assert total_n == 2
+
+
+def test_action_accuracy_filter_keeps_original_frame_alignment():
+    pred_text = ["Frame 0: x\nFrame 1: b"]
+    target_text = ["Frame 0: NO_OP\nFrame 1: b"]
+
+    correct_n, total_n = _TRAIN_MOD._action_accuracy_counts_from_texts(
+        pred_text_B=pred_text,
+        target_text_B=target_text,
+        action_is_counted_fn=lambda action_s: action_s.strip() != "NO_OP",
+    )
+    assert correct_n == 1
+    assert total_n == 1
+
+
+def test_run_validation_steps_filters_masked_actions_from_action_accuracy():
+    batch0 = {
+        "labels": torch.tensor([[-100, 2]], dtype=torch.long),
+        "target_text": ["Frame 0: NO_OP\nFrame 1: b"],
+    }
+    model = _FakeDDPModel(
+        outputs_L=[(1.0, _logits_for_pred(2))],
+        generated_ids_L=[torch.tensor([[99, 6]], dtype=torch.long)],
+        training=True,
+    )
+    _, _, val_action_correct_n, val_action_total_n = _TRAIN_MOD._run_validation_steps(
+        ddp_model=model,
+        collator=_MaskingIdentityCollator(mask_no_op_actions=True),
+        val_it=iter([batch0]),
+        val_steps=1,
+        val_generate_max_new_tokens=4,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert val_action_correct_n == 1
+    assert val_action_total_n == 1
+
+
+def test_run_validation_steps_keeps_action_accuracy_unfiltered_when_masks_disabled():
+    batch0 = {
+        "labels": torch.tensor([[-100, 2]], dtype=torch.long),
+        "target_text": ["Frame 0: NO_OP\nFrame 1: b"],
+    }
+    model = _FakeDDPModel(
+        outputs_L=[(1.0, _logits_for_pred(2))],
+        generated_ids_L=[torch.tensor([[99, 6]], dtype=torch.long)],
+        training=True,
+    )
+    _, _, val_action_correct_n, val_action_total_n = _TRAIN_MOD._run_validation_steps(
+        ddp_model=model,
+        collator=_MaskingIdentityCollator(mask_no_op_actions=False),
+        val_it=iter([batch0]),
+        val_steps=1,
+        val_generate_max_new_tokens=4,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert val_action_correct_n == 1
+    assert val_action_total_n == 2

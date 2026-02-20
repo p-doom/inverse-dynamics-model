@@ -156,12 +156,12 @@ def test_collator_prompt_len_tracks_video_expansion():
     assert int(supervised_idx[0].item()) == out_d["prompt_lens"][0]
 
 
-def test_collator_zero_weight_no_op_masks_only_no_op_actions():
+def test_collator_mask_no_op_masks_only_no_op_actions():
     target_s = "Frame 0: NO_OP\nFrame 1: KEY_DOWN:W"
     collator = VideoSFTCollator(
         processor=_FakeProcessor(),
         instruction_text="Predict actions.",
-        zero_weight_no_op_actions=True,
+        mask_no_op_actions=True,
     )
     out_d = collator(_single_item_batch(frames_n=2, target_s=target_s))
 
@@ -175,7 +175,7 @@ def test_collator_zero_weight_no_op_masks_only_no_op_actions():
     assert torch.all(labels_S[key_slice] == input_ids_S[key_slice])
 
 
-def test_collator_zero_weight_mouse_masks_all_mouse_actions():
+def test_collator_mask_mouse_masks_all_mouse_actions():
     target_s = (
         "Frame 0: KEY_DOWN:W + MOUSE_MOVE\n"
         "Frame 1: MOUSE_DOWN:Left\n"
@@ -185,7 +185,7 @@ def test_collator_zero_weight_mouse_masks_all_mouse_actions():
     collator = VideoSFTCollator(
         processor=_FakeProcessor(),
         instruction_text="Predict actions.",
-        zero_weight_mouse_actions=True,
+        mask_mouse_actions=True,
     )
     out_d = collator(_single_item_batch(frames_n=4, target_s=target_s))
 

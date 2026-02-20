@@ -23,11 +23,11 @@ def test_train_args_does_not_expose_split():
 
 def test_train_args_exposes_loss_weighting_flags_with_false_defaults():
     anns = _TRAIN_MOD.Args.__annotations__
-    assert "zero_weight_no_op_actions" in anns
-    assert "zero_weight_mouse_actions" in anns
+    assert "mask_no_op_actions" in anns
+    assert "mask_mouse_actions" in anns
     args = _TRAIN_MOD.Args()
-    assert args.zero_weight_no_op_actions is False
-    assert args.zero_weight_mouse_actions is False
+    assert args.mask_no_op_actions is False
+    assert args.mask_mouse_actions is False
 
 
 def test_get_dataloader_does_not_accept_actions_map():

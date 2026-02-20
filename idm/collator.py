@@ -11,21 +11,21 @@ class VideoSFTCollator:
         processor: Any,
         instruction_text: str,
         video_fps: float | None = None,
-        zero_weight_no_op_actions: bool = False,
-        zero_weight_mouse_actions: bool = False,
+        mask_no_op_actions: bool = False,
+        mask_mouse_actions: bool = False,
     ):
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.instruction_text = instruction_text
         self.video_fps = video_fps
-        self.zero_weight_no_op_actions = zero_weight_no_op_actions
-        self.zero_weight_mouse_actions = zero_weight_mouse_actions
+        self.mask_no_op_actions = mask_no_op_actions
+        self.mask_mouse_actions = mask_mouse_actions
 
-    def _should_zero_weight_action(self, action_s: str) -> bool:
+    def _should_mask_action(self, action_s: str) -> bool:
         action_s = action_s.strip()
-        if self.zero_weight_no_op_actions and action_s == "NO_OP":
+        if self.mask_no_op_actions and action_s == "NO_OP":
             return True
-        if self.zero_weight_mouse_actions and "MOUSE_" in action_s:
+        if self.mask_mouse_actions and "MOUSE_" in action_s:
             return True
         return False
 
@@ -107,13 +107,13 @@ class VideoSFTCollator:
             for action_s, start_char_i, end_char_i in spans_L
         ]
 
-    def _mask_zero_weight_action_labels(
+    def _mask_mask_action_labels(
         self,
         labels_BS: Any,
         target_B: Any,
         prompt_lens_B: list[int],
     ) -> None:
-        if not self.zero_weight_no_op_actions and not self.zero_weight_mouse_actions:
+        if not self.mask_no_op_actions and not self.mask_mouse_actions:
             return
 
         seq_len_i = int(labels_BS.shape[1])
@@ -121,7 +121,7 @@ class VideoSFTCollator:
             for action_s, start_tok_i, end_tok_i in self._action_token_spans(
                 str(target_s)
             ):
-                if not self._should_zero_weight_action(action_s):
+                if not self._should_mask_action(action_s):
                     continue
                 start_i = int(prompt_len_i) + int(start_tok_i)
                 end_i = int(prompt_len_i) + int(end_tok_i)
@@ -250,7 +250,7 @@ class VideoSFTCollator:
         for b_i, prompt_len in enumerate(prompt_lens_B):
             labels_BS[b_i, :prompt_len] = -100
         labels_BS[enc_d["attention_mask"] == 0] = -100
-        self._mask_zero_weight_action_labels(
+        self._mask_mask_action_labels(
             labels_BS=labels_BS,
             target_B=target_B,
             prompt_lens_B=prompt_lens_B,
