@@ -64,6 +64,8 @@ class Args:
     instruction_text: str = (
         "Given the video frames, output the action text for each frame in order."
     )
+    zero_weight_no_op_actions: bool = False
+    zero_weight_mouse_actions: bool = False
     wandb_enable: bool = True
     wandb_project: str = "idm"
     wandb_entity: str = ""
@@ -426,6 +428,8 @@ def main() -> None:
         processor=processor,
         instruction_text=args.instruction_text,
         video_fps=args.video_fps,
+        zero_weight_no_op_actions=args.zero_weight_no_op_actions,
+        zero_weight_mouse_actions=args.zero_weight_mouse_actions,
     )
     val_it = None
     if args.val_every > 0:

@@ -11,11 +11,124 @@ class VideoSFTCollator:
         processor: Any,
         instruction_text: str,
         video_fps: float | None = None,
+        zero_weight_no_op_actions: bool = False,
+        zero_weight_mouse_actions: bool = False,
     ):
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.instruction_text = instruction_text
         self.video_fps = video_fps
+        self.zero_weight_no_op_actions = zero_weight_no_op_actions
+        self.zero_weight_mouse_actions = zero_weight_mouse_actions
+
+    def _should_zero_weight_action(self, action_s: str) -> bool:
+        action_s = action_s.strip()
+        if self.zero_weight_no_op_actions and action_s == "NO_OP":
+            return True
+        if self.zero_weight_mouse_actions and "MOUSE_" in action_s:
+            return True
+        return False
+
+    def _action_char_spans(self, target_s: str) -> list[tuple[str, int, int]]:
+        spans_L: list[tuple[str, int, int]] = []
+        offset_i = 0
+        for line_s in target_s.splitlines(keepends=True):
+            core_s = line_s[:-1] if line_s.endswith("\n") else line_s
+            parts_L = core_s.split(":", 1)
+            if core_s.startswith("Frame ") and len(parts_L) == 2:
+                action_start_i = len(parts_L[0]) + 1
+                while action_start_i < len(core_s) and core_s[action_start_i] == " ":
+                    action_start_i += 1
+                action_s = core_s[action_start_i:]
+                spans_L.append(
+                    (
+                        action_s,
+                        offset_i + action_start_i,
+                        offset_i + len(core_s),
+                    )
+                )
+            offset_i += len(line_s)
+        return spans_L
+
+    def _token_count(self, text_s: str) -> int:
+        tok_d = self.tokenizer(text_s, add_special_tokens=False)
+        input_ids = tok_d.get("input_ids", [])
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+            return len(input_ids[0])
+        return len(input_ids)
+
+    def _token_offsets(self, text_s: str) -> list[tuple[int, int]] | None:
+        try:
+            tok_d = self.tokenizer(
+                text_s,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+        except TypeError:
+            return None
+        except Exception:
+            return None
+
+        offsets = tok_d.get("offset_mapping")
+        if offsets is None:
+            return None
+        if hasattr(offsets, "tolist"):
+            offsets = offsets.tolist()
+        try:
+            return [(int(span[0]), int(span[1])) for span in offsets]
+        except Exception:
+            return None
+
+    def _action_token_spans(self, target_s: str) -> list[tuple[str, int, int]]:
+        spans_L = self._action_char_spans(target_s)
+        offsets_L = self._token_offsets(target_s)
+        if offsets_L is not None:
+            out_L: list[tuple[str, int, int]] = []
+            for action_s, start_char_i, end_char_i in spans_L:
+                token_idx_L = []
+                for tok_i, (tok_start_i, tok_end_i) in enumerate(offsets_L):
+                    if tok_end_i <= start_char_i or tok_start_i >= end_char_i:
+                        continue
+                    token_idx_L.append(tok_i)
+                if token_idx_L:
+                    out_L.append((action_s, token_idx_L[0], token_idx_L[-1] + 1))
+                else:
+                    out_L.append((action_s, 0, 0))
+            return out_L
+
+        return [
+            (
+                action_s,
+                self._token_count(target_s[:start_char_i]),
+                self._token_count(target_s[:end_char_i]),
+            )
+            for action_s, start_char_i, end_char_i in spans_L
+        ]
+
+    def _mask_zero_weight_action_labels(
+        self,
+        labels_BS: Any,
+        target_B: Any,
+        prompt_lens_B: list[int],
+    ) -> None:
+        if not self.zero_weight_no_op_actions and not self.zero_weight_mouse_actions:
+            return
+
+        seq_len_i = int(labels_BS.shape[1])
+        for b_i, (target_s, prompt_len_i) in enumerate(zip(target_B, prompt_lens_B)):
+            for action_s, start_tok_i, end_tok_i in self._action_token_spans(
+                str(target_s)
+            ):
+                if not self._should_zero_weight_action(action_s):
+                    continue
+                start_i = int(prompt_len_i) + int(start_tok_i)
+                end_i = int(prompt_len_i) + int(end_tok_i)
+                start_i = max(start_i, 0)
+                end_i = min(end_i, seq_len_i)
+                if end_i > start_i:
+                    labels_BS[b_i, start_i:end_i] = -100
 
     def _messages(
         self, target_s: str
@@ -137,6 +250,11 @@ class VideoSFTCollator:
         for b_i, prompt_len in enumerate(prompt_lens_B):
             labels_BS[b_i, :prompt_len] = -100
         labels_BS[enc_d["attention_mask"] == 0] = -100
+        self._mask_zero_weight_action_labels(
+            labels_BS=labels_BS,
+            target_B=target_B,
+            prompt_lens_B=prompt_lens_B,
+        )
 
         enc_d["labels"] = labels_BS
         enc_d["prompt_lens"] = prompt_lens_B
