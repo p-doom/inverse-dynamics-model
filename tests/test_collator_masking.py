@@ -9,9 +9,17 @@ from idm.collator import VideoSFTCollator
 class _FakeTokenizer:
     pad_token_id = 0
 
-    def __call__(self, text: str, add_special_tokens: bool = False):
+    def __call__(
+        self,
+        text: str,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = False,
+    ):
         del add_special_tokens
-        return {"input_ids": [ord(c) for c in text]}
+        tok_d = {"input_ids": [ord(c) for c in text]}
+        if return_offsets_mapping:
+            tok_d["offset_mapping"] = [(i, i + 1) for i in range(len(text))]
+        return tok_d
 
 
 class _FakeProcessor:

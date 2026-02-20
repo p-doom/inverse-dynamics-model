@@ -50,62 +50,29 @@ class VideoSFTCollator:
             offset_i += len(line_s)
         return spans_L
 
-    def _token_count(self, text_s: str) -> int:
-        tok_d = self.tokenizer(text_s, add_special_tokens=False)
-        input_ids = tok_d.get("input_ids", [])
-        if hasattr(input_ids, "tolist"):
-            input_ids = input_ids.tolist()
-        if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
-            return len(input_ids[0])
-        return len(input_ids)
-
-    def _token_offsets(self, text_s: str) -> list[tuple[int, int]] | None:
-        try:
-            tok_d = self.tokenizer(
-                text_s,
-                add_special_tokens=False,
-                return_offsets_mapping=True,
-            )
-        except TypeError:
-            return None
-        except Exception:
-            return None
-
-        offsets = tok_d.get("offset_mapping")
-        if offsets is None:
-            return None
-        if hasattr(offsets, "tolist"):
-            offsets = offsets.tolist()
-        try:
-            return [(int(span[0]), int(span[1])) for span in offsets]
-        except Exception:
-            return None
+    def _token_offsets(self, text_s: str) -> list[tuple[int, int]]:
+        tok_d = self.tokenizer(
+            text_s,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        return [(int(span[0]), int(span[1])) for span in tok_d["offset_mapping"]]
 
     def _action_token_spans(self, target_s: str) -> list[tuple[str, int, int]]:
         spans_L = self._action_char_spans(target_s)
         offsets_L = self._token_offsets(target_s)
-        if offsets_L is not None:
-            out_L: list[tuple[str, int, int]] = []
-            for action_s, start_char_i, end_char_i in spans_L:
-                token_idx_L = []
-                for tok_i, (tok_start_i, tok_end_i) in enumerate(offsets_L):
-                    if tok_end_i <= start_char_i or tok_start_i >= end_char_i:
-                        continue
-                    token_idx_L.append(tok_i)
-                if token_idx_L:
-                    out_L.append((action_s, token_idx_L[0], token_idx_L[-1] + 1))
-                else:
-                    out_L.append((action_s, 0, 0))
-            return out_L
-
-        return [
-            (
-                action_s,
-                self._token_count(target_s[:start_char_i]),
-                self._token_count(target_s[:end_char_i]),
-            )
-            for action_s, start_char_i, end_char_i in spans_L
-        ]
+        out_L: list[tuple[str, int, int]] = []
+        for action_s, start_char_i, end_char_i in spans_L:
+            token_idx_L = []
+            for tok_i, (tok_start_i, tok_end_i) in enumerate(offsets_L):
+                if tok_end_i <= start_char_i or tok_start_i >= end_char_i:
+                    continue
+                token_idx_L.append(tok_i)
+            if token_idx_L:
+                out_L.append((action_s, token_idx_L[0], token_idx_L[-1] + 1))
+            else:
+                out_L.append((action_s, 0, 0))
+        return out_L
 
     def _mask_mask_action_labels(
         self,
