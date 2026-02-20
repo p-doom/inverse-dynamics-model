@@ -32,12 +32,15 @@ class _FakeDDPModel:
     def __init__(
         self,
         outputs_L: list[tuple[float, torch.Tensor]],
+        generated_ids_L: list[torch.Tensor] | None = None,
         training: bool = True,
     ):
         self._out_it = iter(outputs_L)
+        self._gen_it = iter(generated_ids_L or [])
         self.training = training
         self.eval_calls = 0
         self.train_calls = 0
+        self.generate_calls = 0
 
     def eval(self):
         self.training = False
@@ -52,6 +55,10 @@ class _FakeDDPModel:
     def __call__(self, **_: object):
         loss_f, logits = next(self._out_it)
         return _LossOut(loss_f, logits=logits)
+
+    def generate(self, **_: object):
+        self.generate_calls += 1
+        return next(self._gen_it)
 
 
 class _FakeTokenizer:
@@ -74,7 +81,15 @@ class _IdentityCollator:
     tokenizer = _FakeTokenizer()
 
     def __call__(self, batch_d):
-        return batch_d
+        return {"labels": batch_d["labels"]}
+
+    def prompt_model_inputs(self, batch_d):
+        batch_n = int(batch_d["labels"].shape[0])
+        return {
+            "input_ids": torch.full((batch_n, 1), 99, dtype=torch.long),
+            "attention_mask": torch.ones((batch_n, 1), dtype=torch.long),
+            "prompt_lens": [1 for _ in range(batch_n)],
+        }
 
 
 def _logits_for_pred(pred_tok_i: int, vocab_n: int = 8) -> torch.Tensor:
@@ -83,14 +98,7 @@ def _logits_for_pred(pred_tok_i: int, vocab_n: int = 8) -> torch.Tensor:
     return logits
 
 
-def test_should_run_validation_uses_val_every_interval():
-    assert not _TRAIN_MOD._should_run_validation(global_step=10, val_every=0)
-    assert not _TRAIN_MOD._should_run_validation(global_step=10, val_every=-1)
-    assert not _TRAIN_MOD._should_run_validation(global_step=9, val_every=5)
-    assert _TRAIN_MOD._should_run_validation(global_step=10, val_every=5)
-
-
-def test_run_validation_steps_averages_loss_and_rolls_iterator():
+def test_run_validation_steps_averages_loss_and_counts_action_accuracy():
     batch0 = {
         "labels": torch.tensor([[-100, 1]], dtype=torch.long),
         "target_text": ["Frame 0: a"],
@@ -103,107 +111,97 @@ def test_run_validation_steps_averages_loss_and_rolls_iterator():
         "labels": torch.tensor([[-100, 3]], dtype=torch.long),
         "target_text": ["Frame 0: c"],
     }
-    batches_by_epoch = [[batch0], [batch1, batch2]]
-    make_calls = []
-
-    def _make_val_iter(epoch_i: int):
-        make_calls.append(epoch_i)
-        return iter(batches_by_epoch[epoch_i])
-
-    val_it = _make_val_iter(0)
+    val_it = iter([batch0, batch1, batch2])
     model = _FakeDDPModel(
         outputs_L=[
             (1.0, _logits_for_pred(1)),
             (2.0, _logits_for_pred(2)),
             (3.0, _logits_for_pred(4)),
         ],
+        generated_ids_L=[
+            torch.tensor([[99, 1]], dtype=torch.long),
+            torch.tensor([[99, 2]], dtype=torch.long),
+            torch.tensor([[99, 4]], dtype=torch.long),
+        ],
         training=True,
     )
 
-    (
-        mean_loss_f,
-        val_tok_n,
-        val_action_correct_n,
-        val_action_total_n,
-        val_it,
-        val_epoch_i,
-    ) = _TRAIN_MOD._run_validation_steps(
-        ddp_model=model,
-        collator=_IdentityCollator(),
-        val_it=val_it,
-        make_val_iter=_make_val_iter,
-        val_epoch_i=0,
-        val_steps=3,
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
+    mean_loss_f, val_tok_n, val_action_correct_n, val_action_total_n = (
+        _TRAIN_MOD._run_validation_steps(
+            ddp_model=model,
+            collator=_IdentityCollator(),
+            val_it=val_it,
+            val_steps=3,
+            val_generate_max_new_tokens=4,
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+        )
     )
 
     assert mean_loss_f == pytest.approx(2.0)
     assert val_tok_n == 3
     assert val_action_correct_n == 2
     assert val_action_total_n == 3
-    assert val_epoch_i == 1
-    assert make_calls == [0, 1]
     assert model.eval_calls == 1
     assert model.train_calls == 1
+    assert model.generate_calls == 3
     assert model.training is True
-    with pytest.raises(StopIteration):
-        next(val_it)
 
 
-def test_run_validation_steps_preserves_eval_mode():
+def test_run_validation_steps_weights_loss_by_supervised_tokens():
     batch0 = {
-        "labels": torch.tensor([[-100, 1]], dtype=torch.long),
+        "labels": torch.tensor([[-100, 1, -100, -100]], dtype=torch.long),
         "target_text": ["Frame 0: a"],
     }
-    model = _FakeDDPModel(outputs_L=[(4.0, _logits_for_pred(1))], training=False)
-
-    mean_loss_f, _, val_action_correct_n, val_action_total_n, _, _ = (
-        _TRAIN_MOD._run_validation_steps(
-            ddp_model=model,
-            collator=_IdentityCollator(),
-            val_it=iter([batch0]),
-            make_val_iter=lambda _: iter([batch0]),
-            val_epoch_i=0,
-            val_steps=1,
-            device=torch.device("cpu"),
-            dtype=torch.bfloat16,
-        )
+    batch1 = {
+        "labels": torch.tensor([[-100, 2, 3, 4]], dtype=torch.long),
+        "target_text": ["Frame 0: b"],
+    }
+    model = _FakeDDPModel(
+        outputs_L=[
+            (1.0, _logits_for_pred(1)),
+            (3.0, _logits_for_pred(2)),
+        ],
+        generated_ids_L=[
+            torch.tensor([[99, 1]], dtype=torch.long),
+            torch.tensor([[99, 2]], dtype=torch.long),
+        ],
+        training=True,
     )
 
-    assert mean_loss_f == pytest.approx(4.0)
-    assert val_action_correct_n == 1
-    assert val_action_total_n == 1
-    assert model.eval_calls == 1
-    assert model.train_calls == 0
-    assert model.training is False
+    mean_loss_f, val_tok_n, _, _ = _TRAIN_MOD._run_validation_steps(
+        ddp_model=model,
+        collator=_IdentityCollator(),
+        val_it=iter([batch0, batch1]),
+        val_steps=2,
+        val_generate_max_new_tokens=4,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    assert val_tok_n == 4
+    assert mean_loss_f == pytest.approx((1.0 * 1 + 3.0 * 3) / 4.0)
 
 
 def test_run_validation_steps_raises_when_val_loader_is_empty():
-    with pytest.raises(ValueError, match="yielded no batches"):
+    with pytest.raises(StopIteration):
         _TRAIN_MOD._run_validation_steps(
             ddp_model=_FakeDDPModel(outputs_L=[(1.0, _logits_for_pred(1))]),
             collator=_IdentityCollator(),
             val_it=iter([]),
-            make_val_iter=lambda _: iter([]),
-            val_epoch_i=0,
             val_steps=1,
+            val_generate_max_new_tokens=4,
             device=torch.device("cpu"),
             dtype=torch.bfloat16,
         )
 
 
-def test_action_accuracy_counts_from_logits():
-    logits = torch.zeros((2, 2, 8), dtype=torch.float32)
-    logits[0, 0, 1] = 10.0
-    logits[1, 0, 4] = 10.0
-    labels = torch.tensor([[-100, 1], [-100, 2]], dtype=torch.long)
+def test_action_accuracy_counts_from_texts():
+    pred_text = ["Frame 0: a", "Frame 0: z"]
     target_text = ["Frame 0: a", "Frame 0: b"]
-    correct_n, total_n = _TRAIN_MOD._action_accuracy_counts_from_logits(
-        logits_BSV=logits,
-        labels_BS=labels,
+    correct_n, total_n = _TRAIN_MOD._action_accuracy_counts_from_texts(
+        pred_text_B=pred_text,
         target_text_B=target_text,
-        tokenizer=_FakeTokenizer(),
     )
     assert correct_n == 1
     assert total_n == 2
