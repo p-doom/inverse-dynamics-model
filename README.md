@@ -95,5 +95,5 @@ Checkpoints are written under `out_dir/checkpoints/`.
 ## Test
 
 ```bash
-uv run pytest
+uv run pytest tests/
 ```

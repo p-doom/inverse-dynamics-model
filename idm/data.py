@@ -12,31 +12,10 @@ import numpy as np
 
 def derive_record_key(rec_d: dict[str, Any]) -> str:
     path_s = rec_d.get("path")
-    if isinstance(path_s, str) and path_s:
+    if path_s:
         return path_s
 
     raise ValueError("Cannot derive record key. Need non-empty `path`.")
-
-
-def _record_actions(rec_d: dict[str, Any], key_s: str) -> list[str]:
-    actions_any = rec_d.get("actions")
-    if actions_any is None:
-        raise ValueError(
-            f"Record `{key_s}` is missing `actions`. "
-            "Regenerate ArrayRecords with in-record actions."
-        )
-    if not isinstance(actions_any, list) or not all(isinstance(x, str) for x in actions_any):
-        raise ValueError(f"Actions for key `{key_s}` must be list[str].")
-    return actions_any
-
-
-def _decode_record(element_b: bytes) -> dict[str, Any]:
-    if not isinstance(element_b, bytes):
-        raise ValueError(f"Expected bytes record, got {type(element_b)}.")
-    rec_d = pickle.loads(element_b)
-    if not isinstance(rec_d, dict):
-        raise ValueError("Decoded record must be dict.")
-    return rec_d
 
 
 class EpisodeLengthFilter(grain.transforms.Filter):
@@ -54,16 +33,15 @@ class EpisodeLengthFilter(grain.transforms.Filter):
 
     def filter(self, element: Any) -> bool:
         try:
-            rec_d = _decode_record(element)
+            rec_d = pickle.loads(element)
             T = int(rec_d["sequence_length"])
-            raw_b = rec_d.get("raw_video")
+            raw_b = rec_d["raw_video"]
+            actions_L = rec_d["actions"]
             if T < self.seq_len or not isinstance(raw_b, bytes):
                 return False
             exp_n = T * self.image_h * self.image_w * self.image_c
             if len(raw_b) != exp_n:
                 return False
-            key_s = derive_record_key(rec_d)
-            actions_L = _record_actions(rec_d, key_s)
             return len(actions_L) == T
         except Exception:
             return False
@@ -83,24 +61,15 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         self.image_c = image_c
 
     def random_map(self, element: Any, rng: np.random.Generator) -> Any:
-        rec_d = _decode_record(element)
+        rec_d = pickle.loads(element)
         T = int(rec_d["sequence_length"])
-        key_s = derive_record_key(rec_d)
 
         raw_b = rec_d["raw_video"]
-        exp_n = T * self.image_h * self.image_w * self.image_c
-        if len(raw_b) != exp_n:
-            raise ValueError(
-                f"raw_video size mismatch for key `{key_s}`: "
-                f"got {len(raw_b)}, expected {exp_n}."
-            )
-
-        actions_L = _record_actions(rec_d, key_s)
+        actions_L = rec_d.get("actions")
+        if actions_L is None:
+            raise ValueError("missing actions")
         if len(actions_L) != T:
-            raise ValueError(
-                f"actions length mismatch for key `{key_s}`: "
-                f"got {len(actions_L)}, expected {T}."
-            )
+            raise ValueError("actions length mismatch")
 
         max_start_i = T - self.seq_len
         if max_start_i < 0:
@@ -120,11 +89,6 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
 class BuildSFTExampleFromFrames(grain.transforms.Map):
     def map(self, element: dict[str, Any]) -> dict[str, Any]:
         actions_L = element["actions"]
-        if not isinstance(actions_L, list) or not all(
-            isinstance(x, str) for x in actions_L
-        ):
-            raise ValueError("Expected actions as list[str].")
-
         target_text = "\n".join(f"Frame {i}: {a}" for i, a in enumerate(actions_L))
         return {
             "frames": element["frames"],
@@ -151,6 +115,7 @@ def get_dataloader(
     world_size: int,
     seed: int,
     epoch_i: int,
+    num_epochs: int | None = 1,
     num_workers: int = 0,
     prefetch_buffer_size: int = 1,
 ) -> grain.DataLoader:
@@ -173,7 +138,7 @@ def get_dataloader(
             drop_remainder=True,
         ),
         shuffle=True,
-        num_epochs=1,
+        num_epochs=num_epochs,
         seed=seed + epoch_i,
     )
     ops = [

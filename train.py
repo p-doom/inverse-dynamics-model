@@ -55,6 +55,9 @@ class Args:
     num_workers: int = 0
     prefetch_buffer_size: int = 1
     log_every: int = 10
+    val_every: int = 0
+    val_steps: int = 1
+    val_generate_max_new_tokens: int = 1024
     save_every: int = 100
     out_dir: str = "./runs/default"
     resume_from: str = ""
@@ -112,19 +115,147 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, args: Args):
     )
 
 
-def _trainable_count(model: torch.nn.Module) -> tuple[int, int]:
-    train_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_n = sum(p.numel() for p in model.parameters())
-    return train_n, total_n
-
-
-def _to_device(batch_d: dict[str, Any], device: torch.device) -> dict[str, Any]:
+def _to_device(
+    batch_d: dict[str, Any],
+    device: torch.device,
+    skip_keys: set[str] | None = None,
+) -> dict[str, Any]:
+    skip_keys = (
+        {"videos", "prompt_lens", "meta"} if skip_keys is None else set(skip_keys)
+    )
     out_d: dict[str, Any] = {}
     for key_s, val in batch_d.items():
-        if key_s in {"videos", "prompt_lens", "meta"}:
+        if key_s in skip_keys:
             continue
-        out_d[key_s] = val.to(device, non_blocking=True) if hasattr(val, "to") else val
+        out_d[key_s] = val.to(device, non_blocking=True)
     return out_d
+
+
+def _actions_from_target_text(target_s: str) -> list[str]:
+    actions_L = []
+    for line_s in target_s.splitlines():
+        line_s = line_s.strip()
+        if not line_s.startswith("Frame "):
+            continue
+        parts_L = line_s.split(":", 1)
+        if len(parts_L) != 2:
+            continue
+        actions_L.append(parts_L[1].strip())
+    return actions_L
+
+
+def _decode_pred_text_B_from_generated_ids(
+    generated_ids_BS: torch.Tensor,
+    prompt_lens_B: list[int],
+    tokenizer: Any,
+) -> list[str]:
+    pred_ids_B: list[list[int]] = []
+    for b_i, prompt_len_i in enumerate(prompt_lens_B):
+        row_S = generated_ids_BS[b_i]
+        start_i = max(int(prompt_len_i), 0)
+        if start_i >= int(row_S.shape[0]):
+            pred_ids_B.append([])
+            continue
+        pred_ids_B.append([int(x) for x in row_S[start_i:].detach().cpu().tolist()])
+    return [
+        str(x) for x in tokenizer.batch_decode(pred_ids_B, skip_special_tokens=True)
+    ]
+
+
+def _action_accuracy_counts_from_texts(
+    pred_text_B: list[str], target_text_B: list[str]
+) -> tuple[int, int]:
+    correct_n = 0
+    total_n = 0
+    for pred_s, target_s in zip(pred_text_B, target_text_B):
+        pred_actions_L = _actions_from_target_text(pred_s)
+        target_actions_L = _actions_from_target_text(target_s)
+        total_n += len(target_actions_L)
+        for idx_i, target_action_s in enumerate(target_actions_L):
+            if idx_i < len(pred_actions_L) and pred_actions_L[idx_i] == target_action_s:
+                correct_n += 1
+    return correct_n, total_n
+
+
+def _run_validation_steps(
+    ddp_model: torch.nn.Module,
+    collator: VideoSFTCollator,
+    val_it: Any,
+    val_steps: int,
+    val_generate_max_new_tokens: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[float, int, int, int]:
+    ddp_model.eval()
+    val_loss_num = 0.0
+    val_tok_n = 0
+    val_action_correct_n = 0
+    val_action_total_n = 0
+
+    with torch.no_grad():
+        for _ in range(val_steps):
+            raw_batch_d = next(val_it)
+            model_batch_d = _to_device(collator(raw_batch_d), device)
+            batch_tok_n = int((model_batch_d["labels"] != -100).sum().item())
+            val_tok_n += batch_tok_n
+            with torch.autocast(
+                device_type=device.type,
+                dtype=dtype,
+                enabled=(device.type == "cuda"),
+            ):
+                outputs = ddp_model(**model_batch_d)
+                loss = outputs.loss
+            val_loss_num += float(loss.detach().item()) * float(batch_tok_n)
+            prompt_batch_d = collator.prompt_model_inputs(raw_batch_d)
+            prompt_lens_B = [int(x) for x in prompt_batch_d.pop("prompt_lens")]
+            prompt_model_d = _to_device(
+                prompt_batch_d,
+                device,
+                skip_keys={"videos", "meta"},
+            )
+            generate_model = getattr(ddp_model, "module", ddp_model)
+            pad_id = getattr(collator.tokenizer, "pad_token_id", None)
+            eos_id = getattr(collator.tokenizer, "eos_token_id", None)
+            gen_kwargs = {
+                "max_new_tokens": int(val_generate_max_new_tokens),
+                "do_sample": False,
+                "use_cache": True,
+            }
+            if pad_id is not None:
+                gen_kwargs["pad_token_id"] = int(pad_id)
+            if eos_id is not None:
+                gen_kwargs["eos_token_id"] = int(eos_id)
+
+            with torch.autocast(
+                device_type=device.type,
+                dtype=dtype,
+                enabled=(device.type == "cuda"),
+            ):
+                generated_ids_BS = generate_model.generate(
+                    **prompt_model_d,
+                    **gen_kwargs,
+                )
+            pred_text_B = _decode_pred_text_B_from_generated_ids(
+                generated_ids_BS=generated_ids_BS,
+                prompt_lens_B=prompt_lens_B,
+                tokenizer=collator.tokenizer,
+            )
+            target_text_L = [str(x) for x in raw_batch_d["target_text"]]
+            correct_i, total_i = _action_accuracy_counts_from_texts(
+                pred_text_B=pred_text_B,
+                target_text_B=target_text_L,
+            )
+            val_action_correct_n += correct_i
+            val_action_total_n += total_i
+
+    ddp_model.train()
+    val_loss_f = val_loss_num / max(float(val_tok_n), 1.0)
+    return (
+        val_loss_f,
+        val_tok_n,
+        val_action_correct_n,
+        val_action_total_n,
+    )
 
 
 def _resolve_resume_dir(args: Args) -> str:
@@ -143,21 +274,11 @@ def _load_metadata_json(data_root: str) -> dict[str, Any]:
             "Run preprocessing first and keep metadata.json in --data-root."
         )
     with open(meta_path, "r", encoding="utf-8") as f:
-        meta_d = json.load(f)
-    if not isinstance(meta_d, dict):
-        raise ValueError(f"metadata.json must contain a JSON object: {meta_path}")
-    return meta_d
+        return json.load(f)
 
 
 def _assert_image_hwc_matches_metadata(args: Args) -> None:
     meta_d = _load_metadata_json(args.data_root)
-    missing_L = [k for k in ("target_height", "target_width") if meta_d.get(k) is None]
-    if missing_L:
-        raise ValueError(
-            f"metadata.json is missing required keys: {', '.join(missing_L)}. "
-            "Expected target_height/target_width and optional target_channels."
-        )
-
     meta_h = int(meta_d["target_height"])
     meta_w = int(meta_d["target_width"])
     meta_c = int(meta_d.get("target_channels", 3))
@@ -224,6 +345,12 @@ def main() -> None:
         raise ValueError("--grad_accum must be >= 1.")
     if args.log_every <= 0:
         raise ValueError("--log_every must be >= 1.")
+    if args.val_every < 0:
+        raise ValueError("--val_every must be >= 0.")
+    if args.val_steps <= 0:
+        raise ValueError("--val_steps must be >= 1.")
+    if args.val_generate_max_new_tokens <= 0:
+        raise ValueError("--val_generate_max_new_tokens must be >= 1.")
     if args.save_every <= 0:
         raise ValueError("--save_every must be >= 1.")
     if args.video_fps <= 0:
@@ -255,6 +382,20 @@ def main() -> None:
             "does not match the preprocessed data, or records are missing in-record `actions`."
         )
 
+    val_array_paths: list[str] = []
+    if args.val_every > 0:
+        val_array_paths = find_array_record_paths(args.data_root, "val")
+        valid_val_n = count_valid_records(
+            val_array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
+        )
+        if valid_val_n <= 0:
+            raise ValueError(
+                "No valid records found in val split after checks. "
+                "Ensure val data matches --image-h/--image-w/--image-c and --seq-len."
+            )
+        if rank_i == 0:
+            print(f"valid_val_records={valid_val_n}")
+
     per_rank_bs = args.global_batch_size // world_i
     micro_per_epoch = (valid_n // world_i) // per_rank_bs
     opt_per_epoch = max(micro_per_epoch // max(args.grad_accum, 1), 1)
@@ -268,10 +409,12 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
     model = _build_model(args, dtype, device)
     if rank_i == 0:
-        train_n, total_n = _trainable_count(model)
+        train_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_n = sum(p.numel() for p in model.parameters())
         print(
             f"trainable_params={train_n} total_params={total_n} ratio={train_n/max(total_n,1):.6f}"
         )
+        print(f"model_id={args.model_id}")
 
     ddp_model = DDP(
         model,
@@ -284,6 +427,24 @@ def main() -> None:
         instruction_text=args.instruction_text,
         video_fps=args.video_fps,
     )
+    val_it = None
+    if args.val_every > 0:
+        val_loader = get_dataloader(
+            array_record_paths=val_array_paths,
+            seq_len=args.seq_len,
+            global_batch_size=args.global_batch_size,
+            image_h=args.image_h,
+            image_w=args.image_w,
+            image_c=args.image_c,
+            rank=rank_i,
+            world_size=world_i,
+            seed=args.seed,
+            epoch_i=0,
+            num_epochs=None,
+            num_workers=args.num_workers,
+            prefetch_buffer_size=args.prefetch_buffer_size,
+        )
+        val_it = iter(val_loader)
     optimizer = torch.optim.AdamW(
         (p for p in ddp_model.parameters() if p.requires_grad),
         lr=args.lr,
@@ -437,6 +598,60 @@ def main() -> None:
                 log_tok_n = 0
                 log_step_n = 0
                 t0 = time.time()
+
+            if args.val_every > 0 and global_step % args.val_every == 0:
+                assert val_it is not None
+                val_t0 = time.time()
+                (
+                    val_loss_f,
+                    val_tok_n,
+                    val_action_correct_n,
+                    val_action_total_n,
+                ) = _run_validation_steps(
+                    ddp_model=ddp_model,
+                    collator=collator,
+                    val_it=val_it,
+                    val_steps=args.val_steps,
+                    val_generate_max_new_tokens=args.val_generate_max_new_tokens,
+                    device=device,
+                    dtype=dtype,
+                )
+                val_loss_num_t = torch.tensor(
+                    val_loss_f * max(float(val_tok_n), 1.0), device=device
+                )
+                val_tok_t = torch.tensor(float(val_tok_n), device=device)
+                val_action_correct_t = torch.tensor(
+                    float(val_action_correct_n), device=device
+                )
+                val_action_total_t = torch.tensor(
+                    float(val_action_total_n), device=device
+                )
+                if world_i > 1:
+                    dist.all_reduce(val_loss_num_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(val_tok_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(val_action_correct_t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(val_action_total_t, op=dist.ReduceOp.SUM)
+                val_loss_t = val_loss_num_t / torch.clamp(val_tok_t, min=1.0)
+                val_dt = max(time.time() - val_t0, 1e-9)
+                val_toks_per_s = val_tok_t.item() / val_dt
+                val_action_acc_f = val_action_correct_t.item() / max(
+                    val_action_total_t.item(), 1.0
+                )
+                if rank_i == 0:
+                    print(
+                        f"step={global_step} val_loss={val_loss_t.item():.6f} "
+                        f"val_steps={args.val_steps} val_tokens_per_s={val_toks_per_s:.1f} "
+                        f"val_action_acc={val_action_acc_f:.6f}"
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "val/loss": val_loss_t.item(),
+                                "val/tokens_per_s": val_toks_per_s,
+                                "val/action_acc": val_action_acc_f,
+                            },
+                            step=global_step,
+                        )
 
             if global_step % args.save_every == 0 or global_step == args.max_steps:
                 save_checkpoint(

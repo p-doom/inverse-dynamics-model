@@ -8,7 +8,9 @@ from array_record.python.array_record_module import ArrayRecordWriter
 from idm.data import get_dataloader
 
 
-def _write_dummy_arrayrecord(path: Path, n_records: int = 12, T: int = 4, H: int = 2, W: int = 2, C: int = 3):
+def _write_dummy_arrayrecord(
+    path: Path, n_records: int = 12, T: int = 4, H: int = 2, W: int = 2, C: int = 3
+):
     writer = ArrayRecordWriter(str(path), "group_size:1")
     for r_i in range(n_records):
         frames_THWC = np.full((T, H, W, C), r_i % 255, dtype=np.uint8)
@@ -106,3 +108,27 @@ def test_batch_size_must_divide_world_size(tmp_path: Path):
             num_workers=0,
             prefetch_buffer_size=1,
         )
+
+
+def test_num_epochs_none_keeps_iterator_running(tmp_path: Path):
+    p = tmp_path / "d.array_record"
+    _write_dummy_arrayrecord(p, n_records=8)
+    dl = get_dataloader(
+        array_record_paths=[str(p)],
+        seq_len=4,
+        global_batch_size=4,
+        image_h=2,
+        image_w=2,
+        image_c=3,
+        rank=0,
+        world_size=1,
+        seed=7,
+        epoch_i=0,
+        num_epochs=None,
+        num_workers=0,
+        prefetch_buffer_size=1,
+    )
+    it = iter(dl)
+    for _ in range(5):
+        batch_d = next(it)
+        assert len(batch_d["target_text"]) == 4
