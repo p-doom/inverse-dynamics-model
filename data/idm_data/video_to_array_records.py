@@ -54,6 +54,7 @@ class Args:
     black_ratio: float = 0.95
     chunk_size: int = 160
     chunks_per_file: int = 100
+    filter_pure_noop_chunks: bool = False
     seed: int = 0
     num_workers: int = 0
     max_videos: int = 0
@@ -252,6 +253,7 @@ def _chunk_video_records(
     video_info: dict[str, object],
     chunk_size: int,
     actions: list[str] | None = None,
+    filter_pure_noop_chunks: bool = False,
 ) -> list[dict[str, bytes | int | list[str] | str]]:
     """
     Split one decoded video into fixed-length chunk records.
@@ -275,14 +277,23 @@ def _chunk_video_records(
     file_chunks: list[dict[str, bytes | int | list[str] | str]] = []
     for start_idx in range(0, current_episode_len - chunk_size + 1, chunk_size):
         chunk = video_tensor[start_idx : start_idx + chunk_size]
+        chunk_actions = (
+            actions[start_idx : start_idx + chunk_size] if actions is not None else None
+        )
+        if (
+            filter_pure_noop_chunks
+            and chunk_actions is not None
+            and all(action_s == "NO_OP" for action_s in chunk_actions)
+        ):
+            continue
 
         chunk_record = {
             "raw_video": chunk.tobytes(),
             "sequence_length": chunk_size,
             "path": str(video_info.get("path", "")),
         }
-        if actions is not None:
-            chunk_record["actions"] = actions[start_idx : start_idx + chunk_size]
+        if chunk_actions is not None:
+            chunk_record["actions"] = chunk_actions
 
         file_chunks.append(chunk_record)
     return file_chunks
@@ -349,6 +360,7 @@ def preprocess_video(
     chunk_size,
     top_bar_fraction,
     black_ratio,
+    filter_pure_noop_chunks=False,
 ):
     """
     Preprocess a video file by reading it, resizing, changing its frame rate,
@@ -425,6 +437,7 @@ def preprocess_video(
                 video_info=video_info,
                 chunk_size=chunk_size,
                 actions=seg_actions,
+                filter_pure_noop_chunks=filter_pure_noop_chunks,
             )
             all_chunk_records.extend(chunk_records)
 
@@ -459,6 +472,7 @@ def _process_video_shard(
         chunk_size = int(video_arg[6])
         top_bar_fraction = float(video_arg[8]) if len(video_arg) > 8 else 0.15
         black_ratio = float(video_arg[9]) if len(video_arg) > 9 else 0.95
+        filter_pure_noop_chunks = bool(video_arg[10]) if len(video_arg) > 10 else False
 
         chunk_records, failed_rows = preprocess_video(
             idx=idx,
@@ -469,6 +483,7 @@ def _process_video_shard(
             chunk_size=chunk_size,
             top_bar_fraction=top_bar_fraction,
             black_ratio=black_ratio,
+            filter_pure_noop_chunks=filter_pure_noop_chunks,
         )
         if failed_rows:
             shard_results.extend(failed_rows)
@@ -709,6 +724,7 @@ def main():
                     args.chunks_per_file,
                     args.top_bar_fraction,
                     args.black_ratio,
+                    args.filter_pure_noop_chunks,
                 )
             )
 
@@ -746,6 +762,7 @@ def main():
         "top_bar_fraction": args.top_bar_fraction,
         "black_ratio": args.black_ratio,
         "chunk_size": args.chunk_size,
+        "filter_pure_noop_chunks": args.filter_pure_noop_chunks,
         "total_chunks": len(results),
         "total_video_chunks": total_video_chunks,
         "total_videos": len(input_files),
