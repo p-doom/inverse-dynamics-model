@@ -50,17 +50,14 @@ class VideoSFTCollator:
             offset_i += len(line_s)
         return spans_L
 
-    def _token_offsets(self, text_s: str) -> list[tuple[int, int]]:
+    def _action_token_spans(self, target_s: str) -> list[tuple[str, int, int]]:
+        spans_L = self._action_char_spans(target_s)
         tok_d = self.tokenizer(
-            text_s,
+            target_s,
             add_special_tokens=False,
             return_offsets_mapping=True,
         )
-        return [(int(span[0]), int(span[1])) for span in tok_d["offset_mapping"]]
-
-    def _action_token_spans(self, target_s: str) -> list[tuple[str, int, int]]:
-        spans_L = self._action_char_spans(target_s)
-        offsets_L = self._token_offsets(target_s)
+        offsets_L = [(int(span[0]), int(span[1])) for span in tok_d["offset_mapping"]]
         out_L: list[tuple[str, int, int]] = []
         for action_s, start_char_i, end_char_i in spans_L:
             token_idx_L = []
