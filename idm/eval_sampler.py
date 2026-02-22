@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -10,6 +11,10 @@ from typing import Iterator
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
+
+DEFAULT_INSTRUCTION = (
+    "Given the video frames, output the action text for each frame in order."
+)
 
 
 @dataclass
@@ -139,10 +144,12 @@ class IDMEvaluator:
         self,
         sglang_url: str = "http://localhost:30000",
         config: SlidingWindowConfig | None = None,
+        instruction_text: str = DEFAULT_INSTRUCTION,
     ):
         import openai
         self.client = openai.OpenAI(base_url=f"{sglang_url}/v1", api_key="dummy")
         self.config = config or SlidingWindowConfig()
+        self.instruction_text = instruction_text
 
     def predict_segment(self, frames: np.ndarray) -> list[str]:
         content = []
@@ -151,7 +158,7 @@ class IDMEvaluator:
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
             })
-        content.append({"type": "text", "text": "Output the action for each frame transition."})
+        content.append({"type": "text", "text": self.instruction_text})
 
         response = self.client.chat.completions.create(
             model="default",
@@ -264,29 +271,46 @@ class IDMEvaluator:
                 f"eval/per_action/{safe_action}/support": stats["support"],
             })
         
-        cm, labels = metrics.get_confusion_matrix()
-        wandb.log({
-            "eval/confusion_matrix": wandb.plot.confusion_matrix(
-                probs=None,
-                y_true=metrics.all_ground_truth,
-                preds=metrics.all_predictions,
-                class_names=labels,
-                title="Action Confusion Matrix",
-            )
-        })
+        # Ensure equal lengths before logging confusion matrix
+        gt = list(metrics.all_ground_truth)
+        preds = list(metrics.all_predictions)
+        min_len = min(len(gt), len(preds))
+        gt = gt[:min_len]
+        preds = preds[:min_len]
         
-        if len(labels) > 5:
+        if min_len == 0:
+            return
+        
+        gt_norm = [a.lower().strip() for a in gt]
+        pred_norm = [a.lower().strip() for a in preds]
+        labels = sorted(set(gt_norm) | set(pred_norm))
+        
+        try:
+            wandb.log({
+                "eval/confusion_matrix": wandb.plot.confusion_matrix(
+                    probs=None,
+                    y_true=gt_norm,
+                    preds=pred_norm,
+                    class_names=labels,
+                    title="Action Confusion Matrix",
+                )
+            })
+        except Exception:
+            pass  # skip if wandb can't render it
+        
+        cm, cm_labels = metrics.get_confusion_matrix()
+        if len(cm_labels) > 5:
             import matplotlib.pyplot as plt
             
-            fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.5), max(8, len(labels) * 0.4)))
+            fig, ax = plt.subplots(figsize=(max(10, len(cm_labels) * 0.5), max(8, len(cm_labels) * 0.4)))
             
             cm_normalized = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-8)
             
             im = ax.imshow(cm_normalized, cmap="Blues")
-            ax.set_xticks(np.arange(len(labels)))
-            ax.set_yticks(np.arange(len(labels)))
-            ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-            ax.set_yticklabels(labels, fontsize=8)
+            ax.set_xticks(np.arange(len(cm_labels)))
+            ax.set_yticks(np.arange(len(cm_labels)))
+            ax.set_xticklabels(cm_labels, rotation=45, ha="right", fontsize=8)
+            ax.set_yticklabels(cm_labels, fontsize=8)
             ax.set_xlabel("Predicted")
             ax.set_ylabel("Ground Truth")
             ax.set_title("Normalized Confusion Matrix (Recall)")
@@ -316,15 +340,29 @@ class IDMEvaluator:
 def load_val_videos(
     data_root: str, image_h: int, image_w: int, image_c: int = 3
 ) -> Iterator[tuple[str, np.ndarray, list[str]]]:
+    import pickle
+
     from array_record.python.array_record_module import ArrayRecordReader
     from idm.data import find_array_record_paths
 
-    for path in find_array_record_paths(data_root, "val"):
+    frame_size = image_h * image_w * image_c
+
+    for path in find_array_record_paths(data_root, "train"):
         reader = ArrayRecordReader(path)
-        for i in range(reader.num_records()):
-            rec = json.loads(reader.read(i))
-            if not rec.get("actions"):
+        n = reader.num_records()
+        for i in range(n):
+            raw = reader.read([i])[0]
+            rec = pickle.loads(raw)
+            actions = rec.get("actions")
+            if not actions:
                 continue
-            frames = np.array(rec["frames"], dtype=np.uint8).reshape(-1, image_h, image_w, image_c)
-            yield rec.get("video_id", f"{path}:{i}"), frames, rec["actions"]
+            raw_video = rec["raw_video"]
+            n_frames = len(raw_video) // frame_size
+            if n_frames == 0:
+                continue
+            frames = np.frombuffer(raw_video, dtype=np.uint8).reshape(
+                n_frames, image_h, image_w, image_c
+            )
+            video_id = rec.get("video_id", rec.get("path", f"{path}:{i}"))
+            yield video_id, frames, actions
         reader.close()
