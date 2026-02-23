@@ -57,7 +57,8 @@ class Args:
     log_every: int = 10
     val_every: int = 0
     val_steps: int = 1
-    val_generate_max_new_tokens: int = 1024
+    val_generate_max_new_tokens: int = 512
+    val_log_examples: int = 0
     save_every: int = 100
     out_dir: str = "./runs/default"
     resume_from: str = ""
@@ -164,6 +165,13 @@ def _decode_pred_text_B_from_generated_ids(
     ]
 
 
+def _truncate_for_log(text_s: str, max_chars: int = 1200) -> str:
+    text_s = str(text_s).strip()
+    if len(text_s) <= max_chars:
+        return text_s
+    return f"{text_s[:max_chars]} ...[truncated]"
+
+
 def _action_accuracy_counts_from_texts(
     pred_text_B: list[str],
     target_text_B: list[str],
@@ -193,6 +201,8 @@ def _run_validation_steps(
     val_generate_max_new_tokens: int,
     device: torch.device,
     dtype: torch.dtype,
+    debug_examples_n: int = 0,
+    debug_examples_out_L: list[tuple[str, str]] | None = None,
 ) -> tuple[float, int, int, int]:
     ddp_model.eval()
     val_loss_num = 0.0
@@ -269,6 +279,14 @@ def _run_validation_steps(
                 tokenizer=collator.tokenizer,
             )
             target_text_L = [str(x) for x in raw_batch_d["target_text"]]
+            if debug_examples_out_L is not None and debug_examples_n > 0:
+                remaining_i = max(int(debug_examples_n) - len(debug_examples_out_L), 0)
+                if remaining_i > 0:
+                    for pred_s, target_s in zip(pred_text_B, target_text_L):
+                        debug_examples_out_L.append((str(pred_s), str(target_s)))
+                        remaining_i -= 1
+                        if remaining_i <= 0:
+                            break
             correct_i, total_i = _action_accuracy_counts_from_texts(
                 pred_text_B=pred_text_B,
                 target_text_B=target_text_L,
@@ -380,6 +398,8 @@ def main() -> None:
         raise ValueError("--val_steps must be >= 1.")
     if args.val_generate_max_new_tokens <= 0:
         raise ValueError("--val_generate_max_new_tokens must be >= 1.")
+    if args.val_log_examples < 0:
+        raise ValueError("--val_log_examples must be >= 0.")
     if args.save_every <= 0:
         raise ValueError("--save_every must be >= 1.")
     if args.video_fps <= 0:
@@ -401,38 +421,10 @@ def main() -> None:
     _assert_image_hwc_matches_metadata(args)
 
     array_paths = find_array_record_paths(args.data_root, "train")
-    valid_n = count_valid_records(
-        array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
-    )
-    if valid_n <= 0:
-        raise ValueError(
-            "No valid records after checks. "
-            "This usually means your explicit --image-h/--image-w/--image-c or --seq-len "
-            "does not match the preprocessed data, or records are missing in-record `actions`."
-        )
 
     val_array_paths: list[str] = []
     if args.val_every > 0:
         val_array_paths = find_array_record_paths(args.data_root, "val")
-        valid_val_n = count_valid_records(
-            val_array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
-        )
-        if valid_val_n <= 0:
-            raise ValueError(
-                "No valid records found in val split after checks. "
-                "Ensure val data matches --image-h/--image-w/--image-c and --seq-len."
-            )
-        if rank_i == 0:
-            print(f"valid_val_records={valid_val_n}")
-
-    per_rank_bs = args.global_batch_size // world_i
-    micro_per_epoch = (valid_n // world_i) // per_rank_bs
-    opt_per_epoch = max(micro_per_epoch // max(args.grad_accum, 1), 1)
-    if rank_i == 0:
-        print(
-            f"valid_records={valid_n} optimizer_steps_per_epoch~{opt_per_epoch} "
-            f"estimated_epochs~{args.max_steps / opt_per_epoch:.3f}"
-        )
 
     dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
@@ -633,6 +625,7 @@ def main() -> None:
             if args.val_every > 0 and global_step % args.val_every == 0:
                 assert val_it is not None
                 val_t0 = time.time()
+                val_examples_L: list[tuple[str, str]] = []
                 (
                     val_loss_f,
                     val_tok_n,
@@ -646,6 +639,8 @@ def main() -> None:
                     val_generate_max_new_tokens=args.val_generate_max_new_tokens,
                     device=device,
                     dtype=dtype,
+                    debug_examples_n=args.val_log_examples,
+                    debug_examples_out_L=val_examples_L,
                 )
                 val_loss_num_t = torch.tensor(
                     val_loss_f * max(float(val_tok_n), 1.0), device=device
@@ -674,6 +669,22 @@ def main() -> None:
                         f"val_steps={args.val_steps} val_tokens_per_s={val_toks_per_s:.1f} "
                         f"val_action_acc={val_action_acc_f:.6f}"
                     )
+                    if val_examples_L:
+                        for ex_i, (pred_s, target_s) in enumerate(
+                            val_examples_L, start=1
+                        ):
+                            pred_actions_L = _actions_from_target_text(pred_s)
+                            target_actions_L = _actions_from_target_text(target_s)
+                            print(
+                                f"[val_example {ex_i}] pred_actions={len(pred_actions_L)} "
+                                f"target_actions={len(target_actions_L)}"
+                            )
+                            print(
+                                f"[val_example {ex_i}] pred_raw:\n{_truncate_for_log(pred_s)}"
+                            )
+                            print(
+                                f"[val_example {ex_i}] target_raw:\n{_truncate_for_log(target_s)}"
+                            )
                     if wandb_run is not None:
                         wandb_run.log(
                             {
