@@ -20,7 +20,6 @@ import wandb
 from idm.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
 from idm.collator import VideoSFTCollator
 from idm.data import (
-    count_valid_records,
     find_array_record_paths,
     get_dataloader,
 )
@@ -59,7 +58,6 @@ class Args:
     read_num_threads: int = 4
     worker_buffer_size: int = 4
     collator_prefetch: bool = True
-    skip_record_validation: bool = False
     log_every: int = 10
     val_every: int = 0
     val_steps: int = 1
@@ -122,12 +120,6 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, args: Args):
         optimizer=optimizer,
         lr_lambda=lambda step_i: lr_at_step(cfg, int(step_i)) / base_lr,
     )
-
-
-def _broadcast_int(value_i: int, device: torch.device, src_i: int = 0) -> int:
-    value_t = torch.tensor([int(value_i)], device=device, dtype=torch.int64)
-    dist.broadcast(value_t, src=src_i)
-    return int(value_t.item())
 
 
 def _grad_norm_and_clip(
@@ -512,57 +504,10 @@ def main() -> None:
         args.collator_prefetch = False
 
     array_paths = find_array_record_paths(args.data_root, "train")
-    valid_n = -1
-    if args.skip_record_validation:
-        if rank_i == 0:
-            print("Skipping full valid record scan (--skip-record-validation).")
-    else:
-        if rank_i == 0:
-            valid_n = count_valid_records(
-                array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
-            )
-        valid_n = _broadcast_int(valid_n if rank_i == 0 else 0, device=device)
-        if valid_n <= 0:
-            raise ValueError(
-                "No valid records after checks. "
-                "This usually means your explicit --image-h/--image-w/--image-c or --seq-len "
-                "does not match the preprocessed data, or records are missing in-record `actions`."
-            )
 
     val_array_paths: list[str] = []
     if args.val_every > 0:
         val_array_paths = find_array_record_paths(args.data_root, "val")
-        if not args.skip_record_validation:
-            valid_val_n = -1
-            if rank_i == 0:
-                valid_val_n = count_valid_records(
-                    val_array_paths,
-                    args.seq_len,
-                    args.image_h,
-                    args.image_w,
-                    args.image_c,
-                )
-            valid_val_n = _broadcast_int(
-                valid_val_n if rank_i == 0 else 0,
-                device=device,
-            )
-            if valid_val_n <= 0:
-                raise ValueError(
-                    "No valid records found in val split after checks. "
-                    "Ensure val data matches --image-h/--image-w/--image-c and --seq-len."
-                )
-            if rank_i == 0:
-                print(f"valid_val_records={valid_val_n}")
-
-    if valid_n > 0:
-        per_rank_bs = args.global_batch_size // world_i
-        micro_per_epoch = (valid_n // world_i) // per_rank_bs
-        opt_per_epoch = max(micro_per_epoch // max(args.grad_accum, 1), 1)
-        if rank_i == 0:
-            print(
-                f"valid_records={valid_n} optimizer_steps_per_epoch~{opt_per_epoch} "
-                f"estimated_epochs~{args.max_steps / opt_per_epoch:.3f}"
-            )
 
     dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)

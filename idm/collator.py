@@ -126,16 +126,8 @@ class VideoSFTCollator:
             "frames_indices": list(range(int(frames_SHWC.shape[0]))),
         }
 
-    def _prompt_cache_key(self, frames_SHWC: np.ndarray) -> tuple[int, int, int, int]:
-        return (
-            int(frames_SHWC.shape[0]),
-            int(frames_SHWC.shape[1]),
-            int(frames_SHWC.shape[2]),
-            int(frames_SHWC.shape[3]),
-        )
-
     def _prompt_len_for_frames(self, frames_SHWC: np.ndarray) -> int:
-        key_t = self._prompt_cache_key(frames_SHWC)
+        key_t = tuple(frames_SHWC.shape[:4])
         cached_len_i = self._prompt_len_cache.get(key_t)
         if cached_len_i is not None:
             return int(cached_len_i)
