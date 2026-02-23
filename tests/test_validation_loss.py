@@ -203,6 +203,33 @@ def test_run_validation_steps_weights_loss_by_supervised_tokens():
     assert mean_loss_f == pytest.approx((1.0 * 1 + 3.0 * 3) / 4.0)
 
 
+def test_run_validation_steps_collects_debug_examples_when_requested():
+    batch0 = {
+        "labels": torch.tensor([[-100, 1], [-100, 2]], dtype=torch.long),
+        "target_text": ["Frame 0: a", "Frame 0: b"],
+    }
+    model = _FakeDDPModel(
+        outputs_L=[(1.0, torch.zeros((2, 2, 8), dtype=torch.float32))],
+        generated_ids_L=[torch.tensor([[99, 1], [99, 2]], dtype=torch.long)],
+        training=True,
+    )
+    debug_examples: list[tuple[str, str]] = []
+
+    _TRAIN_MOD._run_validation_steps(
+        ddp_model=model,
+        collator=_IdentityCollator(),
+        val_it=iter([batch0]),
+        val_steps=1,
+        val_generate_max_new_tokens=4,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        debug_examples_n=1,
+        debug_examples_out_L=debug_examples,
+    )
+
+    assert debug_examples == [("Frame 0: a", "Frame 0: a")]
+
+
 def test_run_validation_steps_raises_when_val_loader_is_empty():
     with pytest.raises(StopIteration):
         _TRAIN_MOD._run_validation_steps(
