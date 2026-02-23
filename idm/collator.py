@@ -20,6 +20,13 @@ class VideoSFTCollator:
         self.video_fps = video_fps
         self.mask_no_op_actions = mask_no_op_actions
         self.mask_mouse_actions = mask_mouse_actions
+        prompt_msgs, _ = self._messages("")
+        self._prompt_text = self.processor.apply_chat_template(
+            prompt_msgs,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        self._prompt_len_cache: dict[tuple[int, int, int, int], int] = {}
 
     def _should_mask_action(self, action_s: str) -> bool:
         action_s = action_s.strip()
@@ -119,19 +126,60 @@ class VideoSFTCollator:
             "frames_indices": list(range(int(frames_SHWC.shape[0]))),
         }
 
+    def _prompt_cache_key(self, frames_SHWC: np.ndarray) -> tuple[int, int, int, int]:
+        return (
+            int(frames_SHWC.shape[0]),
+            int(frames_SHWC.shape[1]),
+            int(frames_SHWC.shape[2]),
+            int(frames_SHWC.shape[3]),
+        )
+
+    def _prompt_len_for_frames(self, frames_SHWC: np.ndarray) -> int:
+        key_t = self._prompt_cache_key(frames_SHWC)
+        cached_len_i = self._prompt_len_cache.get(key_t)
+        if cached_len_i is not None:
+            return int(cached_len_i)
+
+        prompt_kwargs = {
+            "text": [self._prompt_text],
+            "videos": [self._video_input(frames_SHWC)],
+            "padding": True,
+            "return_tensors": "pt",
+        }
+        if self.video_fps is not None:
+            prompt_kwargs["video_metadata"] = [self._video_metadata(frames_SHWC)]
+
+        prompt_enc_d = self.processor(**prompt_kwargs)
+        prompt_enc_d.pop("token_type_ids", None)
+        prompt_len_i = int(prompt_enc_d["attention_mask"].sum(dim=1).item())
+        self._prompt_len_cache[key_t] = prompt_len_i
+        return prompt_len_i
+
+    def _prompt_lens_from_frames(self, frames_BSHWC: np.ndarray) -> list[int]:
+        if len(frames_BSHWC) == 0:
+            return []
+
+        ref_shape_t = tuple(int(x) for x in frames_BSHWC[0].shape)
+        same_shape_b = True
+        for frames_SHWC in frames_BSHWC[1:]:
+            if tuple(int(x) for x in frames_SHWC.shape) != ref_shape_t:
+                same_shape_b = False
+                break
+
+        if same_shape_b:
+            prompt_len_i = self._prompt_len_for_frames(frames_BSHWC[0])
+            return [prompt_len_i] * int(len(frames_BSHWC))
+
+        prompt_enc_d = self._prompt_enc_d_from_frames(frames_BSHWC)
+        return [int(x) for x in prompt_enc_d["prompt_lens"]]
+
     def _prompt_enc_d_from_frames(self, frames_BSHWC: np.ndarray) -> dict[str, Any]:
         videos_B = []
         prompt_text_B = []
         video_metadata_B = []
         for frames_SHWC in frames_BSHWC:
-            prompt_msgs, _ = self._messages("")
-            prompt_s = self.processor.apply_chat_template(
-                prompt_msgs,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
             videos_B.append(self._video_input(frames_SHWC))
-            prompt_text_B.append(prompt_s)
+            prompt_text_B.append(self._prompt_text)
             if self.video_fps is not None:
                 video_metadata_B.append(self._video_metadata(frames_SHWC))
 
@@ -162,26 +210,21 @@ class VideoSFTCollator:
         target_B = batch_d["target_text"]
 
         videos_B = []
-        prompt_text_B = []
-        full_text_B = []
+        full_msgs_B = []
         video_metadata_B = []
         for frames_SHWC, target_s in zip(frames_BSHWC, target_B):
-            prompt_msgs, full_msgs = self._messages(target_s)
-            prompt_s = self.processor.apply_chat_template(
-                prompt_msgs,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            full_s = self.processor.apply_chat_template(
-                full_msgs,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
+            _, full_msgs = self._messages(target_s)
+            full_msgs_B.append(full_msgs)
             videos_B.append(self._video_input(frames_SHWC))
-            prompt_text_B.append(prompt_s)
-            full_text_B.append(full_s)
             if self.video_fps is not None:
                 video_metadata_B.append(self._video_metadata(frames_SHWC))
+        full_text_B = self.processor.apply_chat_template(
+            full_msgs_B,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        if isinstance(full_text_B, str):
+            full_text_B = [full_text_B]
 
         processor_kwargs = {
             "text": full_text_B,
@@ -189,23 +232,12 @@ class VideoSFTCollator:
             "padding": True,
             "return_tensors": "pt",
         }
-        prompt_kwargs = {
-            "text": prompt_text_B,
-            "videos": videos_B,
-            "padding": True,
-            "return_tensors": "pt",
-        }
         if self.video_fps is not None:
             processor_kwargs["video_metadata"] = video_metadata_B
-            prompt_kwargs["video_metadata"] = video_metadata_B
 
         enc_d = self.processor(**processor_kwargs)
         enc_d.pop("token_type_ids", None)
-        prompt_enc_d = self.processor(**prompt_kwargs)
-        prompt_enc_d.pop("token_type_ids", None)
-
-        prompt_mask_BS = prompt_enc_d["attention_mask"]
-        prompt_lens_B = [int(x) for x in prompt_mask_BS.sum(dim=1).tolist()]
+        prompt_lens_B = self._prompt_lens_from_frames(frames_BSHWC)
 
         input_ids_BS = enc_d["input_ids"]
         labels_BS = input_ids_BS.clone()
