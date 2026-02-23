@@ -124,6 +124,12 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, args: Args):
     )
 
 
+def _broadcast_int(value_i: int, device: torch.device, src_i: int = 0) -> int:
+    value_t = torch.tensor([int(value_i)], device=device, dtype=torch.int64)
+    dist.broadcast(value_t, src=src_i)
+    return int(value_t.item())
+
+
 def _grad_norm_and_clip(
     params: list[torch.nn.Parameter],
     max_grad_norm: float,
@@ -498,6 +504,12 @@ def main() -> None:
     device = torch.device(f"cuda:{local_rank_i}")
     _seed_all(args.seed, rank_i)
     _assert_image_hwc_matches_metadata(args)
+    if args.val_every > 0 and args.collator_prefetch:
+        if rank_i == 0:
+            print(
+                "Disabling --collator-prefetch because validation also uses the collator."
+            )
+        args.collator_prefetch = False
 
     array_paths = find_array_record_paths(args.data_root, "train")
     valid_n = -1
@@ -505,9 +517,11 @@ def main() -> None:
         if rank_i == 0:
             print("Skipping full valid record scan (--skip-record-validation).")
     else:
-        valid_n = count_valid_records(
-            array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
-        )
+        if rank_i == 0:
+            valid_n = count_valid_records(
+                array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
+            )
+        valid_n = _broadcast_int(valid_n if rank_i == 0 else 0, device=device)
         if valid_n <= 0:
             raise ValueError(
                 "No valid records after checks. "
@@ -519,8 +533,18 @@ def main() -> None:
     if args.val_every > 0:
         val_array_paths = find_array_record_paths(args.data_root, "val")
         if not args.skip_record_validation:
-            valid_val_n = count_valid_records(
-                val_array_paths, args.seq_len, args.image_h, args.image_w, args.image_c
+            valid_val_n = -1
+            if rank_i == 0:
+                valid_val_n = count_valid_records(
+                    val_array_paths,
+                    args.seq_len,
+                    args.image_h,
+                    args.image_w,
+                    args.image_c,
+                )
+            valid_val_n = _broadcast_int(
+                valid_val_n if rank_i == 0 else 0,
+                device=device,
             )
             if valid_val_n <= 0:
                 raise ValueError(
