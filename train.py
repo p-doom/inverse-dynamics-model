@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -19,7 +20,6 @@ import wandb
 from idm.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
 from idm.collator import VideoSFTCollator
 from idm.data import (
-    count_valid_records,
     find_array_record_paths,
     get_dataloader,
 )
@@ -53,8 +53,11 @@ class Args:
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     seed: int = 0
-    num_workers: int = 0
-    prefetch_buffer_size: int = 1
+    num_workers: int = 4
+    prefetch_buffer_size: int = 8
+    read_num_threads: int = 4
+    worker_buffer_size: int = 4
+    collator_prefetch: bool = True
     log_every: int = 10
     val_every: int = 0
     val_steps: int = 1
@@ -207,6 +210,56 @@ def _action_accuracy_counts_from_texts(
             if idx_i < len(pred_actions_L) and pred_actions_L[idx_i] == target_action_s:
                 correct_n += 1
     return correct_n, total_n
+
+
+class _CollatorPrefetchIterator:
+    def __init__(self, raw_it: Any, collator: VideoSFTCollator):
+        self._raw_it = raw_it
+        self._collator = collator
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._next_fut: Future[tuple[bytes, dict[str, Any]]] | None = None
+        self._last_state_b: bytes = self._raw_it.get_state()
+        self._closed_b = False
+        self._submit_next()
+
+    def _load_one(self) -> tuple[bytes, dict[str, Any]]:
+        raw_batch_d = next(self._raw_it)
+        state_after_b = self._raw_it.get_state()
+        model_batch_d = self._collator(raw_batch_d)
+        return state_after_b, model_batch_d
+
+    def _submit_next(self) -> None:
+        if self._closed_b:
+            return
+        self._next_fut = self._pool.submit(self._load_one)
+
+    def last_state(self) -> bytes:
+        return self._last_state_b
+
+    def close(self) -> None:
+        if self._closed_b:
+            return
+        self._closed_b = True
+        self._pool.shutdown(wait=True, cancel_futures=False)
+        self._next_fut = None
+
+    def __iter__(self) -> "_CollatorPrefetchIterator":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        if self._next_fut is None:
+            raise StopIteration
+        try:
+            state_after_b, model_batch_d = self._next_fut.result()
+        except StopIteration:
+            self.close()
+            raise
+        except Exception:
+            self.close()
+            raise
+        self._last_state_b = state_after_b
+        self._submit_next()
+        return model_batch_d
 
 
 def _run_validation_steps(
@@ -422,6 +475,12 @@ def main() -> None:
         raise ValueError("--save_every must be >= 1.")
     if args.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
+    if args.prefetch_buffer_size <= 0:
+        raise ValueError("--prefetch_buffer_size must be >= 1.")
+    if args.read_num_threads <= 0:
+        raise ValueError("--read_num_threads must be >= 1.")
+    if args.worker_buffer_size <= 0:
+        raise ValueError("--worker_buffer_size must be >= 1.")
 
     print(f"Rank {rank_i} initializing process group...")
     print(f"Local rank: {local_rank_i}")
@@ -468,8 +527,20 @@ def main() -> None:
         mask_no_op_actions=args.mask_no_op_actions,
         mask_mouse_actions=args.mask_mouse_actions,
     )
+    val_collator = collator
     val_it = None
     if args.val_every > 0:
+        val_processor = AutoProcessor.from_pretrained(
+            args.model_id,
+            trust_remote_code=True,
+        )
+        val_collator = VideoSFTCollator(
+            processor=val_processor,
+            instruction_text=args.instruction_text,
+            video_fps=args.video_fps,
+            mask_no_op_actions=args.mask_no_op_actions,
+            mask_mouse_actions=args.mask_mouse_actions,
+        )
         val_loader = get_dataloader(
             array_record_paths=val_array_paths,
             seq_len=args.seq_len,
@@ -484,6 +555,8 @@ def main() -> None:
             num_epochs=None,
             num_workers=args.num_workers,
             prefetch_buffer_size=args.prefetch_buffer_size,
+            read_num_threads=args.read_num_threads,
+            worker_buffer_size=args.worker_buffer_size,
         )
         val_it = iter(val_loader)
     trainable_params = [p for p in ddp_model.parameters() if p.requires_grad]
@@ -560,202 +633,222 @@ def main() -> None:
             epoch_i=epoch_i,
             num_workers=args.num_workers,
             prefetch_buffer_size=args.prefetch_buffer_size,
+            read_num_threads=args.read_num_threads,
+            worker_buffer_size=args.worker_buffer_size,
         )
-        it = iter(loader)
+        raw_it = iter(loader)
         if pending_state_b is not None and epoch_i == resume_epoch_i:
-            it.set_state(pending_state_b)
+            raw_it.set_state(pending_state_b)
             pending_state_b = None
 
-        for raw_batch_d in it:
-            ddp_model.train()
-            model_batch_d = _to_device(collator(raw_batch_d), device)
-            tok_n = int((model_batch_d["labels"] != -100).sum().item())
+        prefetched_it = (
+            _CollatorPrefetchIterator(raw_it=raw_it, collator=collator)
+            if args.collator_prefetch
+            else None
+        )
+        batch_it = prefetched_it if prefetched_it is not None else raw_it
+        try:
+            for batch_d in batch_it:
+                ddp_model.train()
+                model_batch_d = (
+                    _to_device(batch_d, device)
+                    if prefetched_it is not None
+                    else _to_device(collator(batch_d), device)
+                )
+                tok_n = int((model_batch_d["labels"] != -100).sum().item())
 
-            with torch.autocast("cuda", dtype=dtype):
-                loss = ddp_model(**model_batch_d).loss
+                with torch.autocast("cuda", dtype=dtype):
+                    loss = ddp_model(**model_batch_d).loss
 
-            log_loss_sum += float(loss.detach().item())
-            log_micro_n += 1
-            log_tok_n += tok_n
+                log_loss_sum += float(loss.detach().item())
+                log_micro_n += 1
+                log_tok_n += tok_n
 
-            micro_in_accum_i += 1
-            loss = loss / args.grad_accum
-            should_step_b = micro_in_accum_i >= args.grad_accum
-            if not should_step_b and world_i > 1:
-                with ddp_model.no_sync():
+                micro_in_accum_i += 1
+                loss = loss / args.grad_accum
+                should_step_b = micro_in_accum_i >= args.grad_accum
+                if not should_step_b and world_i > 1:
+                    with ddp_model.no_sync():
+                        if args.precision == "fp16":
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                else:
                     if args.precision == "fp16":
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
-            else:
+                if not should_step_b:
+                    continue
+
+                micro_in_accum_i = 0
                 if args.precision == "fp16":
-                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                grad_norm_f = _grad_norm_and_clip(trainable_params, args.max_grad_norm)
+                if args.precision == "fp16":
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    loss.backward()
-            if not should_step_b:
-                continue
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                global_step += 1
+                log_step_n += 1
+                log_grad_norm_sum += grad_norm_f
+                log_grad_norm_n += 1
 
-            micro_in_accum_i = 0
-            if args.precision == "fp16":
-                scaler.unscale_(optimizer)
-            grad_norm_f = _grad_norm_and_clip(trainable_params, args.max_grad_norm)
-            if args.precision == "fp16":
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            global_step += 1
-            log_step_n += 1
-            log_grad_norm_sum += grad_norm_f
-            log_grad_norm_n += 1
-
-            if global_step % args.log_every == 0:
-                mean_loss_t = torch.tensor(
-                    log_loss_sum / max(log_micro_n, 1), device=device
-                )
-                mean_grad_norm_t = torch.tensor(
-                    log_grad_norm_sum / max(log_grad_norm_n, 1), device=device
-                )
-                tok_t = torch.tensor(float(log_tok_n), device=device)
-                if world_i > 1:
-                    dist.all_reduce(mean_loss_t, op=dist.ReduceOp.SUM)
-                    mean_loss_t /= world_i
-                    dist.all_reduce(mean_grad_norm_t, op=dist.ReduceOp.SUM)
-                    mean_grad_norm_t /= world_i
-                    dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
-
-                dt = max(time.time() - t0, 1e-9)
-                steps_per_s = log_step_n / dt
-                toks_per_s = tok_t.item() / dt
-                lr_f = optimizer.param_groups[0]["lr"]
-                if rank_i == 0:
-                    print(
-                        f"step={global_step} loss={mean_loss_t.item():.6f} "
-                        f"grad_norm={mean_grad_norm_t.item():.6f} "
-                        f"lr={lr_f:.3e} steps_per_s={steps_per_s:.3f} "
-                        f"tokens_per_s={toks_per_s:.1f}"
+                if global_step % args.log_every == 0:
+                    mean_loss_t = torch.tensor(
+                        log_loss_sum / max(log_micro_n, 1), device=device
                     )
-                    if wandb_run is not None:
-                        wandb_run.log(
-                            {
-                                "train/loss": mean_loss_t.item(),
-                                "train/grad_norm": mean_grad_norm_t.item(),
-                                "train/lr": lr_f,
-                                "train/steps_per_s": steps_per_s,
-                                "train/tokens_per_s": toks_per_s,
-                                "train/epoch_estimate": epoch_i,
-                            },
-                            step=global_step,
-                        )
-                log_loss_sum = 0.0
-                log_micro_n = 0
-                log_tok_n = 0
-                log_step_n = 0
-                log_grad_norm_sum = 0.0
-                log_grad_norm_n = 0
-                t0 = time.time()
-
-            if args.val_every > 0 and global_step % args.val_every == 0:
-                assert val_it is not None
-                val_t0 = time.time()
-                val_examples_L: list[tuple[str, str]] = []
-                (
-                    val_loss_f,
-                    val_tok_n,
-                    val_action_correct_n,
-                    val_action_total_n,
-                ) = _run_validation_steps(
-                    ddp_model=ddp_model,
-                    collator=collator,
-                    val_it=val_it,
-                    val_steps=args.val_steps,
-                    val_generate_max_new_tokens=args.val_generate_max_new_tokens,
-                    device=device,
-                    dtype=dtype,
-                    debug_examples_n=args.val_log_examples,
-                    debug_examples_out_L=val_examples_L,
-                )
-                val_loss_num_t = torch.tensor(
-                    val_loss_f * max(float(val_tok_n), 1.0), device=device
-                )
-                val_tok_t = torch.tensor(float(val_tok_n), device=device)
-                val_action_correct_t = torch.tensor(
-                    float(val_action_correct_n), device=device
-                )
-                val_action_total_t = torch.tensor(
-                    float(val_action_total_n), device=device
-                )
-                if world_i > 1:
-                    dist.all_reduce(val_loss_num_t, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(val_tok_t, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(val_action_correct_t, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(val_action_total_t, op=dist.ReduceOp.SUM)
-                val_loss_t = val_loss_num_t / torch.clamp(val_tok_t, min=1.0)
-                val_dt = max(time.time() - val_t0, 1e-9)
-                val_toks_per_s = val_tok_t.item() / val_dt
-                val_action_acc_f = val_action_correct_t.item() / max(
-                    val_action_total_t.item(), 1.0
-                )
-                if rank_i == 0:
-                    print(
-                        f"step={global_step} val_loss={val_loss_t.item():.6f} "
-                        f"val_steps={args.val_steps} val_tokens_per_s={val_toks_per_s:.1f} "
-                        f"val_action_acc={val_action_acc_f:.6f}"
+                    mean_grad_norm_t = torch.tensor(
+                        log_grad_norm_sum / max(log_grad_norm_n, 1), device=device
                     )
-                    if val_examples_L:
-                        for ex_i, (pred_s, target_s) in enumerate(
-                            val_examples_L, start=1
-                        ):
-                            pred_actions_L = _actions_from_target_text(pred_s)
-                            target_actions_L = _actions_from_target_text(target_s)
-                            print(
-                                f"[val_example {ex_i}] pred_actions={len(pred_actions_L)} "
-                                f"target_actions={len(target_actions_L)}"
-                            )
-                            print(
-                                f"[val_example {ex_i}] pred_raw:\n{_truncate_for_log(pred_s)}"
-                            )
-                            print(
-                                f"[val_example {ex_i}] target_raw:\n{_truncate_for_log(target_s)}"
-                            )
-                    if wandb_run is not None:
-                        wandb_run.log(
-                            {
-                                "val/loss": val_loss_t.item(),
-                                "val/tokens_per_s": val_toks_per_s,
-                                "val/action_acc": val_action_acc_f,
-                            },
-                            step=global_step,
+                    tok_t = torch.tensor(float(log_tok_n), device=device)
+                    if world_i > 1:
+                        dist.all_reduce(mean_loss_t, op=dist.ReduceOp.SUM)
+                        mean_loss_t /= world_i
+                        dist.all_reduce(mean_grad_norm_t, op=dist.ReduceOp.SUM)
+                        mean_grad_norm_t /= world_i
+                        dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+
+                    dt = max(time.time() - t0, 1e-9)
+                    steps_per_s = log_step_n / dt
+                    toks_per_s = tok_t.item() / dt
+                    lr_f = optimizer.param_groups[0]["lr"]
+                    if rank_i == 0:
+                        print(
+                            f"step={global_step} loss={mean_loss_t.item():.6f} "
+                            f"grad_norm={mean_grad_norm_t.item():.6f} "
+                            f"lr={lr_f:.3e} steps_per_s={steps_per_s:.3f} "
+                            f"tokens_per_s={toks_per_s:.1f}"
                         )
+                        if wandb_run is not None:
+                            wandb_run.log(
+                                {
+                                    "train/loss": mean_loss_t.item(),
+                                    "train/grad_norm": mean_grad_norm_t.item(),
+                                    "train/lr": lr_f,
+                                    "train/steps_per_s": steps_per_s,
+                                    "train/tokens_per_s": toks_per_s,
+                                    "train/epoch_estimate": epoch_i,
+                                },
+                                step=global_step,
+                            )
+                    log_loss_sum = 0.0
+                    log_micro_n = 0
+                    log_tok_n = 0
+                    log_step_n = 0
+                    log_grad_norm_sum = 0.0
+                    log_grad_norm_n = 0
+                    t0 = time.time()
 
-            if global_step % args.save_every == 0 or global_step == args.max_steps:
-                save_checkpoint(
-                    out_dir=args.out_dir,
-                    step_i=global_step,
-                    model=ddp_model.module,
-                    use_lora=args.use_lora,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler_state=(
-                        scaler.state_dict() if args.precision == "fp16" else None
-                    ),
-                    train_state_d={
-                        "global_step": global_step,
-                        "epoch_i": epoch_i,
-                        "rng_state_d": _rng_state_d(),
-                    },
-                    grain_state_b=it.get_state(),
-                    args_d=asdict(args),
-                    rank_i=rank_i,
-                    save_model=(rank_i == 0),
-                )
-                if world_i > 1:
-                    dist.barrier()
+                if args.val_every > 0 and global_step % args.val_every == 0:
+                    assert val_it is not None
+                    val_t0 = time.time()
+                    val_examples_L: list[tuple[str, str]] = []
+                    (
+                        val_loss_f,
+                        val_tok_n,
+                        val_action_correct_n,
+                        val_action_total_n,
+                    ) = _run_validation_steps(
+                        ddp_model=ddp_model,
+                        collator=val_collator,
+                        val_it=val_it,
+                        val_steps=args.val_steps,
+                        val_generate_max_new_tokens=args.val_generate_max_new_tokens,
+                        device=device,
+                        dtype=dtype,
+                        debug_examples_n=args.val_log_examples,
+                        debug_examples_out_L=val_examples_L,
+                    )
+                    val_loss_num_t = torch.tensor(
+                        val_loss_f * max(float(val_tok_n), 1.0), device=device
+                    )
+                    val_tok_t = torch.tensor(float(val_tok_n), device=device)
+                    val_action_correct_t = torch.tensor(
+                        float(val_action_correct_n), device=device
+                    )
+                    val_action_total_t = torch.tensor(
+                        float(val_action_total_n), device=device
+                    )
+                    if world_i > 1:
+                        dist.all_reduce(val_loss_num_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_tok_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_action_correct_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_action_total_t, op=dist.ReduceOp.SUM)
+                    val_loss_t = val_loss_num_t / torch.clamp(val_tok_t, min=1.0)
+                    val_dt = max(time.time() - val_t0, 1e-9)
+                    val_toks_per_s = val_tok_t.item() / val_dt
+                    val_action_acc_f = val_action_correct_t.item() / max(
+                        val_action_total_t.item(), 1.0
+                    )
+                    if rank_i == 0:
+                        print(
+                            f"step={global_step} val_loss={val_loss_t.item():.6f} "
+                            f"val_steps={args.val_steps} val_tokens_per_s={val_toks_per_s:.1f} "
+                            f"val_action_acc={val_action_acc_f:.6f}"
+                        )
+                        if val_examples_L:
+                            for ex_i, (pred_s, target_s) in enumerate(
+                                val_examples_L, start=1
+                            ):
+                                pred_actions_L = _actions_from_target_text(pred_s)
+                                target_actions_L = _actions_from_target_text(target_s)
+                                print(
+                                    f"[val_example {ex_i}] pred_actions={len(pred_actions_L)} "
+                                    f"target_actions={len(target_actions_L)}"
+                                )
+                                print(
+                                    f"[val_example {ex_i}] pred_raw:\n{_truncate_for_log(pred_s)}"
+                                )
+                                print(
+                                    f"[val_example {ex_i}] target_raw:\n{_truncate_for_log(target_s)}"
+                                )
+                        if wandb_run is not None:
+                            wandb_run.log(
+                                {
+                                    "val/loss": val_loss_t.item(),
+                                    "val/tokens_per_s": val_toks_per_s,
+                                    "val/action_acc": val_action_acc_f,
+                                },
+                                step=global_step,
+                            )
 
-            if global_step >= args.max_steps:
-                break
+                if global_step % args.save_every == 0 or global_step == args.max_steps:
+                    save_checkpoint(
+                        out_dir=args.out_dir,
+                        step_i=global_step,
+                        model=ddp_model.module,
+                        use_lora=args.use_lora,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler_state=(
+                            scaler.state_dict() if args.precision == "fp16" else None
+                        ),
+                        train_state_d={
+                            "global_step": global_step,
+                            "epoch_i": epoch_i,
+                            "rng_state_d": _rng_state_d(),
+                        },
+                        grain_state_b=(
+                            prefetched_it.last_state()
+                            if prefetched_it is not None
+                            else raw_it.get_state()
+                        ),
+                        args_d=asdict(args),
+                        rank_i=rank_i,
+                        save_model=(rank_i == 0),
+                    )
+                    if world_i > 1:
+                        dist.barrier()
+
+                if global_step >= args.max_steps:
+                    break
+        finally:
+            if prefetched_it is not None:
+                prefetched_it.close()
         epoch_i += 1
 
     if rank_i == 0:

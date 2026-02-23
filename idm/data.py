@@ -116,8 +116,10 @@ def get_dataloader(
     seed: int,
     epoch_i: int,
     num_epochs: int | None = 1,
-    num_workers: int = 0,
-    prefetch_buffer_size: int = 1,
+    num_workers: int = 4,
+    prefetch_buffer_size: int = 8,
+    read_num_threads: int = 4,
+    worker_buffer_size: int = 4,
 ) -> grain.DataLoader:
     if not array_record_paths:
         raise ValueError("array_record_paths list cannot be empty.")
@@ -128,6 +130,12 @@ def get_dataloader(
             f"global_batch_size ({global_batch_size}) must be divisible "
             f"by world_size ({world_size})."
         )
+    if prefetch_buffer_size <= 0:
+        raise ValueError("prefetch_buffer_size must be >= 1.")
+    if read_num_threads <= 0:
+        raise ValueError("read_num_threads must be >= 1.")
+    if worker_buffer_size <= 0:
+        raise ValueError("worker_buffer_size must be >= 1.")
 
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
     sampler = grain.samplers.IndexSampler(
@@ -162,14 +170,14 @@ def get_dataloader(
     ]
     read_opts = grain.ReadOptions(
         prefetch_buffer_size=prefetch_buffer_size,
-        num_threads=1,
+        num_threads=read_num_threads,
     )
     return grain.DataLoader(
         data_source=source,
         sampler=sampler,
         operations=ops,
         worker_count=num_workers,
-        worker_buffer_size=1,
+        worker_buffer_size=worker_buffer_size,
         read_options=read_opts,
     )
 

@@ -26,14 +26,19 @@ class _FakeProcessor:
     def __init__(self):
         self.tokenizer = _FakeTokenizer()
 
-    def apply_chat_template(
-        self, messages, tokenize: bool, add_generation_prompt: bool
-    ):
-        del tokenize, add_generation_prompt
+    def _render_template(self, messages):
         user_s = messages[0]["content"][1]["text"]
         if len(messages) == 1:
             return f"U:{user_s}\nA:"
         return f"U:{user_s}\nA:{messages[1]['content']}"
+
+    def apply_chat_template(
+        self, messages, tokenize: bool, add_generation_prompt: bool
+    ):
+        del tokenize, add_generation_prompt
+        if messages and isinstance(messages[0], list):
+            return [self._render_template(msgs) for msgs in messages]
+        return self._render_template(messages)
 
     def __call__(self, text, videos, padding, return_tensors, video_metadata=None):
         del videos, padding, return_tensors, video_metadata
@@ -53,14 +58,19 @@ class _FakeProcessor:
 
 
 class _FakeVideoExpandingProcessor(_FakeProcessor):
-    def apply_chat_template(
-        self, messages, tokenize: bool, add_generation_prompt: bool
-    ):
-        del tokenize, add_generation_prompt
+    def _render_template(self, messages):
         user_s = messages[0]["content"][1]["text"]
         if len(messages) == 1:
             return f"U:[VIDEO]{user_s}\nA:"
         return f"U:[VIDEO]{user_s}\nA:{messages[1]['content']}"
+
+    def apply_chat_template(
+        self, messages, tokenize: bool, add_generation_prompt: bool
+    ):
+        del tokenize, add_generation_prompt
+        if messages and isinstance(messages[0], list):
+            return [self._render_template(msgs) for msgs in messages]
+        return self._render_template(messages)
 
     def __call__(self, text, videos, padding, return_tensors, video_metadata=None):
         del padding, return_tensors, video_metadata
