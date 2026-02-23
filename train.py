@@ -37,6 +37,7 @@ class Args:
     seq_len: int = 128
     global_batch_size: int = 8
     grad_accum: int = 1
+    max_grad_norm: float = 1.0
     max_steps: int = 1000
     lr: float = 2e-5
     init_lr: float = 0.0
@@ -116,6 +117,21 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, args: Args):
         optimizer=optimizer,
         lr_lambda=lambda step_i: lr_at_step(cfg, int(step_i)) / base_lr,
     )
+
+
+def _grad_norm_and_clip(
+    params: list[torch.nn.Parameter],
+    max_grad_norm: float,
+) -> float:
+    grad_params = [p for p in params if p.grad is not None]
+    if not grad_params:
+        return 0.0
+
+    clip_max_norm = float(max_grad_norm) if max_grad_norm > 0 else float("inf")
+    total_norm_t = torch.nn.utils.clip_grad_norm_(grad_params, clip_max_norm)
+    if isinstance(total_norm_t, torch.Tensor):
+        return float(total_norm_t.detach().item())
+    return float(total_norm_t)
 
 
 def _to_device(
@@ -390,6 +406,8 @@ def main() -> None:
         )
     if args.grad_accum <= 0:
         raise ValueError("--grad_accum must be >= 1.")
+    if args.max_grad_norm < 0:
+        raise ValueError("--max_grad_norm must be >= 0.")
     if args.log_every <= 0:
         raise ValueError("--log_every must be >= 1.")
     if args.val_every < 0:
@@ -468,8 +486,9 @@ def main() -> None:
             prefetch_buffer_size=args.prefetch_buffer_size,
         )
         val_it = iter(val_loader)
+    trainable_params = [p for p in ddp_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        (p for p in ddp_model.parameters() if p.requires_grad),
+        trainable_params,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -522,6 +541,8 @@ def main() -> None:
     log_micro_n = 0
     log_tok_n = 0
     log_step_n = 0
+    log_grad_norm_sum = 0.0
+    log_grad_norm_n = 0
     t0 = time.time()
 
     while global_step < args.max_steps:
@@ -576,6 +597,9 @@ def main() -> None:
 
             micro_in_accum_i = 0
             if args.precision == "fp16":
+                scaler.unscale_(optimizer)
+            grad_norm_f = _grad_norm_and_clip(trainable_params, args.max_grad_norm)
+            if args.precision == "fp16":
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -584,15 +608,22 @@ def main() -> None:
             scheduler.step()
             global_step += 1
             log_step_n += 1
+            log_grad_norm_sum += grad_norm_f
+            log_grad_norm_n += 1
 
             if global_step % args.log_every == 0:
                 mean_loss_t = torch.tensor(
                     log_loss_sum / max(log_micro_n, 1), device=device
                 )
+                mean_grad_norm_t = torch.tensor(
+                    log_grad_norm_sum / max(log_grad_norm_n, 1), device=device
+                )
                 tok_t = torch.tensor(float(log_tok_n), device=device)
                 if world_i > 1:
                     dist.all_reduce(mean_loss_t, op=dist.ReduceOp.SUM)
                     mean_loss_t /= world_i
+                    dist.all_reduce(mean_grad_norm_t, op=dist.ReduceOp.SUM)
+                    mean_grad_norm_t /= world_i
                     dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
 
                 dt = max(time.time() - t0, 1e-9)
@@ -602,6 +633,7 @@ def main() -> None:
                 if rank_i == 0:
                     print(
                         f"step={global_step} loss={mean_loss_t.item():.6f} "
+                        f"grad_norm={mean_grad_norm_t.item():.6f} "
                         f"lr={lr_f:.3e} steps_per_s={steps_per_s:.3f} "
                         f"tokens_per_s={toks_per_s:.1f}"
                     )
@@ -609,6 +641,7 @@ def main() -> None:
                         wandb_run.log(
                             {
                                 "train/loss": mean_loss_t.item(),
+                                "train/grad_norm": mean_grad_norm_t.item(),
                                 "train/lr": lr_f,
                                 "train/steps_per_s": steps_per_s,
                                 "train/tokens_per_s": toks_per_s,
@@ -620,6 +653,8 @@ def main() -> None:
                 log_micro_n = 0
                 log_tok_n = 0
                 log_step_n = 0
+                log_grad_norm_sum = 0.0
+                log_grad_norm_n = 0
                 t0 = time.time()
 
             if args.val_every > 0 and global_step % args.val_every == 0:
