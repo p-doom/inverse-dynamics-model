@@ -29,6 +29,7 @@ from idm.lr_schedules import LRScheduleArgs, lr_at_step
 @dataclass
 class Args:
     model_id: str = "Qwen/Qwen3-VL-2B-Instruct"
+    attn_implementation: str = "flash_attention_2"
     data_root: str = ""
     image_h: int = 90
     image_w: int = 160
@@ -76,6 +77,7 @@ class Args:
     wandb_entity: str = ""
     wandb_run_name: str = ""
     wandb_mode: str = "online"
+    mfu_peak_flops: float = 0.0
 
 
 def _rng_state_d() -> dict[str, Any]:
@@ -410,10 +412,15 @@ def _assert_image_hwc_matches_metadata(args: Args) -> None:
 def _build_model(
     args: Args, dtype: torch.dtype, device: torch.device
 ) -> torch.nn.Module:
+    model_kwargs = {
+        "torch_dtype": dtype,
+        "trust_remote_code": True,
+    }
+    if args.attn_implementation != "auto":
+        model_kwargs["attn_implementation"] = args.attn_implementation
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_id,
-        torch_dtype=dtype,
-        trust_remote_code=True,
+        **model_kwargs,
     )
     model.config.use_cache = False
     if args.grad_checkpointing:
@@ -438,6 +445,62 @@ def _build_model(
             ),
         )
     return model.to(device)
+
+
+def _transformer_dims_for_mfu(model: torch.nn.Module) -> tuple[int, int, int]:
+    text_cfg = model.config.text_config
+    n_layers_i = int(text_cfg.num_hidden_layers)
+    n_heads_i = int(text_cfg.num_attention_heads)
+    head_dim_i = int(text_cfg.head_dim)
+    if n_layers_i <= 0 or n_heads_i <= 0 or head_dim_i <= 0:
+        raise ValueError("Invalid Qwen3-VL text_config dimensions for MFU.")
+    return n_layers_i, n_heads_i, head_dim_i
+
+
+def _peak_device_flops(precision_s: str, device_name_s: str) -> float | None:
+    precision_s = str(precision_s).lower()
+    if precision_s not in {"bf16", "fp16"}:
+        return None
+    name_s = str(device_name_s).lower()
+    if "h100" in name_s:
+        return 756e12 if "pcie" in name_s else 989e12
+    if "a100" in name_s:
+        return 312e12
+    return None
+
+
+def _flops_per_token_estimate(
+    n_params_i: int,
+    n_layers_i: int,
+    n_heads_i: int,
+    head_dim_i: int,
+    seq_len_f: float,
+) -> float:
+    return float(
+        (6.0 * float(n_params_i))
+        + (12.0 * float(n_layers_i * n_heads_i * head_dim_i) * float(seq_len_f))
+    )
+
+
+def _mfu_from_throughput(
+    n_params_i: int,
+    n_layers_i: int,
+    n_heads_i: int,
+    head_dim_i: int,
+    seq_len_f: float,
+    tokens_per_s_f: float,
+    peak_flops_f: float,
+) -> float | None:
+    if peak_flops_f <= 0 or tokens_per_s_f <= 0:
+        return None
+    flops_per_token_f = _flops_per_token_estimate(
+        n_params_i=n_params_i,
+        n_layers_i=n_layers_i,
+        n_heads_i=n_heads_i,
+        head_dim_i=head_dim_i,
+        seq_len_f=seq_len_f,
+    )
+    return (flops_per_token_f * float(tokens_per_s_f)) / float(peak_flops_f)
 
 
 def main() -> None:
@@ -475,6 +538,11 @@ def main() -> None:
         raise ValueError("--save_every must be >= 1.")
     if args.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
+    if args.attn_implementation not in {"flash_attention_2", "sdpa", "auto"}:
+        raise ValueError(
+            "Unsupported --attn-implementation. "
+            "Expected one of: flash_attention_2, sdpa, auto."
+        )
     if args.prefetch_buffer_size <= 0:
         raise ValueError("--prefetch_buffer_size must be >= 1.")
     if args.read_num_threads <= 0:
@@ -506,13 +574,34 @@ def main() -> None:
     dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
     model = _build_model(args, dtype, device)
+    train_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_n = sum(p.numel() for p in model.parameters())
+    mfu_n_layers_i, mfu_n_heads_i, mfu_head_dim_i = _transformer_dims_for_mfu(model)
+    mfu_peak_flops_f = (
+        float(args.mfu_peak_flops)
+        if args.mfu_peak_flops > 0.0
+        else (
+            _peak_device_flops(args.precision, torch.cuda.get_device_name(local_rank_i))
+            or 0.0
+        )
+    )
+    mfu_enabled_b = bool(mfu_peak_flops_f > 0.0 and total_n > 0)
     if rank_i == 0:
-        train_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_n = sum(p.numel() for p in model.parameters())
         print(
             f"trainable_params={train_n} total_params={total_n} ratio={train_n/max(total_n,1):.6f}"
         )
         print(f"model_id={args.model_id}")
+        print(f"attn_implementation={model.config._attn_implementation}")
+        if mfu_enabled_b:
+            print(
+                f"mfu_enabled=True peak_flops={mfu_peak_flops_f:.3e} "
+                f"n_layers={mfu_n_layers_i} n_heads={mfu_n_heads_i} head_dim={mfu_head_dim_i}"
+            )
+        else:
+            print(
+                "mfu_enabled=False reason=unknown_peak_flops "
+                "(set --mfu-peak-flops to enable)"
+            )
 
     ddp_model = DDP(
         model,
@@ -613,6 +702,8 @@ def main() -> None:
     log_loss_sum = 0.0
     log_micro_n = 0
     log_tok_n = 0
+    log_input_tok_n = 0
+    log_sample_n = 0
     log_step_n = 0
     log_grad_norm_sum = 0.0
     log_grad_norm_n = 0
@@ -663,6 +754,8 @@ def main() -> None:
                 log_loss_sum += float(loss.detach().item())
                 log_micro_n += 1
                 log_tok_n += tok_n
+                log_input_tok_n += int(model_batch_d["input_ids"].numel())
+                log_sample_n += int(model_batch_d["input_ids"].shape[0])
 
                 micro_in_accum_i += 1
                 loss = loss / args.grad_accum
@@ -705,39 +798,63 @@ def main() -> None:
                         log_grad_norm_sum / max(log_grad_norm_n, 1), device=device
                     )
                     tok_t = torch.tensor(float(log_tok_n), device=device)
+                    input_tok_t = torch.tensor(float(log_input_tok_n), device=device)
+                    sample_t = torch.tensor(float(log_sample_n), device=device)
                     if world_i > 1:
                         dist.all_reduce(mean_loss_t, op=dist.ReduceOp.SUM)
                         mean_loss_t /= world_i
                         dist.all_reduce(mean_grad_norm_t, op=dist.ReduceOp.SUM)
                         mean_grad_norm_t /= world_i
                         dist.all_reduce(tok_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(input_tok_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(sample_t, op=dist.ReduceOp.SUM)
 
                     dt = max(time.time() - t0, 1e-9)
                     steps_per_s = log_step_n / dt
                     toks_per_s = tok_t.item() / dt
+                    input_toks_per_s = input_tok_t.item() / dt
                     lr_f = optimizer.param_groups[0]["lr"]
+                    mean_input_seq_len_f = input_tok_t.item() / max(
+                        sample_t.item(), 1.0
+                    )
+                    mfu_f = None
+                    if mfu_enabled_b:
+                        mfu_f = _mfu_from_throughput(
+                            n_params_i=total_n,
+                            n_layers_i=mfu_n_layers_i,
+                            n_heads_i=mfu_n_heads_i,
+                            head_dim_i=mfu_head_dim_i,
+                            seq_len_f=mean_input_seq_len_f,
+                            tokens_per_s_f=input_toks_per_s,
+                            peak_flops_f=mfu_peak_flops_f,
+                        )
                     if rank_i == 0:
+                        mfu_suffix_s = ""
+                        if mfu_f is not None:
+                            mfu_suffix_s = f" mfu={mfu_f:.4f}"
                         print(
                             f"step={global_step} loss={mean_loss_t.item():.6f} "
                             f"grad_norm={mean_grad_norm_t.item():.6f} "
                             f"lr={lr_f:.3e} steps_per_s={steps_per_s:.3f} "
-                            f"tokens_per_s={toks_per_s:.1f}"
+                            f"tokens_per_s={toks_per_s:.1f}{mfu_suffix_s}"
                         )
                         if wandb_run is not None:
-                            wandb_run.log(
-                                {
-                                    "train/loss": mean_loss_t.item(),
-                                    "train/grad_norm": mean_grad_norm_t.item(),
-                                    "train/lr": lr_f,
-                                    "train/steps_per_s": steps_per_s,
-                                    "train/tokens_per_s": toks_per_s,
-                                    "train/epoch_estimate": epoch_i,
-                                },
-                                step=global_step,
-                            )
+                            log_d = {
+                                "train/loss": mean_loss_t.item(),
+                                "train/grad_norm": mean_grad_norm_t.item(),
+                                "train/lr": lr_f,
+                                "train/steps_per_s": steps_per_s,
+                                "train/tokens_per_s": toks_per_s,
+                                "train/epoch_estimate": epoch_i,
+                            }
+                            if mfu_f is not None:
+                                log_d["train/mfu"] = mfu_f
+                            wandb_run.log(log_d, step=global_step)
                     log_loss_sum = 0.0
                     log_micro_n = 0
                     log_tok_n = 0
+                    log_input_tok_n = 0
+                    log_sample_n = 0
                     log_step_n = 0
                     log_grad_norm_sum = 0.0
                     log_grad_norm_n = 0
