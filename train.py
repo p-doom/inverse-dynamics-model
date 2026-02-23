@@ -496,12 +496,6 @@ def main() -> None:
     device = torch.device(f"cuda:{local_rank_i}")
     _seed_all(args.seed, rank_i)
     _assert_image_hwc_matches_metadata(args)
-    if args.val_every > 0 and args.collator_prefetch:
-        if rank_i == 0:
-            print(
-                "Disabling --collator-prefetch because validation also uses the collator."
-            )
-        args.collator_prefetch = False
 
     array_paths = find_array_record_paths(args.data_root, "train")
 
@@ -533,8 +527,20 @@ def main() -> None:
         mask_no_op_actions=args.mask_no_op_actions,
         mask_mouse_actions=args.mask_mouse_actions,
     )
+    val_collator = collator
     val_it = None
     if args.val_every > 0:
+        val_processor = AutoProcessor.from_pretrained(
+            args.model_id,
+            trust_remote_code=True,
+        )
+        val_collator = VideoSFTCollator(
+            processor=val_processor,
+            instruction_text=args.instruction_text,
+            video_fps=args.video_fps,
+            mask_no_op_actions=args.mask_no_op_actions,
+            mask_mouse_actions=args.mask_mouse_actions,
+        )
         val_loader = get_dataloader(
             array_record_paths=val_array_paths,
             seq_len=args.seq_len,
@@ -748,7 +754,7 @@ def main() -> None:
                         val_action_total_n,
                     ) = _run_validation_steps(
                         ddp_model=ddp_model,
-                        collator=collator,
+                        collator=val_collator,
                         val_it=val_it,
                         val_steps=args.val_steps,
                         val_generate_max_new_tokens=args.val_generate_max_new_tokens,
