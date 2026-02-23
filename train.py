@@ -325,11 +325,6 @@ def _assert_image_hwc_matches_metadata(args: Args) -> None:
 def _build_model(
     args: Args, dtype: torch.dtype, device: torch.device
 ) -> torch.nn.Module:
-    if args.attn_implementation not in {"flash_attention_2", "sdpa", "auto"}:
-        raise ValueError(
-            "Unsupported --attn-implementation. "
-            "Expected one of: flash_attention_2, sdpa, auto."
-        )
     model_kwargs = {
         "torch_dtype": dtype,
         "trust_remote_code": True,
