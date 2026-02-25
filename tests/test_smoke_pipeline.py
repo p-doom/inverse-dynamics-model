@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from idm.data import find_array_record_paths, get_dataloader
+from idm.utils.data import find_array_record_paths, get_dataloader
 
 
 SMOKE_ROOT = Path(

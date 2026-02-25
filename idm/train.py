@@ -17,13 +17,17 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 import tyro
 import wandb
 
-from idm.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
-from idm.collator import VideoSFTCollator
-from idm.data import (
+from idm.utils.checkpoint import (
+    find_latest_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+)
+from idm.utils.collator import VideoSFTCollator
+from idm.utils.data import (
     find_array_record_paths,
     get_dataloader,
 )
-from idm.lr_schedules import LRScheduleArgs, lr_at_step
+from idm.utils.lr_schedules import LRScheduleArgs, lr_at_step
 
 
 @dataclass

@@ -91,7 +91,9 @@ def save_checkpoint(
         "grain_state_b": grain_state_b,
         "args_d": args_d,
     }
-    state_name = "trainer_state.pkl" if rank_i is None else f"trainer_state_rank{rank_i}.pkl"
+    state_name = (
+        "trainer_state.pkl" if rank_i is None else f"trainer_state_rank{rank_i}.pkl"
+    )
     with open(ckpt_dir / state_name, "wb") as f:
         pickle.dump(payload_d, f)
     return str(ckpt_dir)

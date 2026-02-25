@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from array_record.python.array_record_module import ArrayRecordWriter
 
-from idm.data import get_dataloader
+from idm.utils.data import get_dataloader
 
 
 def _write_dummy_arrayrecord(

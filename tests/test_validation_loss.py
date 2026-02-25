@@ -8,7 +8,7 @@ import pytest
 import torch
 
 
-_TRAIN_PATH = Path(__file__).resolve().parents[1] / "train.py"
+_TRAIN_PATH = Path(__file__).resolve().parents[1] / "idm" / "train.py"
 _TRAIN_SPEC = importlib.util.spec_from_file_location(
     "train_module_for_val_loss", _TRAIN_PATH
 )

@@ -5,8 +5,10 @@ import sys
 
 import pytest
 
-_TRAIN_PATH = Path(__file__).resolve().parents[1] / "train.py"
-_TRAIN_SPEC = importlib.util.spec_from_file_location("train_module_for_meta", _TRAIN_PATH)
+_TRAIN_PATH = Path(__file__).resolve().parents[1] / "idm" / "train.py"
+_TRAIN_SPEC = importlib.util.spec_from_file_location(
+    "train_module_for_meta", _TRAIN_PATH
+)
 assert _TRAIN_SPEC is not None and _TRAIN_SPEC.loader is not None
 _TRAIN_MOD = importlib.util.module_from_spec(_TRAIN_SPEC)
 sys.modules["train_module_for_meta"] = _TRAIN_MOD

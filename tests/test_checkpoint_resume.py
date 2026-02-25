@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from idm.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
+from idm.utils.checkpoint import (
+    find_latest_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 
 class _FakeOpt:
