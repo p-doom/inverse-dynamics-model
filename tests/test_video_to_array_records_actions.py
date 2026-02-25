@@ -9,10 +9,7 @@ import msgpack
 import numpy as np
 
 _MODULE_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "data"
-    / "idm_data"
-    / "video_to_array_records.py"
+    Path(__file__).resolve().parents[1] / "data" / "video_to_array_records.py"
 )
 _SPEC = importlib.util.spec_from_file_location("video_to_array_records", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None

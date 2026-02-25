@@ -5,14 +5,16 @@ import pytest
 
 grain = pytest.importorskip("grain")
 
-from idm.data import (  # noqa: E402
+from idm.utils.data import (  # noqa: E402
     BuildSFTExampleFromFrames,
     EpisodeLengthFilter,
     ProcessEpisodeAndSlice,
 )
 
 
-def _make_record_bytes(T: int = 6, H: int = 2, W: int = 2, C: int = 3, with_actions: bool = True) -> bytes:
+def _make_record_bytes(
+    T: int = 6, H: int = 2, W: int = 2, C: int = 3, with_actions: bool = True
+) -> bytes:
     frames_THWC = np.zeros((T, H, W, C), dtype=np.uint8)
     for t_i in range(T):
         frames_THWC[t_i] = t_i
@@ -50,7 +52,9 @@ def test_process_episode_and_slice_contiguous():
 def test_process_episode_raises_when_actions_missing():
     tr = ProcessEpisodeAndSlice(seq_len=4, image_h=2, image_w=2, image_c=3)
     with pytest.raises(ValueError):
-        tr.random_map(_make_record_bytes(T=6, with_actions=False), np.random.default_rng(1))
+        tr.random_map(
+            _make_record_bytes(T=6, with_actions=False), np.random.default_rng(1)
+        )
 
 
 def test_build_sft_example_outputs_all_actions_text():

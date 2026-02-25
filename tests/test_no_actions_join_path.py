@@ -3,9 +3,9 @@ import importlib.util
 from pathlib import Path
 import sys
 
-from idm import data
+from idm.utils import data
 
-_TRAIN_PATH = Path(__file__).resolve().parents[1] / "train.py"
+_TRAIN_PATH = Path(__file__).resolve().parents[1] / "idm" / "train.py"
 _TRAIN_SPEC = importlib.util.spec_from_file_location("train_module", _TRAIN_PATH)
 assert _TRAIN_SPEC is not None and _TRAIN_SPEC.loader is not None
 _TRAIN_MOD = importlib.util.module_from_spec(_TRAIN_SPEC)

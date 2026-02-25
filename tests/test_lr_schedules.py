@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from idm.lr_schedules import LRScheduleArgs, lr_at_step
+from idm.utils.lr_schedules import LRScheduleArgs, lr_at_step
 
 
 def test_cos_warmup_boundaries():

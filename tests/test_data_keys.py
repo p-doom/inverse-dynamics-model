@@ -1,6 +1,6 @@
 import pytest
 
-from idm.data import derive_record_key
+from idm.utils.data import derive_record_key
 
 
 def test_derive_record_key_prefers_path():

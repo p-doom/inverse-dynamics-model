@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from idm.collator import VideoSFTCollator
+from idm.utils.collator import VideoSFTCollator
 
 
 class _FakeTokenizer:
