@@ -15,13 +15,12 @@ dependencies = [
   "numpy",
   "peft",
   "safetensors",
-  "torch==2.9.1",
-  "transformers==4.57.1",
+  "torch",
+  "transformers @ git+https://github.com/huggingface/transformers.git",
   "tyro>=0.8.5",
   "wandb",
-  "torchvision",
+  "torchvision>=0.25.0",
   "ffmpeg-python==0.2.0",
-  "sglang[all]==0.5.9",
 ]
 
 [project.optional-dependencies]
