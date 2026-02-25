@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IDM Eval Visualizer</title>
+  <style>
+    :root {
+      --bg: #f4f7f9;
+      --card: #ffffff;
+      --ink: #11161b;
+      --muted: #5f6a76;
+      --line: #d9e2ea;
+      --ok: #1c8b57;
+      --bad: #c73737;
+      --window: #205fba;
+      --shadow: 0 12px 36px rgba(15, 35, 52, 0.10);
+    }
+    * { box-sizing: border-box; }
+    html {
+      font: 400 16px/1.55em -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue",
+        Arial, sans-serif;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% -5%, #e6f0fb 0%, transparent 38%),
+        radial-gradient(circle at 95% 4%, #f3ebe5 0%, transparent 35%),
+        var(--bg);
+      overflow-x: hidden;
+    }
+
+    .app {
+      min-height: 100vh;
+      width: 100%;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 10px;
+      padding: 16px;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: auto 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 10px 12px;
+    }
+    .toolbar > * {
+      min-width: 0;
+    }
+
+    .toolbar .meta {
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    button, select, input[type="range"] {
+      font: inherit;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #f8fbff;
+      color: var(--ink);
+      padding: 7px 11px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    button:hover {
+      background: #edf4fb;
+    }
+
+    select {
+      width: 100%;
+      min-width: 220px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #ffffff;
+      padding: 7px 9px;
+      color: var(--ink);
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .viewer-shell {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) clamp(240px, 28vw, 320px);
+      gap: 10px;
+    }
+
+    .stage-card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 10px;
+      min-height: 0;
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto auto auto;
+      gap: 10px;
+    }
+
+    .frame-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .frame-count {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      margin-left: 2px;
+    }
+
+    .frame-stage {
+      min-height: 0;
+      border: 3px solid var(--line);
+      border-radius: 12px;
+      background: #0f1318;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      max-height: 68vh;
+      transition: border-color 140ms ease;
+    }
+
+    .frame-stage.ok { border-color: var(--ok); }
+    .frame-stage.bad { border-color: var(--bad); }
+
+    #frameCanvas {
+      width: 1px;
+      height: 1px;
+      display: block;
+      background: #000;
+      image-rendering: auto;
+    }
+
+    .timeline {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 0;
+      min-width: 0;
+    }
+
+    .ticks {
+      display: flex;
+      gap: 2px;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding-bottom: 3px;
+      min-height: 24px;
+      min-width: 0;
+      max-width: 100%;
+      scrollbar-width: thin;
+    }
+
+    .tick {
+      border: 0;
+      width: 8px;
+      min-width: 8px;
+      height: 18px;
+      border-radius: 6px;
+      padding: 0;
+      opacity: 0.9;
+      cursor: pointer;
+      outline: 1px solid transparent;
+      outline-offset: 1px;
+    }
+
+    .tick.ok { background: color-mix(in srgb, var(--ok) 72%, white); }
+    .tick.bad { background: color-mix(in srgb, var(--bad) 72%, white); }
+    .tick.out { filter: grayscale(0.75); opacity: 0.42; }
+    .tick.active { outline-color: #0d1115; }
+
+    .slider {
+      width: 100%;
+      margin: 0;
+    }
+
+    .side {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-height: 0;
+      min-width: 0;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: #f8fbff;
+    }
+
+    .k {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 4px;
+      font-weight: 700;
+    }
+
+    .v {
+      font-size: 14px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .stats-lines {
+      display: grid;
+      gap: 4px;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .stats-lines strong {
+      font-weight: 700;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .badge {
+      border-radius: 999px;
+      border: 1px solid transparent;
+      padding: 4px 9px;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+    .badge.ok {
+      color: var(--ok);
+      border-color: color-mix(in srgb, var(--ok) 32%, white);
+      background: color-mix(in srgb, var(--ok) 10%, white);
+    }
+    .badge.bad {
+      color: var(--bad);
+      border-color: color-mix(in srgb, var(--bad) 32%, white);
+      background: color-mix(in srgb, var(--bad) 10%, white);
+    }
+    .badge.window {
+      color: var(--window);
+      border-color: color-mix(in srgb, var(--window) 30%, white);
+      background: color-mix(in srgb, var(--window) 10%, white);
+    }
+    .badge.muted {
+      color: #5f6a76;
+      border-color: #cad5df;
+      background: #f0f5f9;
+    }
+
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      font-size: 14px;
+      border: 1px dashed var(--line);
+      border-radius: 10px;
+      padding: 16px;
+      background: #fafcff;
+    }
+
+    @media (max-width: 980px) {
+      .viewer-shell {
+        grid-template-columns: 1fr;
+      }
+      .side {
+        order: -1;
+      }
+      .toolbar {
+        grid-template-columns: auto 1fr;
+      }
+      .toolbar .meta {
+        grid-column: 1 / -1;
+      }
+      .frame-stage {
+        max-height: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="toolbar">
+      <button id="openBtn" type="button">Open Eval Folder</button>
+      <select id="sampleSelect" disabled>
+        <option value="">No sample loaded</option>
+      </select>
+      <button id="prevSampleBtn" type="button" disabled>Prev Sample</button>
+      <button id="nextSampleBtn" type="button" disabled>Next Sample</button>
+      <div id="folderMeta" class="meta">
+        Select the folder created by `evaluate.py --visualize True` (typically `eval_results/visualizations`).
+      </div>
+      <input id="folderInput" type="file" webkitdirectory directory multiple hidden />
+    </div>
+
+    <div class="viewer-shell">
+      <div class="stage-card">
+        <div class="frame-toolbar">
+          <button id="prevFrameBtn" type="button" disabled>Prev Frame</button>
+          <button id="nextFrameBtn" type="button" disabled>Next Frame</button>
+          <span id="frameCount" class="frame-count">Frame 0 / 0</span>
+        </div>
+        <div class="timeline">
+          <input id="frameSlider" class="slider" type="range" min="0" max="0" value="0" disabled />
+          <div id="ticks" class="ticks"></div>
+        </div>
+        <div id="frameStage" class="frame-stage">
+          <canvas id="frameCanvas"></canvas>
+        </div>
+      </div>
+
+      <aside class="side">
+        <div class="panel">
+          <span class="k">Video</span>
+          <div id="videoId" class="v">-</div>
+        </div>
+        <div class="panel">
+          <span class="k">Ground Truth</span>
+          <div id="gtLabel" class="v">-</div>
+        </div>
+        <div class="panel">
+          <span class="k">Prediction</span>
+          <div id="predLabel" class="v">-</div>
+        </div>
+        <div class="panel">
+          <span class="k">State</span>
+          <div id="badges" class="badges"></div>
+        </div>
+        <div class="panel">
+          <span class="k">Stats</span>
+          <div id="statsText" class="v">-</div>
+        </div>
+        <div id="emptyState" class="empty">
+          No sample loaded yet.
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    const els = {
+      openBtn: document.getElementById("openBtn"),
+      folderInput: document.getElementById("folderInput"),
+      sampleSelect: document.getElementById("sampleSelect"),
+      prevSampleBtn: document.getElementById("prevSampleBtn"),
+      nextSampleBtn: document.getElementById("nextSampleBtn"),
+      folderMeta: document.getElementById("folderMeta"),
+      prevFrameBtn: document.getElementById("prevFrameBtn"),
+      nextFrameBtn: document.getElementById("nextFrameBtn"),
+      frameSlider: document.getElementById("frameSlider"),
+      frameCount: document.getElementById("frameCount"),
+      ticks: document.getElementById("ticks"),
+      frameStage: document.getElementById("frameStage"),
+      frameCanvas: document.getElementById("frameCanvas"),
+      videoId: document.getElementById("videoId"),
+      gtLabel: document.getElementById("gtLabel"),
+      predLabel: document.getElementById("predLabel"),
+      badges: document.getElementById("badges"),
+      statsText: document.getElementById("statsText"),
+      emptyState: document.getElementById("emptyState"),
+    };
+
+    const ctx = els.frameCanvas.getContext("2d");
+    const state = {
+      samples: [],
+      sampleIndex: -1,
+      frameIndex: 0,
+      sprite: null,
+      spriteUrl: null,
+      payload: null,
+    };
+    let stageResizeObserver = null;
+
+    function badge(text, cls) {
+      const span = document.createElement("span");
+      span.className = `badge ${cls}`;
+      span.textContent = text;
+      return span;
+    }
+
+    function normAction(text) {
+      return String(text || "").trim().toLowerCase();
+    }
+
+    function isCorrectRow(row) {
+      return normAction(row.gt_action) === normAction(row.pred_action);
+    }
+
+    function computeStats(rows, keepFn) {
+      let total = 0;
+      let correct = 0;
+      for (const row of rows) {
+        if (!keepFn(row)) continue;
+        total += 1;
+        if (isCorrectRow(row)) correct += 1;
+      }
+      return {
+        correct,
+        total,
+        accuracy: total > 0 ? correct / total : 0,
+      };
+    }
+
+    function renderStats(rows) {
+      const keepAll = () => true;
+      const keepNoNoOp = (row) => normAction(row.gt_action) !== "no_op";
+      const keepNoNoOpNoMouse = (row) => {
+        const gt = normAction(row.gt_action);
+        return gt !== "no_op" && !gt.includes("mouse");
+      };
+
+      const sAll = computeStats(rows, keepAll);
+      const sNoOp = computeStats(rows, keepNoNoOp);
+      const sNoOpMouse = computeStats(rows, keepNoNoOpNoMouse);
+
+      const f = (s) => `${(s.accuracy * 100).toFixed(1)}% (${s.correct}/${s.total})`;
+      els.statsText.innerHTML = `
+        <div class="stats-lines">
+          <div><strong>All:</strong> ${f(sAll)}</div>
+          <div><strong>No NO_OP:</strong> ${f(sNoOp)}</div>
+          <div><strong>No NO_OP + MOUSE:</strong> ${f(sNoOpMouse)}</div>
+        </div>
+      `;
+    }
+
+    function baseName(filename) {
+      const i = filename.lastIndexOf(".");
+      return i >= 0 ? filename.slice(0, i) : filename;
+    }
+
+    function truncateMiddle(text, maxLen = 48) {
+      if (!text || text.length <= maxLen) return text;
+      const side = Math.max(8, Math.floor((maxLen - 3) / 2));
+      return `${text.slice(0, side)}...${text.slice(-side)}`;
+    }
+
+    function safeRelPath(file) {
+      return file.webkitRelativePath || file.name;
+    }
+
+    function setUiEnabled(hasData) {
+      els.sampleSelect.disabled = !hasData;
+      els.prevSampleBtn.disabled = !hasData;
+      els.nextSampleBtn.disabled = !hasData;
+      els.prevFrameBtn.disabled = !hasData;
+      els.nextFrameBtn.disabled = !hasData;
+      els.frameSlider.disabled = !hasData;
+    }
+
+    function clearCurrentSample() {
+      if (state.spriteUrl) {
+        URL.revokeObjectURL(state.spriteUrl);
+      }
+      state.sprite = null;
+      state.spriteUrl = null;
+      state.payload = null;
+      state.frameIndex = 0;
+      els.frameCanvas.width = 1;
+      els.frameCanvas.height = 1;
+      els.frameCanvas.style.width = "1px";
+      els.frameCanvas.style.height = "1px";
+      ctx.clearRect(0, 0, 1, 1);
+      els.frameStage.classList.remove("ok", "bad");
+      els.frameCount.textContent = "Frame 0 / 0";
+      els.videoId.textContent = "-";
+      els.gtLabel.textContent = "-";
+      els.predLabel.textContent = "-";
+      els.badges.replaceChildren();
+      els.statsText.textContent = "-";
+      els.ticks.replaceChildren();
+    }
+
+    async function readFolder(files) {
+      const pngByBase = new Map();
+      const jsonByBase = new Map();
+
+      for (const file of files) {
+        const name = file.name.toLowerCase();
+        const base = baseName(file.name);
+        if (name.endsWith(".png")) {
+          pngByBase.set(base, file);
+        } else if (name.endsWith(".json")) {
+          jsonByBase.set(base, file);
+        }
+      }
+
+      const samples = [];
+      for (const [base, pngFile] of pngByBase.entries()) {
+        const jsonFile = jsonByBase.get(base);
+        if (!jsonFile) continue;
+        samples.push({
+          key: base,
+          pngFile,
+          jsonFile,
+          relPath: safeRelPath(pngFile),
+        });
+      }
+
+      samples.sort((a, b) => a.relPath.localeCompare(b.relPath));
+      state.samples = samples;
+
+      els.sampleSelect.replaceChildren();
+      if (samples.length === 0) {
+        const opt = document.createElement("option");
+        opt.textContent = "No PNG/JSON pairs found";
+        opt.value = "";
+        els.sampleSelect.appendChild(opt);
+        setUiEnabled(false);
+        clearCurrentSample();
+        els.emptyState.textContent = "No valid visualization files found in this folder.";
+        els.emptyState.style.display = "block";
+        return;
+      }
+
+      samples.forEach((sample, idx) => {
+        const opt = document.createElement("option");
+        opt.value = String(idx);
+        opt.textContent = truncateMiddle(sample.pngFile.name, 42);
+        opt.title = sample.relPath;
+        els.sampleSelect.appendChild(opt);
+      });
+
+      setUiEnabled(true);
+      els.folderMeta.textContent = `Loaded ${samples.length} sample(s)`;
+      await loadSample(0);
+    }
+
+    async function loadSample(idx) {
+      if (idx < 0 || idx >= state.samples.length) return;
+      clearCurrentSample();
+      state.sampleIndex = idx;
+      state.frameIndex = 0;
+      els.sampleSelect.value = String(idx);
+
+      const sample = state.samples[idx];
+      els.folderMeta.textContent = `Loaded ${state.samples.length} sample(s) | Selected: ${truncateMiddle(sample.pngFile.name, 52)}`;
+      els.folderMeta.title = sample.relPath;
+      const raw = await sample.jsonFile.text();
+      const payload = JSON.parse(raw);
+      state.payload = payload;
+      renderStats(payload.frames || []);
+
+      const sprite = new Image();
+      state.spriteUrl = URL.createObjectURL(sample.pngFile);
+      state.sprite = sprite;
+      await new Promise((resolve, reject) => {
+        sprite.onload = () => resolve();
+        sprite.onerror = () => reject(new Error("Failed to load sprite image"));
+        sprite.src = state.spriteUrl;
+      });
+
+      const frames = payload.frames || [];
+      const maxFrame = Math.max(0, frames.length - 1);
+      els.frameSlider.max = String(maxFrame);
+      els.frameSlider.value = "0";
+
+      buildTicks();
+      renderFrame(0);
+      els.emptyState.style.display = "none";
+    }
+
+    function frameGeom() {
+      const p = state.payload;
+      return {
+        frameW: Number(p.frame_w || 1),
+        frameH: Number(p.frame_h || 1),
+        cols: Number(p.grid_cols || 8),
+        textH: Number(p.grid_text_h || 40),
+      };
+    }
+
+    function fitCanvasToStage() {
+      const p = state.payload;
+      if (!p) return;
+      const { frameW, frameH } = frameGeom();
+      if (frameW <= 0 || frameH <= 0) return;
+      const bounds = els.frameStage.getBoundingClientRect();
+      const stageW = Math.max(1, Math.floor(bounds.width - 8));
+      const stageH = Math.max(1, Math.floor(bounds.height - 8));
+      const scale = Math.min(stageW / frameW, stageH / frameH);
+      const drawW = Math.max(1, Math.floor(frameW * scale));
+      const drawH = Math.max(1, Math.floor(frameH * scale));
+      els.frameCanvas.style.width = `${drawW}px`;
+      els.frameCanvas.style.height = `${drawH}px`;
+    }
+
+    function drawFrameAt(i) {
+      const p = state.payload;
+      if (!p || !state.sprite) return;
+      const frames = p.frames || [];
+      if (i < 0 || i >= frames.length) return;
+
+      const { frameW, frameH, cols, textH } = frameGeom();
+      const cellH = frameH + textH;
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const sx = col * frameW;
+      const sy = row * cellH;
+
+      els.frameCanvas.width = frameW;
+      els.frameCanvas.height = frameH;
+      ctx.clearRect(0, 0, frameW, frameH);
+      ctx.drawImage(state.sprite, sx, sy, frameW, frameH, 0, 0, frameW, frameH);
+      fitCanvasToStage();
+    }
+
+    function updateInfo(i) {
+      const p = state.payload;
+      if (!p) return;
+      const frames = p.frames || [];
+      const f = frames[i];
+      if (!f) return;
+
+      els.frameCount.textContent = `Frame ${i + 1} / ${frames.length}`;
+      els.videoId.textContent = p.video_id || "-";
+      els.gtLabel.textContent = f.gt_action || "(empty)";
+      els.predLabel.textContent = f.pred_action || "(empty)";
+
+      els.frameStage.classList.remove("ok", "bad");
+      els.frameStage.classList.add(f.correct ? "ok" : "bad");
+
+      els.badges.replaceChildren(
+        badge(f.correct ? "Correct" : "Incorrect", f.correct ? "ok" : "bad"),
+        badge(f.in_window_region ? "In Window Region" : "Outside Window Region", f.in_window_region ? "window" : "muted"),
+        badge(f.selected_by_stitching ? "Used by Stitching" : "Not Used by Stitching", f.selected_by_stitching ? "window" : "muted"),
+      );
+    }
+
+    function setTickActive(i) {
+      const children = els.ticks.children;
+      for (let j = 0; j < children.length; j += 1) {
+        children[j].classList.toggle("active", j === i);
+      }
+    }
+
+    function renderFrame(i) {
+      const p = state.payload;
+      if (!p) return;
+      const frames = p.frames || [];
+      const bounded = Math.max(0, Math.min(frames.length - 1, i));
+      state.frameIndex = bounded;
+      els.frameSlider.value = String(bounded);
+      drawFrameAt(bounded);
+      updateInfo(bounded);
+      setTickActive(bounded);
+    }
+
+    function buildTicks() {
+      const p = state.payload;
+      els.ticks.replaceChildren();
+      if (!p) return;
+      const frames = p.frames || [];
+      frames.forEach((f, idx) => {
+        const t = document.createElement("button");
+        t.type = "button";
+        t.className = `tick ${f.correct ? "ok" : "bad"} ${f.in_window_region ? "" : "out"}`;
+        t.title = `Frame ${idx + 1}`;
+        t.addEventListener("click", () => renderFrame(idx));
+        els.ticks.appendChild(t);
+      });
+    }
+
+    function stepSample(delta) {
+      if (state.samples.length === 0) return;
+      const next = Math.max(0, Math.min(state.samples.length - 1, state.sampleIndex + delta));
+      if (next !== state.sampleIndex) loadSample(next);
+    }
+
+    function stepFrame(delta) {
+      if (!state.payload) return;
+      renderFrame(state.frameIndex + delta);
+    }
+
+    els.openBtn.addEventListener("click", () => els.folderInput.click());
+    els.folderInput.addEventListener("change", async (ev) => {
+      const files = Array.from(ev.target.files || []);
+      if (files.length === 0) return;
+      await readFolder(files);
+    });
+
+    els.sampleSelect.addEventListener("change", async (ev) => {
+      const idx = Number(ev.target.value);
+      if (Number.isFinite(idx)) await loadSample(idx);
+    });
+    els.prevSampleBtn.addEventListener("click", () => stepSample(-1));
+    els.nextSampleBtn.addEventListener("click", () => stepSample(1));
+    els.prevFrameBtn.addEventListener("click", () => stepFrame(-1));
+    els.nextFrameBtn.addEventListener("click", () => stepFrame(1));
+    els.frameSlider.addEventListener("input", (ev) => renderFrame(Number(ev.target.value)));
+
+    window.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowLeft") {
+        ev.preventDefault();
+        stepFrame(-1);
+      } else if (ev.key === "ArrowRight") {
+        ev.preventDefault();
+        stepFrame(1);
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        stepSample(-1);
+      } else if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        stepSample(1);
+      }
+    });
+
+    window.addEventListener("resize", () => fitCanvasToStage());
+    stageResizeObserver = new ResizeObserver(() => fitCanvasToStage());
+    stageResizeObserver.observe(els.frameStage);
+  </script>
+</body>
+</html>
