@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -32,14 +33,6 @@ class VideoSFTCollator:
             add_generation_prompt=True,
         )
         self._prompt_len_cache: dict[tuple[int, int, int, int], int] = {}
-
-    def _should_mask_action(self, action_s: str) -> bool:
-        action_s = action_s.strip()
-        if self.mask_no_op_actions and action_s == "NO_OP":
-            return True
-        if self.mask_mouse_actions and "MOUSE_" in action_s:
-            return True
-        return False
 
     def _action_loss_weight(self, action_s: str) -> float:
         action_s = action_s.strip()
@@ -90,29 +83,6 @@ class VideoSFTCollator:
             else:
                 out_L.append((action_s, 0, 0))
         return out_L
-
-    def _mask_mask_action_labels(
-        self,
-        labels_BS: Any,
-        target_B: Any,
-        prompt_lens_B: list[int],
-    ) -> None:
-        if not self.mask_no_op_actions and not self.mask_mouse_actions:
-            return
-
-        seq_len_i = int(labels_BS.shape[1])
-        for b_i, (target_s, prompt_len_i) in enumerate(zip(target_B, prompt_lens_B)):
-            for action_s, start_tok_i, end_tok_i in self._action_token_spans(
-                str(target_s)
-            ):
-                if not self._should_mask_action(action_s):
-                    continue
-                start_i = int(prompt_len_i) + int(start_tok_i)
-                end_i = int(prompt_len_i) + int(end_tok_i)
-                start_i = max(start_i, 0)
-                end_i = min(end_i, seq_len_i)
-                if end_i > start_i:
-                    labels_BS[b_i, start_i:end_i] = -100
 
     def _apply_action_loss_weights(
         self,
@@ -278,11 +248,6 @@ class VideoSFTCollator:
         for b_i, prompt_len in enumerate(prompt_lens_B):
             labels_BS[b_i, :prompt_len] = -100
         labels_BS[enc_d["attention_mask"] == 0] = -100
-        self._mask_mask_action_labels(
-            labels_BS=labels_BS,
-            target_B=target_B,
-            prompt_lens_B=prompt_lens_B,
-        )
         label_weights_BS = labels_BS.new_ones(
             labels_BS.shape,
             dtype=torch.float32,
@@ -299,3 +264,53 @@ class VideoSFTCollator:
         enc_d["prompt_lens"] = prompt_lens_B
         enc_d["videos"] = videos_B
         return enc_d
+
+
+class CollatorPrefetchIterator:
+    def __init__(self, raw_it: Any, collator: VideoSFTCollator):
+        self._raw_it = raw_it
+        self._collator = collator
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._next_fut: Future[tuple[bytes, dict[str, Any]]] | None = None
+        self._last_state_b: bytes = self._raw_it.get_state()
+        self._closed_b = False
+        self._submit_next()
+
+    def _load_one(self) -> tuple[bytes, dict[str, Any]]:
+        raw_batch_d = next(self._raw_it)
+        state_after_b = self._raw_it.get_state()
+        model_batch_d = self._collator(raw_batch_d)
+        return state_after_b, model_batch_d
+
+    def _submit_next(self) -> None:
+        if self._closed_b:
+            return
+        self._next_fut = self._pool.submit(self._load_one)
+
+    def last_state(self) -> bytes:
+        return self._last_state_b
+
+    def close(self) -> None:
+        if self._closed_b:
+            return
+        self._closed_b = True
+        self._pool.shutdown(wait=True, cancel_futures=False)
+        self._next_fut = None
+
+    def __iter__(self) -> "CollatorPrefetchIterator":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        if self._next_fut is None:
+            raise StopIteration
+        try:
+            state_after_b, model_batch_d = self._next_fut.result()
+        except StopIteration:
+            self.close()
+            raise
+        except Exception:
+            self.close()
+            raise
+        self._last_state_b = state_after_b
+        self._submit_next()
+        return model_batch_d

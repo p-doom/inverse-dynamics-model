@@ -96,7 +96,7 @@ class _IdentityCollator:
         }
 
 
-class _MaskingIdentityCollator(_IdentityCollator):
+class _MaskAttrsIdentityCollator(_IdentityCollator):
     def __init__(
         self,
         mask_no_op_actions: bool = False,
@@ -358,7 +358,7 @@ def test_action_accuracy_filter_keeps_original_frame_alignment():
     assert total_n == 1
 
 
-def test_run_validation_steps_filters_masked_actions_from_action_accuracy():
+def test_run_validation_steps_keeps_action_accuracy_unfiltered_with_mask_flags():
     batch0 = {
         "labels": torch.tensor([[-100, 2]], dtype=torch.long),
         "target_text": ["Frame 0: NO_OP\nFrame 1: b"],
@@ -370,30 +370,10 @@ def test_run_validation_steps_filters_masked_actions_from_action_accuracy():
     )
     _, _, val_action_correct_n, val_action_total_n = _TRAIN_MOD._run_validation_steps(
         ddp_model=model,
-        collator=_MaskingIdentityCollator(mask_no_op_actions=True),
-        val_it=iter([batch0]),
-        val_steps=1,
-        val_generate_max_new_tokens=4,
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-    )
-    assert val_action_correct_n == 1
-    assert val_action_total_n == 1
-
-
-def test_run_validation_steps_keeps_action_accuracy_unfiltered_when_masks_disabled():
-    batch0 = {
-        "labels": torch.tensor([[-100, 2]], dtype=torch.long),
-        "target_text": ["Frame 0: NO_OP\nFrame 1: b"],
-    }
-    model = _FakeDDPModel(
-        outputs_L=[(1.0, _logits_for_pred(2))],
-        generated_ids_L=[torch.tensor([[99, 6]], dtype=torch.long)],
-        training=True,
-    )
-    _, _, val_action_correct_n, val_action_total_n = _TRAIN_MOD._run_validation_steps(
-        ddp_model=model,
-        collator=_MaskingIdentityCollator(mask_no_op_actions=False),
+        collator=_MaskAttrsIdentityCollator(
+            mask_no_op_actions=True,
+            mask_mouse_actions=True,
+        ),
         val_it=iter([batch0]),
         val_steps=1,
         val_generate_max_new_tokens=4,

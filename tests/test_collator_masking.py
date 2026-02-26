@@ -177,7 +177,7 @@ def test_collator_prompt_len_tracks_video_expansion():
     assert int(supervised_idx[0].item()) == out_d["prompt_lens"][0]
 
 
-def test_collator_mask_no_op_masks_only_no_op_actions():
+def test_collator_mask_no_op_flag_does_not_mask_labels():
     target_s = "Frame 0: NO_OP\nFrame 1: KEY_DOWN:W"
     collator = VideoSFTCollator(
         processor=_FakeProcessor(),
@@ -187,16 +187,19 @@ def test_collator_mask_no_op_masks_only_no_op_actions():
     out_d = collator(_single_item_batch(frames_n=2, target_s=target_s))
 
     labels_S = out_d["labels"][0]
+    label_weights_S = out_d["label_weights"][0]
     input_ids_S = out_d["input_ids"][0]
     prompt_len_i = out_d["prompt_lens"][0]
 
     noop_slice = _action_slice(prompt_len_i, target_s, "NO_OP")
     key_slice = _action_slice(prompt_len_i, target_s, "KEY_DOWN:W")
-    assert torch.all(labels_S[noop_slice] == -100)
+    assert torch.all(labels_S[noop_slice] == input_ids_S[noop_slice])
     assert torch.all(labels_S[key_slice] == input_ids_S[key_slice])
+    assert torch.all(label_weights_S[noop_slice] == torch.tensor(1.0))
+    assert torch.all(label_weights_S[key_slice] == torch.tensor(1.0))
 
 
-def test_collator_mask_mouse_masks_all_mouse_actions():
+def test_collator_mask_mouse_flag_does_not_mask_labels():
     target_s = (
         "Frame 0: KEY_DOWN:W + MOUSE_MOVE\n"
         "Frame 1: MOUSE_DOWN:Left\n"
@@ -211,6 +214,7 @@ def test_collator_mask_mouse_masks_all_mouse_actions():
     out_d = collator(_single_item_batch(frames_n=4, target_s=target_s))
 
     labels_S = out_d["labels"][0]
+    label_weights_S = out_d["label_weights"][0]
     input_ids_S = out_d["input_ids"][0]
     prompt_len_i = out_d["prompt_lens"][0]
 
@@ -219,10 +223,14 @@ def test_collator_mask_mouse_masks_all_mouse_actions():
     scroll_slice = _action_slice(prompt_len_i, target_s, "MOUSE_SCROLL")
     key_slice = _action_slice(prompt_len_i, target_s, "KEY_UP:W")
 
-    assert torch.all(labels_S[mixed_slice] == -100)
-    assert torch.all(labels_S[down_slice] == -100)
-    assert torch.all(labels_S[scroll_slice] == -100)
+    assert torch.all(labels_S[mixed_slice] == input_ids_S[mixed_slice])
+    assert torch.all(labels_S[down_slice] == input_ids_S[down_slice])
+    assert torch.all(labels_S[scroll_slice] == input_ids_S[scroll_slice])
     assert torch.all(labels_S[key_slice] == input_ids_S[key_slice])
+    assert torch.all(label_weights_S[mixed_slice] == torch.tensor(1.0))
+    assert torch.all(label_weights_S[down_slice] == torch.tensor(1.0))
+    assert torch.all(label_weights_S[scroll_slice] == torch.tensor(1.0))
+    assert torch.all(label_weights_S[key_slice] == torch.tensor(1.0))
 
 
 def test_collator_no_op_loss_weight_applies_only_no_op_tokens():
@@ -263,3 +271,24 @@ def test_collator_mouse_loss_weight_applies_to_mouse_action_tokens():
     assert torch.all(label_weights_S[mixed_slice] == torch.tensor(0.4))
     assert torch.all(label_weights_S[key_slice] == torch.tensor(1.0))
     assert torch.all(label_weights_S[labels_S == -100] == 0.0)
+
+
+def test_collator_zero_loss_weight_disables_no_op_loss_without_label_masking():
+    target_s = "Frame 0: NO_OP\nFrame 1: KEY_DOWN:W"
+    collator = VideoSFTCollator(
+        processor=_FakeProcessor(),
+        instruction_text="Predict actions.",
+        no_op_loss_weight=0.0,
+    )
+    out_d = collator(_single_item_batch(frames_n=2, target_s=target_s))
+    labels_S = out_d["labels"][0]
+    label_weights_S = out_d["label_weights"][0]
+    input_ids_S = out_d["input_ids"][0]
+    prompt_len_i = out_d["prompt_lens"][0]
+
+    noop_slice = _action_slice(prompt_len_i, target_s, "NO_OP")
+    key_slice = _action_slice(prompt_len_i, target_s, "KEY_DOWN:W")
+    assert torch.all(labels_S[noop_slice] == input_ids_S[noop_slice])
+    assert torch.all(labels_S[key_slice] == input_ids_S[key_slice])
+    assert torch.all(label_weights_S[noop_slice] == torch.tensor(0.0))
+    assert torch.all(label_weights_S[key_slice] == torch.tensor(1.0))

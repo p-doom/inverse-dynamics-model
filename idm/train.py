@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -23,7 +22,7 @@ from idm.utils.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from idm.utils.collator import VideoSFTCollator
+from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
 from idm.utils.data import (
     find_array_record_paths,
     get_dataloader,
@@ -262,56 +261,6 @@ def _weighted_causal_lm_loss(
     return (token_loss_BS * valid_weights_BS).sum() / denom_t
 
 
-class _CollatorPrefetchIterator:
-    def __init__(self, raw_it: Any, collator: VideoSFTCollator):
-        self._raw_it = raw_it
-        self._collator = collator
-        self._pool = ThreadPoolExecutor(max_workers=1)
-        self._next_fut: Future[tuple[bytes, dict[str, Any]]] | None = None
-        self._last_state_b: bytes = self._raw_it.get_state()
-        self._closed_b = False
-        self._submit_next()
-
-    def _load_one(self) -> tuple[bytes, dict[str, Any]]:
-        raw_batch_d = next(self._raw_it)
-        state_after_b = self._raw_it.get_state()
-        model_batch_d = self._collator(raw_batch_d)
-        return state_after_b, model_batch_d
-
-    def _submit_next(self) -> None:
-        if self._closed_b:
-            return
-        self._next_fut = self._pool.submit(self._load_one)
-
-    def last_state(self) -> bytes:
-        return self._last_state_b
-
-    def close(self) -> None:
-        if self._closed_b:
-            return
-        self._closed_b = True
-        self._pool.shutdown(wait=True, cancel_futures=False)
-        self._next_fut = None
-
-    def __iter__(self) -> "_CollatorPrefetchIterator":
-        return self
-
-    def __next__(self) -> dict[str, Any]:
-        if self._next_fut is None:
-            raise StopIteration
-        try:
-            state_after_b, model_batch_d = self._next_fut.result()
-        except StopIteration:
-            self.close()
-            raise
-        except Exception:
-            self.close()
-            raise
-        self._last_state_b = state_after_b
-        self._submit_next()
-        return model_batch_d
-
-
 def _run_validation_steps(
     ddp_model: torch.nn.Module,
     collator: VideoSFTCollator,
@@ -335,26 +284,6 @@ def _run_validation_steps(
     val_target_no_op_n = 0
     val_target_mouse_n = 0
     val_target_action_total_n = 0
-    action_is_counted_fn: Callable[[str], bool] | None = None
-    mask_no_op_actions = bool(getattr(collator, "mask_no_op_actions", False))
-    mask_mouse_actions = bool(getattr(collator, "mask_mouse_actions", False))
-    if mask_no_op_actions or mask_mouse_actions:
-        should_mask_action_fn = getattr(collator, "_should_mask_action", None)
-        if callable(should_mask_action_fn):
-            action_is_counted_fn = lambda action_s: not bool(
-                should_mask_action_fn(action_s)
-            )
-        else:
-            # Keep validation action-accuracy masking aligned with label masking.
-            def _fallback_action_is_counted(action_s: str) -> bool:
-                action_s = action_s.strip()
-                if mask_no_op_actions and action_s == "NO_OP":
-                    return False
-                if mask_mouse_actions and "MOUSE_" in action_s:
-                    return False
-                return True
-
-            action_is_counted_fn = _fallback_action_is_counted
 
     with torch.no_grad():
         for _ in range(val_steps):
@@ -424,7 +353,6 @@ def _run_validation_steps(
             correct_i, total_i = _action_accuracy_counts_from_texts(
                 pred_text_B=pred_text_B,
                 target_text_B=target_text_L,
-                action_is_counted_fn=action_is_counted_fn,
             )
             pred_no_op_i, pred_mouse_i, pred_total_i = _action_type_counts_from_texts(
                 pred_text_B
@@ -829,7 +757,7 @@ def main() -> None:
             pending_state_b = None
 
         prefetched_it = (
-            _CollatorPrefetchIterator(raw_it=raw_it, collator=collator)
+            CollatorPrefetchIterator(raw_it=raw_it, collator=collator)
             if args.collator_prefetch
             else None
         )
