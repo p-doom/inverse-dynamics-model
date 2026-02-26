@@ -70,7 +70,7 @@ class _FakeTokenizer:
         4: "Frame 0: z",
         5: "Frame 0: NO_OP\nFrame 1: b",
         6: "Frame 0: x\nFrame 1: b",
-        7: "Frame 0: MOUSE_MOVE\nFrame 1: b",
+        7: "Frame 0: MOUSE:1,0,0\nFrame 1: b",
     }
 
     def batch_decode(self, ids_B, skip_special_tokens: bool = True):
@@ -342,10 +342,10 @@ def test_action_accuracy_filter_keeps_original_frame_alignment():
 
 def test_action_accuracy_counts_from_texts_populates_per_class_counts():
     pred_text = [
-        "Frame 0: NO_OP\nFrame 1: MOUSE_MOVE\nFrame 2: KEY_DOWN:W",
+        "Frame 0: NO_OP\nFrame 1: MOUSE:3,0,0 ; W\nFrame 2: KEY_DOWN:W",
     ]
     target_text = [
-        "Frame 0: NO_OP\nFrame 1: MOUSE_MOVE\nFrame 2: KEY_UP:W",
+        "Frame 0: NO_OP\nFrame 1: MOUSE:3,0,0 ; W\nFrame 2: KEY_UP:W",
     ]
     class_counts = {}
 
@@ -368,7 +368,7 @@ def test_action_accuracy_counts_from_texts_populates_per_class_counts():
 def test_run_validation_steps_populates_action_type_stats():
     batch0 = {
         "labels": torch.tensor([[-100, 7]], dtype=torch.long),
-        "target_text": ["Frame 0: NO_OP\nFrame 1: MOUSE_MOVE"],
+        "target_text": ["Frame 0: NO_OP\nFrame 1: MOUSE:1,0,0"],
     }
     model = _FakeDDPModel(
         outputs_L=[(1.0, _logits_for_pred(7))],

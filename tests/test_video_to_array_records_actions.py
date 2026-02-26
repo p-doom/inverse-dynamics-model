@@ -16,6 +16,7 @@ assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 
+_actions_from_keylog_entries = _MODULE._actions_from_keylog_entries
 _actions_from_keylog_file = _MODULE._actions_from_keylog_file
 _chunk_video_records = _MODULE._chunk_video_records
 _write_chunk_records = _MODULE._write_chunk_records
@@ -36,6 +37,7 @@ def test_actions_from_keylog_file_aligns_to_target_fps(tmp_path: Path) -> None:
         [0, ["KeyPress", [0, "KeyW"]]],
         [100_000, ["MouseMove", [5.0, 0.0]]],
         [700_000, ["MouseScroll", [0.0, -1.0]]],
+        [850_000, ["KeyRelease", [0, "KeyW"]]],
         [900_000, ["MouseMove", [0.0, 0.0]]],
     ]
     keylog_p = tmp_path / "k.msgpack"
@@ -44,9 +46,10 @@ def test_actions_from_keylog_file_aligns_to_target_fps(tmp_path: Path) -> None:
     actions_L = _actions_from_keylog_file(keylog_p, n_frames=10, target_fps=10)
 
     assert len(actions_L) == 10
-    assert actions_L[0] == "KEY_DOWN:W"
-    assert actions_L[1] == "MOUSE_MOVE"
-    assert actions_L[7] == "MOUSE_SCROLL"
+    assert actions_L[0] == "MOUSE:0,0,0 ; W"
+    assert actions_L[1] == "MOUSE:1,0,0 ; W"
+    assert actions_L[7] == "MOUSE:0,0,-1 ; W"
+    assert actions_L[8] == "NO_OP"
     assert actions_L[9] == "NO_OP"
 
 
@@ -57,6 +60,56 @@ def test_actions_from_empty_keylog_file_is_noop(tmp_path: Path) -> None:
     actions_L = _actions_from_keylog_file(keylog_p, n_frames=6, target_fps=10)
 
     assert actions_L == ["NO_OP"] * 6
+
+
+def test_actions_quantize_and_sum_mouse_motion_per_frame() -> None:
+    entries_L = [
+        [0, ["MouseMove", [2.0, 2.0]]],
+        [1_000, ["MouseMove", [3.0, 2.0]]],
+    ]
+
+    actions_L = _actions_from_keylog_entries(entries_L, n_frames=1, target_fps=10)
+
+    assert actions_L == ["MOUSE:1,1,0"]
+
+
+def test_actions_clamp_mouse_motion_and_scroll_ranges() -> None:
+    entries_L = [
+        [0, ["MouseMove", [6_000.0, -6_000.0]]],
+        [0, ["MouseScroll", [0.0, 80.0]]],
+        [0, ["MouseScroll", [0.0, -180.0]]],
+    ]
+
+    actions_L = _actions_from_keylog_entries(entries_L, n_frames=1, target_fps=10)
+
+    assert actions_L == ["MOUSE:1000,-1000,-5"]
+
+
+def test_actions_track_pressed_key_state_across_frames() -> None:
+    entries_L = [
+        [0, ["KeyPress", [0, "KeyW"]]],
+        [250_000, ["KeyRelease", [0, "KeyW"]]],
+    ]
+
+    actions_L = _actions_from_keylog_entries(entries_L, n_frames=4, target_fps=10)
+
+    assert actions_L[0] == "MOUSE:0,0,0 ; W"
+    assert actions_L[1] == "MOUSE:0,0,0 ; W"
+    assert actions_L[2] == "NO_OP"
+    assert actions_L[3] == "NO_OP"
+
+
+def test_actions_track_mouse_button_state_as_keys() -> None:
+    entries_L = [
+        [0, ["MousePress", ["Left", 0.0, 0.0]]],
+        [100_000, ["MouseRelease", ["Left", 0.0, 0.0]]],
+    ]
+
+    actions_L = _actions_from_keylog_entries(entries_L, n_frames=3, target_fps=10)
+
+    assert actions_L[0] == "MOUSE:0,0,0 ; LMB"
+    assert actions_L[1] == "NO_OP"
+    assert actions_L[2] == "NO_OP"
 
 
 def test_chunk_video_records_embeds_action_slices() -> None:

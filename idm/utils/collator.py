@@ -6,6 +6,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from idm.utils.actions import action_has_nonzero_mouse_b, action_is_no_op_b
+
 
 class VideoSFTCollator:
     def __init__(
@@ -32,9 +34,9 @@ class VideoSFTCollator:
 
     def _action_loss_weight(self, action_s: str) -> float:
         action_s = action_s.strip()
-        if action_s == "NO_OP":
+        if action_is_no_op_b(action_s):
             return self.no_op_loss_weight
-        if "MOUSE_" in action_s:
+        if action_has_nonzero_mouse_b(action_s):
             return self.mouse_loss_weight
         return 1.0
 

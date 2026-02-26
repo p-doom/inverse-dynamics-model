@@ -198,7 +198,7 @@ def test_collator_no_op_loss_weight_applies_only_no_op_tokens():
 
 
 def test_collator_mouse_loss_weight_applies_to_mouse_action_tokens():
-    target_s = "Frame 0: KEY_DOWN:W + MOUSE_MOVE\nFrame 1: KEY_UP:W"
+    target_s = "Frame 0: MOUSE:3,0,0 ; W\nFrame 1: MOUSE:0,0,0 ; W"
     collator = VideoSFTCollator(
         processor=_FakeProcessor(),
         instruction_text="Predict actions.",
@@ -209,11 +209,11 @@ def test_collator_mouse_loss_weight_applies_to_mouse_action_tokens():
     label_weights_S = out_d["label_weights"][0]
     prompt_len_i = out_d["prompt_lens"][0]
 
-    mixed_slice = _action_slice(prompt_len_i, target_s, "KEY_DOWN:W + MOUSE_MOVE")
-    key_slice = _action_slice(prompt_len_i, target_s, "KEY_UP:W")
+    mouse_slice = _action_slice(prompt_len_i, target_s, "MOUSE:3,0,0 ; W")
+    key_only_slice = _action_slice(prompt_len_i, target_s, "MOUSE:0,0,0 ; W")
 
-    assert torch.all(label_weights_S[mixed_slice] == torch.tensor(0.4))
-    assert torch.all(label_weights_S[key_slice] == torch.tensor(1.0))
+    assert torch.all(label_weights_S[mouse_slice] == torch.tensor(0.4))
+    assert torch.all(label_weights_S[key_only_slice] == torch.tensor(1.0))
     assert torch.all(label_weights_S[labels_S == -100] == 0.0)
 
 
