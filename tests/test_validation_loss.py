@@ -400,3 +400,153 @@ def test_run_validation_steps_populates_action_type_stats():
     assert action_stats["class_mouse_total_n"] == 1
     assert action_stats["class_keyboard_correct_n"] == 0
     assert action_stats["class_keyboard_total_n"] == 0
+
+
+def test_action_accuracy_counts_from_texts_populates_confusion_counts():
+    pred_text = [
+        "Frame 0: NO_OP\nFrame 1: MOUSE_MOVE\nFrame 2: KEY_DOWN:W",
+    ]
+    target_text = [
+        "Frame 0: NO_OP\nFrame 1: KEY_UP:W\nFrame 2: MOUSE_MOVE\nFrame 3: NO_OP",
+    ]
+    confusion_counts = {}
+
+    correct_n, total_n = _TRAIN_MOD._action_accuracy_counts_from_texts(
+        pred_text_B=pred_text,
+        target_text_B=target_text,
+        confusion_counts_out_d=confusion_counts,
+    )
+
+    assert correct_n == 1
+    assert total_n == 4
+    assert (
+        confusion_counts[_TRAIN_MOD._action_confusion_count_key("no_op", "no_op")] == 1
+    )
+    assert (
+        confusion_counts[_TRAIN_MOD._action_confusion_count_key("keyboard", "mouse")]
+        == 1
+    )
+    assert (
+        confusion_counts[_TRAIN_MOD._action_confusion_count_key("mouse", "keyboard")]
+        == 1
+    )
+    assert (
+        confusion_counts[_TRAIN_MOD._action_confusion_count_key("no_op", "missing")]
+        == 1
+    )
+    assert (
+        confusion_counts[_TRAIN_MOD._action_confusion_count_key("keyboard", "missing")]
+        == 0
+    )
+
+
+def test_run_validation_steps_populates_action_confusion_stats():
+    batch0 = {
+        "labels": torch.tensor([[-100, 7]], dtype=torch.long),
+        "target_text": ["Frame 0: NO_OP\nFrame 1: MOUSE_MOVE\nFrame 2: KEY_DOWN:W"],
+    }
+    model = _FakeDDPModel(
+        outputs_L=[(1.0, _logits_for_pred(7))],
+        generated_ids_L=[torch.tensor([[99, 7]], dtype=torch.long)],
+        training=True,
+    )
+    action_stats = {}
+    _TRAIN_MOD._run_validation_steps(
+        ddp_model=model,
+        collator=_IdentityCollator(),
+        val_it=iter([batch0]),
+        val_steps=1,
+        val_generate_max_new_tokens=4,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        action_stats_out_d=action_stats,
+    )
+
+    assert action_stats[_TRAIN_MOD._action_confusion_count_key("no_op", "mouse")] == 1
+    assert (
+        action_stats[_TRAIN_MOD._action_confusion_count_key("mouse", "keyboard")] == 1
+    )
+    assert (
+        action_stats[_TRAIN_MOD._action_confusion_count_key("keyboard", "missing")] == 1
+    )
+
+
+def test_build_val_wandb_log_d_uses_fresh_val_action_split(monkeypatch):
+    captured = {}
+
+    def _fake_confusion_matrix(**kwargs):
+        captured.update(kwargs)
+        return "chart-obj"
+
+    monkeypatch.setattr(
+        _TRAIN_MOD.wandb.plot,
+        "confusion_matrix",
+        _fake_confusion_matrix,
+    )
+
+    log_d = _TRAIN_MOD._build_val_wandb_log_d(
+        val_loss_f=1.23,
+        val_toks_per_s_f=45.6,
+        val_action_acc_f=0.7,
+        val_pred_no_op_rate_f=0.1,
+        val_target_no_op_rate_f=0.2,
+        val_pred_mouse_rate_f=0.3,
+        val_target_mouse_rate_f=0.4,
+        val_pred_action_total_f=10.0,
+        val_target_action_total_f=11.0,
+        val_action_acc_no_op_f=0.8,
+        val_action_acc_mouse_f=0.9,
+        val_action_acc_keyboard_f=1.0,
+        val_action_total_no_op_f=5.0,
+        val_action_total_mouse_f=3.0,
+        val_action_total_keyboard_f=2.0,
+        val_confusion_counts_NM=[[2, 0, 0, 1], [0, 1, 0, 0], [0, 0, 1, 0]],
+    )
+
+    assert log_d["val/loss"] == pytest.approx(1.23)
+    assert log_d["val/tokens_per_s"] == pytest.approx(45.6)
+    assert "val_action/action_acc_no_op" in log_d
+    assert "val/action_acc_no_op" not in log_d
+    assert log_d["val_action/confusion_matrix"] == "chart-obj"
+    assert captured["class_names"] == list(
+        _TRAIN_MOD._ACTION_CONFUSION_PRED_CLASS_NAMES
+    )
+    assert len(captured["y_true"]) == 5
+    assert len(captured["preds"]) == 5
+
+
+def test_build_val_wandb_log_d_skips_confusion_chart_when_no_counts(monkeypatch):
+    calls_n = 0
+
+    def _fake_confusion_matrix(**_: object):
+        nonlocal calls_n
+        calls_n += 1
+        return "chart-obj"
+
+    monkeypatch.setattr(
+        _TRAIN_MOD.wandb.plot,
+        "confusion_matrix",
+        _fake_confusion_matrix,
+    )
+
+    log_d = _TRAIN_MOD._build_val_wandb_log_d(
+        val_loss_f=0.1,
+        val_toks_per_s_f=1.0,
+        val_action_acc_f=0.0,
+        val_pred_no_op_rate_f=0.0,
+        val_target_no_op_rate_f=0.0,
+        val_pred_mouse_rate_f=0.0,
+        val_target_mouse_rate_f=0.0,
+        val_pred_action_total_f=0.0,
+        val_target_action_total_f=0.0,
+        val_action_acc_no_op_f=0.0,
+        val_action_acc_mouse_f=0.0,
+        val_action_acc_keyboard_f=0.0,
+        val_action_total_no_op_f=0.0,
+        val_action_total_mouse_f=0.0,
+        val_action_total_keyboard_f=0.0,
+        val_confusion_counts_NM=[[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+    )
+
+    assert calls_n == 0
+    assert "val_action/confusion_matrix" not in log_d

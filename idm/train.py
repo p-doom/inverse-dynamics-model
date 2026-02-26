@@ -85,6 +85,10 @@ class Args:
     mfu_peak_flops: float = 0.0
 
 
+_ACTION_CLASS_NAMES = ("no_op", "mouse", "keyboard")
+_ACTION_CONFUSION_PRED_CLASS_NAMES = ("no_op", "mouse", "keyboard", "missing")
+
+
 def _rng_state_d() -> dict[str, Any]:
     return {
         "python": random.getstate(),
@@ -209,35 +213,50 @@ def _action_accuracy_counts_from_texts(
     target_text_B: list[str],
     action_is_counted_fn: Callable[[str], bool] | None = None,
     class_counts_out_d: dict[str, int] | None = None,
+    confusion_counts_out_d: dict[str, int] | None = None,
 ) -> tuple[int, int]:
     correct_n = 0
     total_n = 0
     if action_is_counted_fn is None:
         action_is_counted_fn = lambda _: True
     if class_counts_out_d is not None:
-        class_counts_out_d.setdefault("no_op_correct_n", 0)
-        class_counts_out_d.setdefault("no_op_total_n", 0)
-        class_counts_out_d.setdefault("mouse_correct_n", 0)
-        class_counts_out_d.setdefault("mouse_total_n", 0)
-        class_counts_out_d.setdefault("keyboard_correct_n", 0)
-        class_counts_out_d.setdefault("keyboard_total_n", 0)
+        for action_class_s in _ACTION_CLASS_NAMES:
+            class_counts_out_d.setdefault(f"{action_class_s}_correct_n", 0)
+            class_counts_out_d.setdefault(f"{action_class_s}_total_n", 0)
+    if confusion_counts_out_d is not None:
+        for target_class_s in _ACTION_CLASS_NAMES:
+            for pred_class_s in _ACTION_CONFUSION_PRED_CLASS_NAMES:
+                confusion_counts_out_d.setdefault(
+                    _action_confusion_count_key(target_class_s, pred_class_s),
+                    0,
+                )
     for pred_s, target_s in zip(pred_text_B, target_text_B):
         pred_actions_L = _actions_from_target_text(pred_s)
         target_actions_L = _actions_from_target_text(target_s)
         for idx_i, target_action_s in enumerate(target_actions_L):
             if not action_is_counted_fn(target_action_s):
                 continue
-            action_class_s = _action_class_s(target_action_s)
+            target_action_class_s = _action_class_s(target_action_s)
+            has_pred_b = idx_i < len(pred_actions_L)
+            pred_action_s = pred_actions_L[idx_i] if has_pred_b else ""
+            pred_action_class_s = (
+                _action_class_s(pred_action_s) if has_pred_b else "missing"
+            )
             total_n += 1
             if class_counts_out_d is not None:
-                class_counts_out_d[f"{action_class_s}_total_n"] += 1
-            is_correct_b = (
-                idx_i < len(pred_actions_L) and pred_actions_L[idx_i] == target_action_s
-            )
+                class_counts_out_d[f"{target_action_class_s}_total_n"] += 1
+            if confusion_counts_out_d is not None:
+                confusion_counts_out_d[
+                    _action_confusion_count_key(
+                        target_action_class_s,
+                        pred_action_class_s,
+                    )
+                ] += 1
+            is_correct_b = has_pred_b and pred_action_s == target_action_s
             if is_correct_b:
                 correct_n += 1
                 if class_counts_out_d is not None:
-                    class_counts_out_d[f"{action_class_s}_correct_n"] += 1
+                    class_counts_out_d[f"{target_action_class_s}_correct_n"] += 1
     return correct_n, total_n
 
 
@@ -254,6 +273,106 @@ def _action_type_counts_from_texts(action_text_B: list[str]) -> tuple[int, int, 
             if action_cls_s == "mouse":
                 mouse_n += 1
     return no_op_n, mouse_n, total_n
+
+
+def _action_confusion_count_key(target_class_s: str, pred_class_s: str) -> str:
+    return f"confusion_{target_class_s}_as_{pred_class_s}_n"
+
+
+def _action_confusion_matrix_counts_from_stats(
+    action_stats_d: dict[str, int],
+) -> list[list[int]]:
+    counts_NM: list[list[int]] = []
+    for target_class_s in _ACTION_CLASS_NAMES:
+        row_M: list[int] = []
+        for pred_class_s in _ACTION_CONFUSION_PRED_CLASS_NAMES:
+            row_M.append(
+                int(
+                    action_stats_d.get(
+                        _action_confusion_count_key(
+                            target_class_s,
+                            pred_class_s,
+                        ),
+                        0,
+                    )
+                )
+            )
+        counts_NM.append(row_M)
+    return counts_NM
+
+
+def _action_confusion_labels_from_counts(
+    counts_NM: list[list[int]],
+) -> tuple[list[int], list[int]]:
+    y_true_L: list[int] = []
+    preds_L: list[int] = []
+    for target_i in range(len(_ACTION_CLASS_NAMES)):
+        row_M = counts_NM[target_i]
+        for pred_i in range(len(_ACTION_CONFUSION_PRED_CLASS_NAMES)):
+            count_i = int(row_M[pred_i])
+            if count_i <= 0:
+                continue
+            y_true_L.extend([target_i] * count_i)
+            preds_L.extend([pred_i] * count_i)
+    return y_true_L, preds_L
+
+
+def _wandb_action_confusion_matrix_chart_from_counts(
+    counts_NM: list[list[int]],
+) -> Any | None:
+    y_true_L, preds_L = _action_confusion_labels_from_counts(counts_NM)
+    if not y_true_L:
+        return None
+    return wandb.plot.confusion_matrix(
+        y_true=y_true_L,
+        preds=preds_L,
+        class_names=list(_ACTION_CONFUSION_PRED_CLASS_NAMES),
+        title="Validation Action-Type Confusion Matrix",
+    )
+
+
+def _build_val_wandb_log_d(
+    *,
+    val_loss_f: float,
+    val_toks_per_s_f: float,
+    val_action_acc_f: float,
+    val_pred_no_op_rate_f: float,
+    val_target_no_op_rate_f: float,
+    val_pred_mouse_rate_f: float,
+    val_target_mouse_rate_f: float,
+    val_pred_action_total_f: float,
+    val_target_action_total_f: float,
+    val_action_acc_no_op_f: float,
+    val_action_acc_mouse_f: float,
+    val_action_acc_keyboard_f: float,
+    val_action_total_no_op_f: float,
+    val_action_total_mouse_f: float,
+    val_action_total_keyboard_f: float,
+    val_confusion_counts_NM: list[list[int]],
+) -> dict[str, Any]:
+    log_d: dict[str, Any] = {
+        "val/loss": val_loss_f,
+        "val/tokens_per_s": val_toks_per_s_f,
+        "val_action/action_acc": val_action_acc_f,
+        "val_action/pred_no_op_rate": val_pred_no_op_rate_f,
+        "val_action/target_no_op_rate": val_target_no_op_rate_f,
+        "val_action/pred_mouse_rate": val_pred_mouse_rate_f,
+        "val_action/target_mouse_rate": val_target_mouse_rate_f,
+        "val_action/pred_action_total": val_pred_action_total_f,
+        "val_action/target_action_total": val_target_action_total_f,
+        "val_action/action_acc_no_op": val_action_acc_no_op_f,
+        "val_action/action_acc_mouse": val_action_acc_mouse_f,
+        "val_action/action_acc_keyboard": val_action_acc_keyboard_f,
+        "val_action/action_total_no_op": val_action_total_no_op_f,
+        "val_action/action_total_mouse": val_action_total_mouse_f,
+        "val_action/action_total_keyboard": val_action_total_keyboard_f,
+    }
+    confusion_chart = _wandb_action_confusion_matrix_chart_from_counts(
+        val_confusion_counts_NM
+    )
+    if confusion_chart is not None:
+        log_d["val_action/confusion_matrix"] = confusion_chart
+    return log_d
 
 
 def _weighted_causal_lm_loss(
@@ -304,6 +423,7 @@ def _run_validation_steps(
     val_target_mouse_n = 0
     val_target_action_total_n = 0
     val_action_class_counts_d: dict[str, int] = {}
+    val_action_confusion_counts_d: dict[str, int] = {}
 
     with torch.no_grad():
         for _ in range(val_steps):
@@ -374,6 +494,7 @@ def _run_validation_steps(
                 pred_text_B=pred_text_B,
                 target_text_B=target_text_L,
                 class_counts_out_d=val_action_class_counts_d,
+                confusion_counts_out_d=val_action_confusion_counts_d,
             )
             pred_no_op_i, pred_mouse_i, pred_total_i = _action_type_counts_from_texts(
                 pred_text_B
@@ -419,6 +540,10 @@ def _run_validation_steps(
         action_stats_out_d["class_keyboard_total_n"] = val_action_class_counts_d.get(
             "keyboard_total_n", 0
         )
+        for target_class_s in _ACTION_CLASS_NAMES:
+            for pred_class_s in _ACTION_CONFUSION_PRED_CLASS_NAMES:
+                key_s = _action_confusion_count_key(target_class_s, pred_class_s)
+                action_stats_out_d[key_s] = val_action_confusion_counts_d.get(key_s, 0)
     return (
         val_loss_f,
         val_tok_n,
@@ -1005,6 +1130,11 @@ def main() -> None:
                         float(val_action_stats_d.get("class_keyboard_total_n", 0)),
                         device=device,
                     )
+                    val_confusion_counts_t = torch.tensor(
+                        _action_confusion_matrix_counts_from_stats(val_action_stats_d),
+                        device=device,
+                        dtype=torch.float32,
+                    )
                     if world_i > 1:
                         dist.all_reduce(val_loss_num_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_tok_t, op=dist.ReduceOp.SUM)
@@ -1028,6 +1158,7 @@ def main() -> None:
                             val_class_keyboard_total_t,
                             op=dist.ReduceOp.SUM,
                         )
+                        dist.all_reduce(val_confusion_counts_t, op=dist.ReduceOp.SUM)
                     val_loss_t = val_loss_num_t / torch.clamp(val_tok_t, min=1.0)
                     val_dt = max(time.time() - val_t0, 1e-9)
                     val_toks_per_s = val_tok_t.item() / val_dt
@@ -1058,6 +1189,10 @@ def main() -> None:
                         val_class_keyboard_correct_t.item()
                         / max(val_class_keyboard_total_t.item(), 1.0)
                     )
+                    val_confusion_counts_NM = [
+                        [int(x) for x in row]
+                        for row in val_confusion_counts_t.detach().cpu().tolist()
+                    ]
                     if rank_i == 0:
                         print(
                             f"step={global_step} val_loss={val_loss_t.item():.6f} "
@@ -1089,23 +1224,24 @@ def main() -> None:
                                 )
                         if wandb_run is not None:
                             wandb_run.log(
-                                {
-                                    "val/loss": val_loss_t.item(),
-                                    "val/tokens_per_s": val_toks_per_s,
-                                    "val/action_acc": val_action_acc_f,
-                                    "val/pred_no_op_rate": val_pred_no_op_rate_f,
-                                    "val/target_no_op_rate": val_target_no_op_rate_f,
-                                    "val/pred_mouse_rate": val_pred_mouse_rate_f,
-                                    "val/target_mouse_rate": val_target_mouse_rate_f,
-                                    "val/pred_action_total": val_pred_action_total_t.item(),
-                                    "val/target_action_total": val_target_action_total_t.item(),
-                                    "val/action_acc_no_op": val_action_acc_no_op_f,
-                                    "val/action_acc_mouse": val_action_acc_mouse_f,
-                                    "val/action_acc_keyboard": val_action_acc_keyboard_f,
-                                    "val/action_total_no_op": val_class_no_op_total_t.item(),
-                                    "val/action_total_mouse": val_class_mouse_total_t.item(),
-                                    "val/action_total_keyboard": val_class_keyboard_total_t.item(),
-                                },
+                                _build_val_wandb_log_d(
+                                    val_loss_f=val_loss_t.item(),
+                                    val_toks_per_s_f=val_toks_per_s,
+                                    val_action_acc_f=val_action_acc_f,
+                                    val_pred_no_op_rate_f=val_pred_no_op_rate_f,
+                                    val_target_no_op_rate_f=val_target_no_op_rate_f,
+                                    val_pred_mouse_rate_f=val_pred_mouse_rate_f,
+                                    val_target_mouse_rate_f=val_target_mouse_rate_f,
+                                    val_pred_action_total_f=val_pred_action_total_t.item(),
+                                    val_target_action_total_f=val_target_action_total_t.item(),
+                                    val_action_acc_no_op_f=val_action_acc_no_op_f,
+                                    val_action_acc_mouse_f=val_action_acc_mouse_f,
+                                    val_action_acc_keyboard_f=val_action_acc_keyboard_f,
+                                    val_action_total_no_op_f=val_class_no_op_total_t.item(),
+                                    val_action_total_mouse_f=val_class_mouse_total_t.item(),
+                                    val_action_total_keyboard_f=val_class_keyboard_total_t.item(),
+                                    val_confusion_counts_NM=val_confusion_counts_NM,
+                                ),
                                 step=global_step,
                             )
 
