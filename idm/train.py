@@ -12,6 +12,7 @@ import numpy as np
 from peft import LoraConfig, get_peft_model
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 import tyro
@@ -76,6 +77,8 @@ class Args:
     )
     mask_no_op_actions: bool = False
     mask_mouse_actions: bool = False
+    no_op_loss_weight: float = 1.0
+    mouse_loss_weight: float = 1.0
     wandb_enable: bool = True
     wandb_project: str = "idm"
     wandb_entity: str = ""
@@ -149,7 +152,9 @@ def _to_device(
     skip_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     skip_keys = (
-        {"videos", "prompt_lens", "meta"} if skip_keys is None else set(skip_keys)
+        {"videos", "prompt_lens", "meta", "label_weights"}
+        if skip_keys is None
+        else set(skip_keys)
     )
     out_d: dict[str, Any] = {}
     for key_s, val in batch_d.items():
@@ -218,6 +223,45 @@ def _action_accuracy_counts_from_texts(
     return correct_n, total_n
 
 
+def _action_type_counts_from_texts(action_text_B: list[str]) -> tuple[int, int, int]:
+    no_op_n = 0
+    mouse_n = 0
+    total_n = 0
+    for action_text_s in action_text_B:
+        for action_s in _actions_from_target_text(action_text_s):
+            action_s = action_s.strip()
+            total_n += 1
+            if action_s == "NO_OP":
+                no_op_n += 1
+            if "MOUSE_" in action_s:
+                mouse_n += 1
+    return no_op_n, mouse_n, total_n
+
+
+def _weighted_causal_lm_loss(
+    logits_BSV: torch.Tensor,
+    labels_BS: torch.Tensor,
+    label_weights_BS: torch.Tensor | None = None,
+) -> torch.Tensor:
+    shift_logits_BSV = logits_BSV[:, :-1, :].contiguous()
+    shift_labels_BS = labels_BS[:, 1:].contiguous()
+    token_loss_BS = F.cross_entropy(
+        input=shift_logits_BSV.view(-1, shift_logits_BSV.shape[-1]),
+        target=shift_labels_BS.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view_as(shift_labels_BS)
+    valid_mask_BS = shift_labels_BS != -100
+    if label_weights_BS is None:
+        denom_t = torch.clamp(valid_mask_BS.sum(), min=1).to(token_loss_BS.dtype)
+        return (token_loss_BS * valid_mask_BS.to(token_loss_BS.dtype)).sum() / denom_t
+
+    shift_weights_BS = label_weights_BS[:, 1:].to(token_loss_BS.dtype).contiguous()
+    valid_weights_BS = shift_weights_BS * valid_mask_BS.to(token_loss_BS.dtype)
+    denom_t = torch.clamp(valid_weights_BS.sum(), min=1.0)
+    return (token_loss_BS * valid_weights_BS).sum() / denom_t
+
+
 class _CollatorPrefetchIterator:
     def __init__(self, raw_it: Any, collator: VideoSFTCollator):
         self._raw_it = raw_it
@@ -278,12 +322,19 @@ def _run_validation_steps(
     dtype: torch.dtype,
     debug_examples_n: int = 0,
     debug_examples_out_L: list[tuple[str, str]] | None = None,
+    action_stats_out_d: dict[str, int] | None = None,
 ) -> tuple[float, int, int, int]:
     ddp_model.eval()
     val_loss_num = 0.0
     val_tok_n = 0
     val_action_correct_n = 0
     val_action_total_n = 0
+    val_pred_no_op_n = 0
+    val_pred_mouse_n = 0
+    val_pred_action_total_n = 0
+    val_target_no_op_n = 0
+    val_target_mouse_n = 0
+    val_target_action_total_n = 0
     action_is_counted_fn: Callable[[str], bool] | None = None
     mask_no_op_actions = bool(getattr(collator, "mask_no_op_actions", False))
     mask_mouse_actions = bool(getattr(collator, "mask_mouse_actions", False))
@@ -308,16 +359,24 @@ def _run_validation_steps(
     with torch.no_grad():
         for _ in range(val_steps):
             raw_batch_d = next(val_it)
-            model_batch_d = _to_device(collator(raw_batch_d), device)
+            collated_batch_d = collator(raw_batch_d)
+            label_weights_BS = collated_batch_d.get("label_weights")
+            model_batch_d = _to_device(collated_batch_d, device)
             batch_tok_n = int((model_batch_d["labels"] != -100).sum().item())
             val_tok_n += batch_tok_n
+            if label_weights_BS is not None:
+                label_weights_BS = label_weights_BS.to(device, non_blocking=True)
             with torch.autocast(
                 device_type=device.type,
                 dtype=dtype,
                 enabled=(device.type == "cuda"),
             ):
                 outputs = ddp_model(**model_batch_d)
-                loss = outputs.loss
+                loss = _weighted_causal_lm_loss(
+                    logits_BSV=outputs.logits,
+                    labels_BS=model_batch_d["labels"],
+                    label_weights_BS=label_weights_BS,
+                )
             val_loss_num += float(loss.detach().item()) * float(batch_tok_n)
             prompt_batch_d = collator.prompt_model_inputs(raw_batch_d)
             prompt_lens_B = [int(x) for x in prompt_batch_d.pop("prompt_lens")]
@@ -367,11 +426,32 @@ def _run_validation_steps(
                 target_text_B=target_text_L,
                 action_is_counted_fn=action_is_counted_fn,
             )
+            pred_no_op_i, pred_mouse_i, pred_total_i = _action_type_counts_from_texts(
+                pred_text_B
+            )
+            (
+                target_no_op_i,
+                target_mouse_i,
+                target_total_i,
+            ) = _action_type_counts_from_texts(target_text_L)
             val_action_correct_n += correct_i
             val_action_total_n += total_i
+            val_pred_no_op_n += pred_no_op_i
+            val_pred_mouse_n += pred_mouse_i
+            val_pred_action_total_n += pred_total_i
+            val_target_no_op_n += target_no_op_i
+            val_target_mouse_n += target_mouse_i
+            val_target_action_total_n += target_total_i
 
     ddp_model.train()
     val_loss_f = val_loss_num / max(float(val_tok_n), 1.0)
+    if action_stats_out_d is not None:
+        action_stats_out_d["pred_no_op_n"] = val_pred_no_op_n
+        action_stats_out_d["pred_mouse_n"] = val_pred_mouse_n
+        action_stats_out_d["pred_action_total_n"] = val_pred_action_total_n
+        action_stats_out_d["target_no_op_n"] = val_target_no_op_n
+        action_stats_out_d["target_mouse_n"] = val_target_mouse_n
+        action_stats_out_d["target_action_total_n"] = val_target_action_total_n
     return (
         val_loss_f,
         val_tok_n,
@@ -553,6 +633,10 @@ def main() -> None:
         raise ValueError("--read_num_threads must be >= 1.")
     if args.worker_buffer_size <= 0:
         raise ValueError("--worker_buffer_size must be >= 1.")
+    if args.no_op_loss_weight <= 0:
+        raise ValueError("--no-op-loss-weight must be > 0.")
+    if args.mouse_loss_weight <= 0:
+        raise ValueError("--mouse-loss-weight must be > 0.")
 
     print(f"Rank {rank_i} initializing process group...")
     print(f"Local rank: {local_rank_i}")
@@ -596,6 +680,10 @@ def main() -> None:
         )
         print(f"model_id={args.model_id}")
         print(f"attn_implementation={model.config._attn_implementation}")
+        print(
+            f"loss_weights no_op={args.no_op_loss_weight:.4f} "
+            f"mouse={args.mouse_loss_weight:.4f}"
+        )
         if mfu_enabled_b:
             print(
                 f"mfu_enabled=True peak_flops={mfu_peak_flops_f:.3e} "
@@ -619,6 +707,8 @@ def main() -> None:
         video_fps=args.video_fps,
         mask_no_op_actions=args.mask_no_op_actions,
         mask_mouse_actions=args.mask_mouse_actions,
+        no_op_loss_weight=args.no_op_loss_weight,
+        mouse_loss_weight=args.mouse_loss_weight,
     )
     val_collator = collator
     val_it = None
@@ -633,6 +723,8 @@ def main() -> None:
             video_fps=args.video_fps,
             mask_no_op_actions=args.mask_no_op_actions,
             mask_mouse_actions=args.mask_mouse_actions,
+            no_op_loss_weight=args.no_op_loss_weight,
+            mouse_loss_weight=args.mouse_loss_weight,
         )
         val_loader = get_dataloader(
             array_record_paths=val_array_paths,
@@ -745,15 +837,22 @@ def main() -> None:
         try:
             for batch_d in batch_it:
                 ddp_model.train()
-                model_batch_d = (
-                    _to_device(batch_d, device)
-                    if prefetched_it is not None
-                    else _to_device(collator(batch_d), device)
+                collated_batch_d = (
+                    batch_d if prefetched_it is not None else collator(batch_d)
                 )
+                label_weights_BS = collated_batch_d.get("label_weights")
+                model_batch_d = _to_device(collated_batch_d, device)
+                if label_weights_BS is not None:
+                    label_weights_BS = label_weights_BS.to(device, non_blocking=True)
                 tok_n = int((model_batch_d["labels"] != -100).sum().item())
 
                 with torch.autocast("cuda", dtype=dtype):
-                    loss = ddp_model(**model_batch_d).loss
+                    outputs = ddp_model(**model_batch_d)
+                    loss = _weighted_causal_lm_loss(
+                        logits_BSV=outputs.logits,
+                        labels_BS=model_batch_d["labels"],
+                        label_weights_BS=label_weights_BS,
+                    )
 
                 log_loss_sum += float(loss.detach().item())
                 log_micro_n += 1
@@ -868,6 +967,7 @@ def main() -> None:
                     assert val_it is not None
                     val_t0 = time.time()
                     val_examples_L: list[tuple[str, str]] = []
+                    val_action_stats_d: dict[str, int] = {}
                     (
                         val_loss_f,
                         val_tok_n,
@@ -883,6 +983,7 @@ def main() -> None:
                         dtype=dtype,
                         debug_examples_n=args.val_log_examples,
                         debug_examples_out_L=val_examples_L,
+                        action_stats_out_d=val_action_stats_d,
                     )
                     val_loss_num_t = torch.tensor(
                         val_loss_f * max(float(val_tok_n), 1.0), device=device
@@ -894,22 +995,67 @@ def main() -> None:
                     val_action_total_t = torch.tensor(
                         float(val_action_total_n), device=device
                     )
+                    val_pred_no_op_t = torch.tensor(
+                        float(val_action_stats_d.get("pred_no_op_n", 0)), device=device
+                    )
+                    val_pred_mouse_t = torch.tensor(
+                        float(val_action_stats_d.get("pred_mouse_n", 0)),
+                        device=device,
+                    )
+                    val_pred_action_total_t = torch.tensor(
+                        float(val_action_stats_d.get("pred_action_total_n", 0)),
+                        device=device,
+                    )
+                    val_target_no_op_t = torch.tensor(
+                        float(val_action_stats_d.get("target_no_op_n", 0)),
+                        device=device,
+                    )
+                    val_target_mouse_t = torch.tensor(
+                        float(val_action_stats_d.get("target_mouse_n", 0)),
+                        device=device,
+                    )
+                    val_target_action_total_t = torch.tensor(
+                        float(val_action_stats_d.get("target_action_total_n", 0)),
+                        device=device,
+                    )
                     if world_i > 1:
                         dist.all_reduce(val_loss_num_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_tok_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_action_correct_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_action_total_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_pred_no_op_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_pred_mouse_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_pred_action_total_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_target_no_op_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_target_mouse_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_target_action_total_t, op=dist.ReduceOp.SUM)
                     val_loss_t = val_loss_num_t / torch.clamp(val_tok_t, min=1.0)
                     val_dt = max(time.time() - val_t0, 1e-9)
                     val_toks_per_s = val_tok_t.item() / val_dt
                     val_action_acc_f = val_action_correct_t.item() / max(
                         val_action_total_t.item(), 1.0
                     )
+                    val_pred_no_op_rate_f = val_pred_no_op_t.item() / max(
+                        val_pred_action_total_t.item(), 1.0
+                    )
+                    val_target_no_op_rate_f = val_target_no_op_t.item() / max(
+                        val_target_action_total_t.item(), 1.0
+                    )
+                    val_pred_mouse_rate_f = val_pred_mouse_t.item() / max(
+                        val_pred_action_total_t.item(), 1.0
+                    )
+                    val_target_mouse_rate_f = val_target_mouse_t.item() / max(
+                        val_target_action_total_t.item(), 1.0
+                    )
                     if rank_i == 0:
                         print(
                             f"step={global_step} val_loss={val_loss_t.item():.6f} "
                             f"val_steps={args.val_steps} val_tokens_per_s={val_toks_per_s:.1f} "
-                            f"val_action_acc={val_action_acc_f:.6f}"
+                            f"val_action_acc={val_action_acc_f:.6f} "
+                            f"val_pred_no_op_rate={val_pred_no_op_rate_f:.4f} "
+                            f"val_target_no_op_rate={val_target_no_op_rate_f:.4f} "
+                            f"val_pred_mouse_rate={val_pred_mouse_rate_f:.4f} "
+                            f"val_target_mouse_rate={val_target_mouse_rate_f:.4f}"
                         )
                         if val_examples_L:
                             for ex_i, (pred_s, target_s) in enumerate(
@@ -933,6 +1079,12 @@ def main() -> None:
                                     "val/loss": val_loss_t.item(),
                                     "val/tokens_per_s": val_toks_per_s,
                                     "val/action_acc": val_action_acc_f,
+                                    "val/pred_no_op_rate": val_pred_no_op_rate_f,
+                                    "val/target_no_op_rate": val_target_no_op_rate_f,
+                                    "val/pred_mouse_rate": val_pred_mouse_rate_f,
+                                    "val/target_mouse_rate": val_target_mouse_rate_f,
+                                    "val/pred_action_total": val_pred_action_total_t.item(),
+                                    "val/target_action_total": val_target_action_total_t.item(),
                                 },
                                 step=global_step,
                             )

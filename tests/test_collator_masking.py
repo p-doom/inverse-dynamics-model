@@ -125,6 +125,7 @@ def test_collator_masks_prompt_and_padding_tokens():
     )
     out_d = collator(_batch())
     labels_BS = out_d["labels"]
+    label_weights_BS = out_d["label_weights"]
     input_ids_BS = out_d["input_ids"]
     attn_BS = out_d["attention_mask"]
     assert "token_type_ids" not in out_d
@@ -137,6 +138,8 @@ def test_collator_masks_prompt_and_padding_tokens():
         assert torch.all(
             labels_BS[b_i, supervised_mask_S] == input_ids_BS[b_i, supervised_mask_S]
         )
+        assert torch.all(label_weights_BS[b_i, ~supervised_mask_S] == 0.0)
+        assert torch.all(label_weights_BS[b_i, supervised_mask_S] == 1.0)
 
 
 def test_collator_preserves_batch_size():
@@ -220,3 +223,43 @@ def test_collator_mask_mouse_masks_all_mouse_actions():
     assert torch.all(labels_S[down_slice] == -100)
     assert torch.all(labels_S[scroll_slice] == -100)
     assert torch.all(labels_S[key_slice] == input_ids_S[key_slice])
+
+
+def test_collator_no_op_loss_weight_applies_only_no_op_tokens():
+    target_s = "Frame 0: NO_OP\nFrame 1: KEY_DOWN:W"
+    collator = VideoSFTCollator(
+        processor=_FakeProcessor(),
+        instruction_text="Predict actions.",
+        no_op_loss_weight=0.25,
+    )
+    out_d = collator(_single_item_batch(frames_n=2, target_s=target_s))
+    labels_S = out_d["labels"][0]
+    label_weights_S = out_d["label_weights"][0]
+    prompt_len_i = out_d["prompt_lens"][0]
+
+    noop_slice = _action_slice(prompt_len_i, target_s, "NO_OP")
+    key_slice = _action_slice(prompt_len_i, target_s, "KEY_DOWN:W")
+
+    assert torch.all(label_weights_S[noop_slice] == torch.tensor(0.25))
+    assert torch.all(label_weights_S[key_slice] == torch.tensor(1.0))
+    assert torch.all(label_weights_S[labels_S == -100] == 0.0)
+
+
+def test_collator_mouse_loss_weight_applies_to_mouse_action_tokens():
+    target_s = "Frame 0: KEY_DOWN:W + MOUSE_MOVE\nFrame 1: KEY_UP:W"
+    collator = VideoSFTCollator(
+        processor=_FakeProcessor(),
+        instruction_text="Predict actions.",
+        mouse_loss_weight=0.4,
+    )
+    out_d = collator(_single_item_batch(frames_n=2, target_s=target_s))
+    labels_S = out_d["labels"][0]
+    label_weights_S = out_d["label_weights"][0]
+    prompt_len_i = out_d["prompt_lens"][0]
+
+    mixed_slice = _action_slice(prompt_len_i, target_s, "KEY_DOWN:W + MOUSE_MOVE")
+    key_slice = _action_slice(prompt_len_i, target_s, "KEY_UP:W")
+
+    assert torch.all(label_weights_S[mixed_slice] == torch.tensor(0.4))
+    assert torch.all(label_weights_S[key_slice] == torch.tensor(1.0))
+    assert torch.all(label_weights_S[labels_S == -100] == 0.0)

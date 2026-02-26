@@ -6,6 +6,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 
 _TRAIN_PATH = Path(__file__).resolve().parents[1] / "idm" / "train.py"
@@ -69,6 +70,7 @@ class _FakeTokenizer:
         4: "Frame 0: z",
         5: "Frame 0: NO_OP\nFrame 1: b",
         6: "Frame 0: x\nFrame 1: b",
+        7: "Frame 0: MOUSE_MOVE\nFrame 1: b",
     }
 
     def batch_decode(self, ids_B, skip_special_tokens: bool = True):
@@ -118,6 +120,52 @@ def _logits_for_pred(pred_tok_i: int, vocab_n: int = 8) -> torch.Tensor:
     return logits
 
 
+def _logits_for_pred_with_seq(
+    pred_tok_i: int, seq_len: int, vocab_n: int = 8
+) -> torch.Tensor:
+    logits = torch.zeros((1, seq_len, vocab_n), dtype=torch.float32)
+    if seq_len > 1:
+        logits[0, : seq_len - 1, pred_tok_i] = 10.0
+    return logits
+
+
+def test_weighted_causal_lm_loss_matches_manual_weighted_average():
+    logits = torch.tensor(
+        [
+            [
+                [1.0, 2.0, 0.5],
+                [0.3, 0.7, 1.1],
+                [2.0, 0.1, 0.2],
+                [0.0, 0.0, 0.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    labels = torch.tensor([[-100, 1, 2, 0]], dtype=torch.long)
+    label_weights = torch.tensor([[0.0, 0.25, 1.0, 2.0]], dtype=torch.float32)
+
+    loss_t = _TRAIN_MOD._weighted_causal_lm_loss(
+        logits_BSV=logits,
+        labels_BS=labels,
+        label_weights_BS=label_weights,
+    )
+
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    token_loss = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.shape[-1]),
+        shift_labels.reshape(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).reshape_as(shift_labels)
+    valid = shift_labels != -100
+    shift_weights = label_weights[:, 1:]
+    expected_loss = (token_loss * shift_weights * valid.to(torch.float32)).sum() / (
+        shift_weights * valid.to(torch.float32)
+    ).sum()
+    assert loss_t.item() == pytest.approx(expected_loss.item())
+
+
 def test_run_validation_steps_averages_loss_and_counts_action_accuracy():
     batch0 = {
         "labels": torch.tensor([[-100, 1]], dtype=torch.long),
@@ -158,7 +206,21 @@ def test_run_validation_steps_averages_loss_and_counts_action_accuracy():
         )
     )
 
-    assert mean_loss_f == pytest.approx(2.0)
+    expected_losses = [
+        _TRAIN_MOD._weighted_causal_lm_loss(
+            logits_BSV=_logits_for_pred(1),
+            labels_BS=batch0["labels"],
+        ).item(),
+        _TRAIN_MOD._weighted_causal_lm_loss(
+            logits_BSV=_logits_for_pred(2),
+            labels_BS=batch1["labels"],
+        ).item(),
+        _TRAIN_MOD._weighted_causal_lm_loss(
+            logits_BSV=_logits_for_pred(4),
+            labels_BS=batch2["labels"],
+        ).item(),
+    ]
+    assert mean_loss_f == pytest.approx(sum(expected_losses) / len(expected_losses))
     assert val_tok_n == 3
     assert val_action_correct_n == 2
     assert val_action_total_n == 3
@@ -179,8 +241,8 @@ def test_run_validation_steps_weights_loss_by_supervised_tokens():
     }
     model = _FakeDDPModel(
         outputs_L=[
-            (1.0, _logits_for_pred(1)),
-            (3.0, _logits_for_pred(2)),
+            (1.0, _logits_for_pred_with_seq(1, seq_len=4)),
+            (3.0, _logits_for_pred_with_seq(2, seq_len=4)),
         ],
         generated_ids_L=[
             torch.tensor([[99, 1]], dtype=torch.long),
@@ -200,7 +262,15 @@ def test_run_validation_steps_weights_loss_by_supervised_tokens():
     )
 
     assert val_tok_n == 4
-    assert mean_loss_f == pytest.approx((1.0 * 1 + 3.0 * 3) / 4.0)
+    loss0 = _TRAIN_MOD._weighted_causal_lm_loss(
+        logits_BSV=_logits_for_pred_with_seq(1, seq_len=4),
+        labels_BS=batch0["labels"],
+    ).item()
+    loss1 = _TRAIN_MOD._weighted_causal_lm_loss(
+        logits_BSV=_logits_for_pred_with_seq(2, seq_len=4),
+        labels_BS=batch1["labels"],
+    ).item()
+    assert mean_loss_f == pytest.approx((loss0 * 1 + loss1 * 3) / 4.0)
 
 
 def test_run_validation_steps_collects_debug_examples_when_requested():
@@ -332,3 +402,34 @@ def test_run_validation_steps_keeps_action_accuracy_unfiltered_when_masks_disabl
     )
     assert val_action_correct_n == 1
     assert val_action_total_n == 2
+
+
+def test_run_validation_steps_populates_action_type_stats():
+    batch0 = {
+        "labels": torch.tensor([[-100, 7]], dtype=torch.long),
+        "target_text": ["Frame 0: NO_OP\nFrame 1: MOUSE_MOVE"],
+    }
+    model = _FakeDDPModel(
+        outputs_L=[(1.0, _logits_for_pred(7))],
+        generated_ids_L=[torch.tensor([[99, 7]], dtype=torch.long)],
+        training=True,
+    )
+    action_stats = {}
+
+    _TRAIN_MOD._run_validation_steps(
+        ddp_model=model,
+        collator=_IdentityCollator(),
+        val_it=iter([batch0]),
+        val_steps=1,
+        val_generate_max_new_tokens=4,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        action_stats_out_d=action_stats,
+    )
+
+    assert action_stats["pred_no_op_n"] == 0
+    assert action_stats["pred_mouse_n"] == 1
+    assert action_stats["pred_action_total_n"] == 2
+    assert action_stats["target_no_op_n"] == 1
+    assert action_stats["target_mouse_n"] == 1
+    assert action_stats["target_action_total_n"] == 2

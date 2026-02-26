@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch
 
 
 class VideoSFTCollator:
@@ -13,6 +14,8 @@ class VideoSFTCollator:
         video_fps: float | None = None,
         mask_no_op_actions: bool = False,
         mask_mouse_actions: bool = False,
+        no_op_loss_weight: float = 1.0,
+        mouse_loss_weight: float = 1.0,
     ):
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -20,6 +23,8 @@ class VideoSFTCollator:
         self.video_fps = video_fps
         self.mask_no_op_actions = mask_no_op_actions
         self.mask_mouse_actions = mask_mouse_actions
+        self.no_op_loss_weight = float(no_op_loss_weight)
+        self.mouse_loss_weight = float(mouse_loss_weight)
         prompt_msgs, _ = self._messages("")
         self._prompt_text = self.processor.apply_chat_template(
             prompt_msgs,
@@ -35,6 +40,14 @@ class VideoSFTCollator:
         if self.mask_mouse_actions and "MOUSE_" in action_s:
             return True
         return False
+
+    def _action_loss_weight(self, action_s: str) -> float:
+        action_s = action_s.strip()
+        if action_s == "NO_OP":
+            return self.no_op_loss_weight
+        if "MOUSE_" in action_s:
+            return self.mouse_loss_weight
+        return 1.0
 
     def _action_char_spans(self, target_s: str) -> list[tuple[str, int, int]]:
         spans_L: list[tuple[str, int, int]] = []
@@ -100,6 +113,33 @@ class VideoSFTCollator:
                 end_i = min(end_i, seq_len_i)
                 if end_i > start_i:
                     labels_BS[b_i, start_i:end_i] = -100
+
+    def _apply_action_loss_weights(
+        self,
+        label_weights_BS: Any,
+        labels_BS: Any,
+        target_B: Any,
+        prompt_lens_B: list[int],
+    ) -> None:
+        if self.no_op_loss_weight == 1.0 and self.mouse_loss_weight == 1.0:
+            label_weights_BS[labels_BS == -100] = 0.0
+            return
+
+        seq_len_i = int(label_weights_BS.shape[1])
+        for b_i, (target_s, prompt_len_i) in enumerate(zip(target_B, prompt_lens_B)):
+            for action_s, start_tok_i, end_tok_i in self._action_token_spans(
+                str(target_s)
+            ):
+                weight_f = self._action_loss_weight(action_s)
+                if weight_f == 1.0:
+                    continue
+                start_i = int(prompt_len_i) + int(start_tok_i)
+                end_i = int(prompt_len_i) + int(end_tok_i)
+                start_i = max(start_i, 0)
+                end_i = min(end_i, seq_len_i)
+                if end_i > start_i:
+                    label_weights_BS[b_i, start_i:end_i] = weight_f
+        label_weights_BS[labels_BS == -100] = 0.0
 
     def _messages(
         self, target_s: str
@@ -243,8 +283,19 @@ class VideoSFTCollator:
             target_B=target_B,
             prompt_lens_B=prompt_lens_B,
         )
+        label_weights_BS = labels_BS.new_ones(
+            labels_BS.shape,
+            dtype=torch.float32,
+        )
+        self._apply_action_loss_weights(
+            label_weights_BS=label_weights_BS,
+            labels_BS=labels_BS,
+            target_B=target_B,
+            prompt_lens_B=prompt_lens_B,
+        )
 
         enc_d["labels"] = labels_BS
+        enc_d["label_weights"] = label_weights_BS
         enc_d["prompt_lens"] = prompt_lens_B
         enc_d["videos"] = videos_B
         return enc_d
