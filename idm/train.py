@@ -74,8 +74,6 @@ class Args:
     instruction_text: str = (
         "Given the video frames, output the action text for each frame in order."
     )
-    mask_no_op_actions: bool = False
-    mask_mouse_actions: bool = False
     no_op_loss_weight: float = 1.0
     mouse_loss_weight: float = 1.0
     wandb_enable: bool = True
@@ -633,8 +631,6 @@ def main() -> None:
         processor=processor,
         instruction_text=args.instruction_text,
         video_fps=args.video_fps,
-        mask_no_op_actions=args.mask_no_op_actions,
-        mask_mouse_actions=args.mask_mouse_actions,
         no_op_loss_weight=args.no_op_loss_weight,
         mouse_loss_weight=args.mouse_loss_weight,
     )
@@ -649,8 +645,6 @@ def main() -> None:
             processor=val_processor,
             instruction_text=args.instruction_text,
             video_fps=args.video_fps,
-            mask_no_op_actions=args.mask_no_op_actions,
-            mask_mouse_actions=args.mask_mouse_actions,
             no_op_loss_weight=args.no_op_loss_weight,
             mouse_loss_weight=args.mouse_loss_weight,
         )

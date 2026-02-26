@@ -13,8 +13,6 @@ class VideoSFTCollator:
         processor: Any,
         instruction_text: str,
         video_fps: float | None = None,
-        mask_no_op_actions: bool = False,
-        mask_mouse_actions: bool = False,
         no_op_loss_weight: float = 1.0,
         mouse_loss_weight: float = 1.0,
     ):
@@ -22,8 +20,6 @@ class VideoSFTCollator:
         self.tokenizer = processor.tokenizer
         self.instruction_text = instruction_text
         self.video_fps = video_fps
-        self.mask_no_op_actions = mask_no_op_actions
-        self.mask_mouse_actions = mask_mouse_actions
         self.no_op_loss_weight = float(no_op_loss_weight)
         self.mouse_loss_weight = float(mouse_loss_weight)
         prompt_msgs, _ = self._messages("")

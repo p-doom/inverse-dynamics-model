@@ -96,24 +96,6 @@ class _IdentityCollator:
         }
 
 
-class _MaskAttrsIdentityCollator(_IdentityCollator):
-    def __init__(
-        self,
-        mask_no_op_actions: bool = False,
-        mask_mouse_actions: bool = False,
-    ):
-        self.mask_no_op_actions = mask_no_op_actions
-        self.mask_mouse_actions = mask_mouse_actions
-
-    def _should_mask_action(self, action_s: str) -> bool:
-        action_s = action_s.strip()
-        if self.mask_no_op_actions and action_s == "NO_OP":
-            return True
-        if self.mask_mouse_actions and "MOUSE_" in action_s:
-            return True
-        return False
-
-
 def _logits_for_pred(pred_tok_i: int, vocab_n: int = 8) -> torch.Tensor:
     logits = torch.zeros((1, 2, vocab_n), dtype=torch.float32)
     logits[0, 0, pred_tok_i] = 10.0
@@ -356,32 +338,6 @@ def test_action_accuracy_filter_keeps_original_frame_alignment():
     )
     assert correct_n == 1
     assert total_n == 1
-
-
-def test_run_validation_steps_keeps_action_accuracy_unfiltered_with_mask_flags():
-    batch0 = {
-        "labels": torch.tensor([[-100, 2]], dtype=torch.long),
-        "target_text": ["Frame 0: NO_OP\nFrame 1: b"],
-    }
-    model = _FakeDDPModel(
-        outputs_L=[(1.0, _logits_for_pred(2))],
-        generated_ids_L=[torch.tensor([[99, 6]], dtype=torch.long)],
-        training=True,
-    )
-    _, _, val_action_correct_n, val_action_total_n = _TRAIN_MOD._run_validation_steps(
-        ddp_model=model,
-        collator=_MaskAttrsIdentityCollator(
-            mask_no_op_actions=True,
-            mask_mouse_actions=True,
-        ),
-        val_it=iter([batch0]),
-        val_steps=1,
-        val_generate_max_new_tokens=4,
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-    )
-    assert val_action_correct_n == 1
-    assert val_action_total_n == 2
 
 
 def test_run_validation_steps_populates_action_type_stats():
