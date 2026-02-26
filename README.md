@@ -47,6 +47,14 @@ idm_data/
   test/*.array_record
 ```
 
+Lumine-inspired action format (per frame, see [Lumine](https://arxiv.org/abs/2511.08892)):
+
+- `NO_OP`
+- `MOUSE:dx,dy,dz`
+- `MOUSE:dx,dy,dz ; <pressed_keys>`
+
+`dx,dy,dz` are per-frame relative mouse deltas (quantized/clipped during preprocessing), and pressed keys are appended as a sorted space-separated list when present.
+
 ## Train
 
 Single GPU (baseline):

@@ -22,6 +22,7 @@ from idm.utils.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from idm.utils.actions import action_class_s
 from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
 from idm.utils.data import (
     find_array_record_paths,
@@ -175,12 +176,7 @@ def _actions_from_target_text(target_s: str) -> list[str]:
 
 
 def _action_class_s(action_s: str) -> str:
-    action_s = action_s.strip()
-    if action_s == "NO_OP":
-        return "no_op"
-    if "MOUSE_" in action_s:
-        return "mouse"
-    return "keyboard"
+    return action_class_s(action_s)
 
 
 def _decode_pred_text_B_from_generated_ids(
@@ -251,11 +247,11 @@ def _action_type_counts_from_texts(action_text_B: list[str]) -> tuple[int, int, 
     total_n = 0
     for action_text_s in action_text_B:
         for action_s in _actions_from_target_text(action_text_s):
-            action_s = action_s.strip()
+            action_cls_s = _action_class_s(action_s)
             total_n += 1
-            if action_s == "NO_OP":
+            if action_cls_s == "no_op":
                 no_op_n += 1
-            if "MOUSE_" in action_s:
+            if action_cls_s == "mouse":
                 mouse_n += 1
     return no_op_n, mouse_n, total_n
 

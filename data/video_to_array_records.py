@@ -38,6 +38,15 @@ KEY_NAME_MAP = {
     "LeftArrow": "Left",
     "RightArrow": "Right",
 }
+BUTTON_NAME_MAP = {
+    "Left": "LMB",
+    "Right": "RMB",
+    "Middle": "MMB",
+}
+MOUSE_X_QUANT_UNIT_F = 5.0
+MOUSE_Y_QUANT_UNIT_F = 4.0
+MOUSE_DELTA_CLIP_I = 1000
+MOUSE_SCROLL_CLIP_I = 5
 
 
 @dataclass
@@ -60,81 +69,13 @@ class Args:
     max_videos: int = 0
 
 
-class _StepAccumulator:
-    def __init__(self) -> None:
-        self.tokens_s = set()
-        self.has_active_input_b = False
-        self.has_nonzero_motion_b = False
-        self.has_nonzero_scroll_b = False
-        self.has_zero_passive_event_b = False
-        self.has_parse_error_b = False
-
-    def consume(self, event_tuple: object) -> None:
-        if not isinstance(event_tuple, list) or len(event_tuple) < 1:
-            self.tokens_s.add("MALFORMED_EVENT")
-            self.has_parse_error_b = True
-            return
-
-        event_type_s = str(event_tuple[0])
-        payload = event_tuple[1] if len(event_tuple) > 1 else None
-
-        if event_type_s == "KeyPress":
-            self.tokens_s.add(f"KEY_DOWN:{_parse_key_name(payload)}")
-            self.has_active_input_b = True
-            return
-        if event_type_s == "KeyRelease":
-            self.tokens_s.add(f"KEY_UP:{_parse_key_name(payload)}")
-            self.has_active_input_b = True
-            return
-        if event_type_s == "MousePress":
-            self.tokens_s.add(f"MOUSE_DOWN:{_parse_button(payload)}")
-            self.has_active_input_b = True
-            return
-        if event_type_s == "MouseRelease":
-            self.tokens_s.add(f"MOUSE_UP:{_parse_button(payload)}")
-            self.has_active_input_b = True
-            return
-        if event_type_s == "MouseMove":
-            dx_f, dy_f = _parse_two_floats(payload)
-            if _is_zero(dx_f) and _is_zero(dy_f):
-                self.has_zero_passive_event_b = True
-            else:
-                self.tokens_s.add("MOUSE_MOVE")
-                self.has_nonzero_motion_b = True
-            return
-        if event_type_s == "MouseScroll":
-            sx_f, sy_f = _parse_two_floats(payload)
-            if _is_zero(sx_f) and _is_zero(sy_f):
-                self.has_zero_passive_event_b = True
-            else:
-                self.tokens_s.add("MOUSE_SCROLL")
-                self.has_nonzero_scroll_b = True
-            return
-
-        self.tokens_s.add(f"OTHER:{event_type_s}")
-        self.has_active_input_b = True
-
-    def label(self) -> str:
-        if (
-            not self.has_active_input_b
-            and not self.has_nonzero_motion_b
-            and not self.has_nonzero_scroll_b
-            and not self.has_parse_error_b
-            and (self.has_zero_passive_event_b or not self.tokens_s)
-        ):
-            return "NO_OP"
-        if self.tokens_s:
-            return " + ".join(sorted(self.tokens_s))
-        if self.has_parse_error_b:
-            return "MALFORMED_STEP"
-        return "EMPTY_STEP"
-
-
 def _normalize_key_name(name_s: str) -> str:
     if name_s in KEY_NAME_MAP:
         return KEY_NAME_MAP[name_s]
     if name_s.startswith("Key") and len(name_s) == 4:
         return name_s[3:]
+    if name_s.startswith("Digit") and len(name_s) == 6:
+        return name_s[5:]
     if name_s.startswith("Num") and len(name_s) == 4:
         return name_s[3:]
     if name_s.startswith("Kp") and len(name_s) == 3:
@@ -154,9 +95,16 @@ def _parse_key_name(payload: object) -> str:
     return "UNKNOWN_KEY"
 
 
+def _normalize_button_name(name_s: str) -> str:
+    out_s = BUTTON_NAME_MAP.get(name_s, name_s).strip()
+    if not out_s:
+        return "UNKNOWN_BUTTON"
+    return out_s.replace(" ", "_")
+
+
 def _parse_button(payload: object) -> str:
     if isinstance(payload, list) and len(payload) >= 1:
-        return str(payload[0])
+        return _normalize_button_name(str(payload[0]))
     return "UNKNOWN_BUTTON"
 
 
@@ -167,6 +115,41 @@ def _parse_two_floats(payload: object) -> tuple[float, float]:
         return float(payload[0]), float(payload[1])
     except (TypeError, ValueError):
         return float("nan"), float("nan")
+
+
+def _mouse_scroll_delta(payload: object) -> float:
+    sx_f, sy_f = _parse_two_floats(payload)
+    if not np.isnan(sy_f) and not _is_zero(sy_f):
+        return sy_f
+    if not np.isnan(sx_f) and not _is_zero(sx_f):
+        return sx_f
+    return 0.0
+
+
+def _quantize_and_clip(
+    value_f: float,
+    quant_unit_f: float,
+    clip_abs_i: int,
+) -> int:
+    if np.isnan(value_f):
+        return 0
+    quant_i = int(np.rint(value_f / quant_unit_f))
+    return int(np.clip(quant_i, -clip_abs_i, clip_abs_i))
+
+
+def _format_action(
+    mouse_dx_i: int,
+    mouse_dy_i: int,
+    scroll_i: int,
+    pressed_keys_s: set[str],
+) -> str:
+    keys_L = sorted(pressed_keys_s)
+    if mouse_dx_i == 0 and mouse_dy_i == 0 and scroll_i == 0 and not keys_L:
+        return "NO_OP"
+    mouse_s = f"MOUSE:{mouse_dx_i},{mouse_dy_i},{scroll_i}"
+    if not keys_L:
+        return mouse_s
+    return f"{mouse_s} ; {' '.join(keys_L)}"
 
 
 def _get_keylog_path(filename: str) -> Path:
@@ -191,8 +174,9 @@ def _actions_from_keylog_entries(
     if n_frames <= 0:
         return []
 
-    accumulators_d: dict[int, _StepAccumulator] = {}
-    for entry in entries:
+    frame_events_d: dict[int, list[tuple[str, object]]] = {}
+    sortable_events_L: list[tuple[int, int, int, object]] = []
+    for order_i, entry in enumerate(entries):
         if not isinstance(entry, list) or len(entry) < 2:
             continue
 
@@ -206,15 +190,76 @@ def _actions_from_keylog_entries(
         frame_idx_i = (timestamp_i * target_fps) // 1_000_000
         if frame_idx_i < 0 or frame_idx_i >= n_frames:
             continue
-        acc = accumulators_d.get(frame_idx_i)
-        if acc is None:
-            acc = _StepAccumulator()
-            accumulators_d[frame_idx_i] = acc
-        acc.consume(event_tuple)
+        sortable_events_L.append((timestamp_i, order_i, frame_idx_i, event_tuple))
 
-    actions_L = ["NO_OP"] * n_frames
-    for frame_idx_i, acc in accumulators_d.items():
-        actions_L[frame_idx_i] = acc.label()
+    sortable_events_L.sort(key=lambda x: (x[0], x[1]))
+    for _, _, frame_idx_i, event_tuple in sortable_events_L:
+        if not isinstance(event_tuple, list) or len(event_tuple) < 1:
+            continue
+        event_type_s = str(event_tuple[0])
+        payload = event_tuple[1] if len(event_tuple) > 1 else None
+        frame_events_d.setdefault(frame_idx_i, []).append((event_type_s, payload))
+
+    actions_L = []
+    pressed_keys_s: set[str] = set()
+    for frame_idx_i in range(n_frames):
+        mouse_dx_f = 0.0
+        mouse_dy_f = 0.0
+        mouse_scroll_f = 0.0
+        for event_type_s, payload in frame_events_d.get(frame_idx_i, []):
+            if event_type_s == "KeyPress":
+                key_s = _parse_key_name(payload)
+                if key_s != "UNKNOWN_KEY":
+                    pressed_keys_s.add(key_s)
+                continue
+            if event_type_s == "KeyRelease":
+                key_s = _parse_key_name(payload)
+                if key_s != "UNKNOWN_KEY":
+                    pressed_keys_s.discard(key_s)
+                continue
+            if event_type_s == "MousePress":
+                button_s = _parse_button(payload)
+                if button_s != "UNKNOWN_BUTTON":
+                    pressed_keys_s.add(button_s)
+                continue
+            if event_type_s == "MouseRelease":
+                button_s = _parse_button(payload)
+                if button_s != "UNKNOWN_BUTTON":
+                    pressed_keys_s.discard(button_s)
+                continue
+            if event_type_s == "MouseMove":
+                dx_f, dy_f = _parse_two_floats(payload)
+                if not np.isnan(dx_f):
+                    mouse_dx_f += dx_f
+                if not np.isnan(dy_f):
+                    mouse_dy_f += dy_f
+                continue
+            if event_type_s == "MouseScroll":
+                mouse_scroll_f += _mouse_scroll_delta(payload)
+
+        mouse_dx_i = _quantize_and_clip(
+            value_f=mouse_dx_f,
+            quant_unit_f=MOUSE_X_QUANT_UNIT_F,
+            clip_abs_i=MOUSE_DELTA_CLIP_I,
+        )
+        mouse_dy_i = _quantize_and_clip(
+            value_f=mouse_dy_f,
+            quant_unit_f=MOUSE_Y_QUANT_UNIT_F,
+            clip_abs_i=MOUSE_DELTA_CLIP_I,
+        )
+        mouse_scroll_i = _quantize_and_clip(
+            value_f=mouse_scroll_f,
+            quant_unit_f=1.0,
+            clip_abs_i=MOUSE_SCROLL_CLIP_I,
+        )
+        actions_L.append(
+            _format_action(
+                mouse_dx_i=mouse_dx_i,
+                mouse_dy_i=mouse_dy_i,
+                scroll_i=mouse_scroll_i,
+                pressed_keys_s=pressed_keys_s,
+            )
+        )
     return actions_L
 
 
