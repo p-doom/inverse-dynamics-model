@@ -340,6 +340,31 @@ def test_action_accuracy_filter_keeps_original_frame_alignment():
     assert total_n == 1
 
 
+def test_action_accuracy_counts_from_texts_populates_per_class_counts():
+    pred_text = [
+        "Frame 0: NO_OP\nFrame 1: MOUSE_MOVE\nFrame 2: KEY_DOWN:W",
+    ]
+    target_text = [
+        "Frame 0: NO_OP\nFrame 1: MOUSE_MOVE\nFrame 2: KEY_UP:W",
+    ]
+    class_counts = {}
+
+    correct_n, total_n = _TRAIN_MOD._action_accuracy_counts_from_texts(
+        pred_text_B=pred_text,
+        target_text_B=target_text,
+        class_counts_out_d=class_counts,
+    )
+
+    assert correct_n == 2
+    assert total_n == 3
+    assert class_counts["no_op_correct_n"] == 1
+    assert class_counts["no_op_total_n"] == 1
+    assert class_counts["mouse_correct_n"] == 1
+    assert class_counts["mouse_total_n"] == 1
+    assert class_counts["keyboard_correct_n"] == 0
+    assert class_counts["keyboard_total_n"] == 1
+
+
 def test_run_validation_steps_populates_action_type_stats():
     batch0 = {
         "labels": torch.tensor([[-100, 7]], dtype=torch.long),
@@ -369,3 +394,9 @@ def test_run_validation_steps_populates_action_type_stats():
     assert action_stats["target_no_op_n"] == 1
     assert action_stats["target_mouse_n"] == 1
     assert action_stats["target_action_total_n"] == 2
+    assert action_stats["class_no_op_correct_n"] == 0
+    assert action_stats["class_no_op_total_n"] == 1
+    assert action_stats["class_mouse_correct_n"] == 0
+    assert action_stats["class_mouse_total_n"] == 1
+    assert action_stats["class_keyboard_correct_n"] == 0
+    assert action_stats["class_keyboard_total_n"] == 0

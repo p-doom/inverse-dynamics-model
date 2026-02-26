@@ -174,6 +174,15 @@ def _actions_from_target_text(target_s: str) -> list[str]:
     return actions_L
 
 
+def _action_class_s(action_s: str) -> str:
+    action_s = action_s.strip()
+    if action_s == "NO_OP":
+        return "no_op"
+    if "MOUSE_" in action_s:
+        return "mouse"
+    return "keyboard"
+
+
 def _decode_pred_text_B_from_generated_ids(
     generated_ids_BS: torch.Tensor,
     prompt_lens_B: list[int],
@@ -203,20 +212,36 @@ def _action_accuracy_counts_from_texts(
     pred_text_B: list[str],
     target_text_B: list[str],
     action_is_counted_fn: Callable[[str], bool] | None = None,
+    class_counts_out_d: dict[str, int] | None = None,
 ) -> tuple[int, int]:
     correct_n = 0
     total_n = 0
     if action_is_counted_fn is None:
         action_is_counted_fn = lambda _: True
+    if class_counts_out_d is not None:
+        class_counts_out_d.setdefault("no_op_correct_n", 0)
+        class_counts_out_d.setdefault("no_op_total_n", 0)
+        class_counts_out_d.setdefault("mouse_correct_n", 0)
+        class_counts_out_d.setdefault("mouse_total_n", 0)
+        class_counts_out_d.setdefault("keyboard_correct_n", 0)
+        class_counts_out_d.setdefault("keyboard_total_n", 0)
     for pred_s, target_s in zip(pred_text_B, target_text_B):
         pred_actions_L = _actions_from_target_text(pred_s)
         target_actions_L = _actions_from_target_text(target_s)
         for idx_i, target_action_s in enumerate(target_actions_L):
             if not action_is_counted_fn(target_action_s):
                 continue
+            action_class_s = _action_class_s(target_action_s)
             total_n += 1
-            if idx_i < len(pred_actions_L) and pred_actions_L[idx_i] == target_action_s:
+            if class_counts_out_d is not None:
+                class_counts_out_d[f"{action_class_s}_total_n"] += 1
+            is_correct_b = (
+                idx_i < len(pred_actions_L) and pred_actions_L[idx_i] == target_action_s
+            )
+            if is_correct_b:
                 correct_n += 1
+                if class_counts_out_d is not None:
+                    class_counts_out_d[f"{action_class_s}_correct_n"] += 1
     return correct_n, total_n
 
 
@@ -282,6 +307,7 @@ def _run_validation_steps(
     val_target_no_op_n = 0
     val_target_mouse_n = 0
     val_target_action_total_n = 0
+    val_action_class_counts_d: dict[str, int] = {}
 
     with torch.no_grad():
         for _ in range(val_steps):
@@ -351,6 +377,7 @@ def _run_validation_steps(
             correct_i, total_i = _action_accuracy_counts_from_texts(
                 pred_text_B=pred_text_B,
                 target_text_B=target_text_L,
+                class_counts_out_d=val_action_class_counts_d,
             )
             pred_no_op_i, pred_mouse_i, pred_total_i = _action_type_counts_from_texts(
                 pred_text_B
@@ -378,6 +405,24 @@ def _run_validation_steps(
         action_stats_out_d["target_no_op_n"] = val_target_no_op_n
         action_stats_out_d["target_mouse_n"] = val_target_mouse_n
         action_stats_out_d["target_action_total_n"] = val_target_action_total_n
+        action_stats_out_d["class_no_op_correct_n"] = val_action_class_counts_d.get(
+            "no_op_correct_n", 0
+        )
+        action_stats_out_d["class_no_op_total_n"] = val_action_class_counts_d.get(
+            "no_op_total_n", 0
+        )
+        action_stats_out_d["class_mouse_correct_n"] = val_action_class_counts_d.get(
+            "mouse_correct_n", 0
+        )
+        action_stats_out_d["class_mouse_total_n"] = val_action_class_counts_d.get(
+            "mouse_total_n", 0
+        )
+        action_stats_out_d["class_keyboard_correct_n"] = val_action_class_counts_d.get(
+            "keyboard_correct_n", 0
+        )
+        action_stats_out_d["class_keyboard_total_n"] = val_action_class_counts_d.get(
+            "keyboard_total_n", 0
+        )
     return (
         val_loss_f,
         val_tok_n,
@@ -940,6 +985,30 @@ def main() -> None:
                         float(val_action_stats_d.get("target_action_total_n", 0)),
                         device=device,
                     )
+                    val_class_no_op_correct_t = torch.tensor(
+                        float(val_action_stats_d.get("class_no_op_correct_n", 0)),
+                        device=device,
+                    )
+                    val_class_no_op_total_t = torch.tensor(
+                        float(val_action_stats_d.get("class_no_op_total_n", 0)),
+                        device=device,
+                    )
+                    val_class_mouse_correct_t = torch.tensor(
+                        float(val_action_stats_d.get("class_mouse_correct_n", 0)),
+                        device=device,
+                    )
+                    val_class_mouse_total_t = torch.tensor(
+                        float(val_action_stats_d.get("class_mouse_total_n", 0)),
+                        device=device,
+                    )
+                    val_class_keyboard_correct_t = torch.tensor(
+                        float(val_action_stats_d.get("class_keyboard_correct_n", 0)),
+                        device=device,
+                    )
+                    val_class_keyboard_total_t = torch.tensor(
+                        float(val_action_stats_d.get("class_keyboard_total_n", 0)),
+                        device=device,
+                    )
                     if world_i > 1:
                         dist.all_reduce(val_loss_num_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_tok_t, op=dist.ReduceOp.SUM)
@@ -951,6 +1020,18 @@ def main() -> None:
                         dist.all_reduce(val_target_no_op_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_target_mouse_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_target_action_total_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_class_no_op_correct_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_class_no_op_total_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_class_mouse_correct_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_class_mouse_total_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(
+                            val_class_keyboard_correct_t,
+                            op=dist.ReduceOp.SUM,
+                        )
+                        dist.all_reduce(
+                            val_class_keyboard_total_t,
+                            op=dist.ReduceOp.SUM,
+                        )
                     val_loss_t = val_loss_num_t / torch.clamp(val_tok_t, min=1.0)
                     val_dt = max(time.time() - val_t0, 1e-9)
                     val_toks_per_s = val_tok_t.item() / val_dt
@@ -969,6 +1050,18 @@ def main() -> None:
                     val_target_mouse_rate_f = val_target_mouse_t.item() / max(
                         val_target_action_total_t.item(), 1.0
                     )
+                    val_action_acc_no_op_f = val_class_no_op_correct_t.item() / max(
+                        val_class_no_op_total_t.item(),
+                        1.0,
+                    )
+                    val_action_acc_mouse_f = val_class_mouse_correct_t.item() / max(
+                        val_class_mouse_total_t.item(),
+                        1.0,
+                    )
+                    val_action_acc_keyboard_f = (
+                        val_class_keyboard_correct_t.item()
+                        / max(val_class_keyboard_total_t.item(), 1.0)
+                    )
                     if rank_i == 0:
                         print(
                             f"step={global_step} val_loss={val_loss_t.item():.6f} "
@@ -977,7 +1070,10 @@ def main() -> None:
                             f"val_pred_no_op_rate={val_pred_no_op_rate_f:.4f} "
                             f"val_target_no_op_rate={val_target_no_op_rate_f:.4f} "
                             f"val_pred_mouse_rate={val_pred_mouse_rate_f:.4f} "
-                            f"val_target_mouse_rate={val_target_mouse_rate_f:.4f}"
+                            f"val_target_mouse_rate={val_target_mouse_rate_f:.4f} "
+                            f"val_action_acc_no_op={val_action_acc_no_op_f:.4f} "
+                            f"val_action_acc_mouse={val_action_acc_mouse_f:.4f} "
+                            f"val_action_acc_keyboard={val_action_acc_keyboard_f:.4f}"
                         )
                         if val_examples_L:
                             for ex_i, (pred_s, target_s) in enumerate(
@@ -1007,6 +1103,12 @@ def main() -> None:
                                     "val/target_mouse_rate": val_target_mouse_rate_f,
                                     "val/pred_action_total": val_pred_action_total_t.item(),
                                     "val/target_action_total": val_target_action_total_t.item(),
+                                    "val/action_acc_no_op": val_action_acc_no_op_f,
+                                    "val/action_acc_mouse": val_action_acc_mouse_f,
+                                    "val/action_acc_keyboard": val_action_acc_keyboard_f,
+                                    "val/action_total_no_op": val_class_no_op_total_t.item(),
+                                    "val/action_total_mouse": val_class_mouse_total_t.item(),
+                                    "val/action_total_keyboard": val_class_keyboard_total_t.item(),
                                 },
                                 step=global_step,
                             )
