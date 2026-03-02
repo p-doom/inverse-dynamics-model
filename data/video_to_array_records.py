@@ -3,6 +3,7 @@ import multiprocessing as mp
 import os
 import pickle
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,7 +19,7 @@ It splits videos into chunks of a specified size and saves them in a specified o
 The script uses multiprocessing to handle multiple videos concurrently and generates metadata for the processed videos.
 """
 
-RECORDING_RE = re.compile(r"^recording_([0-9a-fA-F-]+)_seg(\d+)\.mp4$")
+RECORDING_RE = re.compile(r"^recording_([0-9a-fA-F-]+)_seg(\d+)(_filtered)?\.mp4$")
 KEY_NAME_MAP = {
     "Return": "Enter",
     "Escape": "Esc",
@@ -47,6 +48,7 @@ MOUSE_X_QUANT_UNIT_F = 5.0
 MOUSE_Y_QUANT_UNIT_F = 4.0
 MOUSE_DELTA_CLIP_I = 1000
 MOUSE_SCROLL_CLIP_I = 5
+DEFAULT_IDENTICAL_NOOP_MAD_THRESHOLD_F = 0.01
 
 
 @dataclass
@@ -64,9 +66,12 @@ class Args:
     chunk_size: int = 160
     chunks_per_file: int = 100
     filter_pure_noop_chunks: bool = False
+    filter_identical_noop_frames: bool = False
+    identical_noop_mad_threshold: float = DEFAULT_IDENTICAL_NOOP_MAD_THRESHOLD_F
     seed: int = 0
     num_workers: int = 0
     max_videos: int = 0
+    decode_timeout_sec: int = 0
 
 
 def _normalize_key_name(name_s: str) -> str:
@@ -159,10 +164,11 @@ def _get_keylog_path(filename: str) -> Path:
     ), f"Invalid recording filename: {filename}. Expected recording_<session-id>_seg####.mp4"
     session_id_s = match.group(1)
     seg_idx_i = int(match.group(2))
+    filtered_suffix_s = str(match.group(3) or "")
     return (
         Path(filename).parent.parent
         / "keylogs"
-        / (f"input_{session_id_s}_seg{seg_idx_i:04d}.msgpack")
+        / (f"input_{session_id_s}_seg{seg_idx_i:04d}{filtered_suffix_s}.msgpack")
     )
 
 
@@ -406,6 +412,9 @@ def preprocess_video(
     top_bar_fraction,
     black_ratio,
     filter_pure_noop_chunks=False,
+    filter_identical_noop_frames: bool = False,
+    identical_noop_mad_threshold: float = DEFAULT_IDENTICAL_NOOP_MAD_THRESHOLD_F,
+    decode_timeout_sec: int = 0,
 ):
     """
     Preprocess a video file by reading it, resizing, changing its frame rate,
@@ -428,7 +437,7 @@ def preprocess_video(
     in_filename = str(video_info["filename"])
     print(f"Processing video {idx}, Filename: {in_filename}")
     try:
-        out, _ = (
+        decode_stream = (
             ffmpeg.input(in_filename)
             .filter("fps", fps=target_fps, round="up")
             .filter(
@@ -439,8 +448,29 @@ def preprocess_video(
             )
             .filter("pad", target_width, target_height, "(ow-iw)/2", "(oh-ih)/2")
             .output("pipe:", format="rawvideo", pix_fmt="rgb24")
-            .run(capture_stdout=True, quiet=True)
         )
+        if decode_timeout_sec > 0:
+            process = decode_stream.run_async(
+                pipe_stdout=True,
+                pipe_stderr=True,
+                quiet=True,
+            )
+            try:
+                out, err = process.communicate(timeout=float(decode_timeout_sec))
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                return [], _failed_result(
+                    video_info,
+                    f"decode_timeout:{int(decode_timeout_sec)}s",
+                )
+            if process.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg exited with code {process.returncode}: "
+                    f"{err.decode('utf-8', errors='ignore')[:200]}"
+                )
+        else:
+            out, _ = decode_stream.run(capture_stdout=True, quiet=True)
 
         frame_size = target_height * target_width * 3
         n_frames = len(out) // frame_size
@@ -458,6 +488,12 @@ def preprocess_video(
             n_frames=n_frames,
             target_fps=target_fps,
         )
+        if filter_identical_noop_frames:
+            frames, actions = _filter_identical_noop_frames(
+                frames=frames,
+                actions=actions,
+                mad_threshold_f=identical_noop_mad_threshold,
+            )
 
         segments = _filter_black_frames(
             frames=frames,
@@ -509,26 +545,36 @@ def _process_video_shard(
     shard_results: list[dict[str, object]] = []
 
     for video_arg in shard_args:
-        idx = int(video_arg[0])
-        video_info = video_arg[1]
-        target_width = int(video_arg[3])
-        target_height = int(video_arg[4])
-        target_fps = int(video_arg[5])
-        chunk_size = int(video_arg[6])
-        top_bar_fraction = float(video_arg[8]) if len(video_arg) > 8 else 0.15
-        black_ratio = float(video_arg[9]) if len(video_arg) > 9 else 0.95
-        filter_pure_noop_chunks = bool(video_arg[10]) if len(video_arg) > 10 else False
+        (
+            idx,
+            video_info,
+            _output_folder,
+            target_width,
+            target_height,
+            target_fps,
+            chunk_size,
+            _chunks_per_file,
+            top_bar_fraction,
+            black_ratio,
+            filter_pure_noop_chunks,
+            filter_identical_noop_frames,
+            identical_noop_mad_threshold,
+            decode_timeout_sec,
+        ) = video_arg
 
         chunk_records, failed_rows = preprocess_video(
-            idx=idx,
+            idx=int(idx),
             video_info=video_info,
-            target_width=target_width,
-            target_height=target_height,
-            target_fps=target_fps,
-            chunk_size=chunk_size,
-            top_bar_fraction=top_bar_fraction,
-            black_ratio=black_ratio,
-            filter_pure_noop_chunks=filter_pure_noop_chunks,
+            target_width=int(target_width),
+            target_height=int(target_height),
+            target_fps=int(target_fps),
+            chunk_size=int(chunk_size),
+            top_bar_fraction=float(top_bar_fraction),
+            black_ratio=float(black_ratio),
+            filter_pure_noop_chunks=bool(filter_pure_noop_chunks),
+            filter_identical_noop_frames=bool(filter_identical_noop_frames),
+            identical_noop_mad_threshold=float(identical_noop_mad_threshold),
+            decode_timeout_sec=int(decode_timeout_sec),
         )
         if failed_rows:
             shard_results.extend(failed_rows)
@@ -651,6 +697,62 @@ def _filter_black_frames(
     return segments
 
 
+def _frame_mad_f(lhs_frame: np.ndarray, rhs_frame: np.ndarray) -> float:
+    return float(
+        np.mean(np.abs(lhs_frame.astype(np.int16) - rhs_frame.astype(np.int16)))
+    )
+
+
+def _filter_identical_noop_frames(
+    frames: np.ndarray,
+    actions: list[str] | None,
+    mad_threshold_f: float = DEFAULT_IDENTICAL_NOOP_MAD_THRESHOLD_F,
+) -> tuple[np.ndarray, list[str] | None]:
+    if actions is None:
+        return frames, actions
+    if len(actions) != len(frames):
+        raise ValueError(
+            f"Action length mismatch: len(actions)={len(actions)} != frames={len(frames)}"
+        )
+    if mad_threshold_f < 0.0:
+        raise ValueError(f"mad_threshold_f must be non-negative, got {mad_threshold_f}")
+
+    n_frames = len(frames)
+    if n_frames <= 2:
+        return frames, actions
+
+    keep_mask = np.ones(n_frames, dtype=bool)
+    idx = 0
+    while idx < n_frames:
+        if actions[idx] != "NO_OP":
+            idx += 1
+            continue
+
+        run_end = idx
+        while run_end + 1 < n_frames:
+            next_idx = run_end + 1
+            if actions[next_idx] != "NO_OP":
+                break
+            mad_f = _frame_mad_f(frames[next_idx], frames[run_end])
+            if mad_f > mad_threshold_f:
+                break
+            run_end = next_idx
+
+        run_len = run_end - idx + 1
+        if run_len > 2:
+            keep_mask[idx + 1 : run_end] = False
+        idx = run_end + 1
+
+    if keep_mask.all():
+        return frames, actions
+
+    filtered_frames = frames[keep_mask]
+    filtered_actions = [
+        action_s for action_s, keep_b in zip(actions, keep_mask) if bool(keep_b)
+    ]
+    return filtered_frames, filtered_actions
+
+
 def save_split(pool_args, num_workers: int):
     if not pool_args:
         return []
@@ -734,6 +836,9 @@ def main():
     assert np.isclose(total_ratio, 1.0), "Ratios must sum to 1.0"
     assert 0.0 <= args.top_bar_fraction < 1.0, "top_bar_fraction must be in [0, 1)"
     assert 0.0 <= args.black_ratio <= 1.0, "black_ratio must be in [0, 1]"
+    assert (
+        args.identical_noop_mad_threshold >= 0.0
+    ), "identical_noop_mad_threshold must be non-negative"
 
     print("Converting video to array_record files...")
     input_files = _collect_input_videos(args.input_path)
@@ -770,6 +875,9 @@ def main():
                     args.top_bar_fraction,
                     args.black_ratio,
                     args.filter_pure_noop_chunks,
+                    args.filter_identical_noop_frames and split == "train",
+                    args.identical_noop_mad_threshold,
+                    args.decode_timeout_sec,
                 )
             )
 
@@ -808,6 +916,8 @@ def main():
         "black_ratio": args.black_ratio,
         "chunk_size": args.chunk_size,
         "filter_pure_noop_chunks": args.filter_pure_noop_chunks,
+        "filter_identical_noop_frames_train": args.filter_identical_noop_frames,
+        "identical_noop_mad_threshold": args.identical_noop_mad_threshold,
         "total_chunks": len(results),
         "total_video_chunks": total_video_chunks,
         "total_videos": len(input_files),

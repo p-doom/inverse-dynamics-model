@@ -7,6 +7,7 @@ import importlib.util
 from array_record.python.array_record_module import ArrayRecordReader
 import msgpack
 import numpy as np
+import pytest
 
 _MODULE_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "video_to_array_records.py"
@@ -22,6 +23,7 @@ _chunk_video_records = _MODULE._chunk_video_records
 _write_chunk_records = _MODULE._write_chunk_records
 _get_keylog_path = _MODULE._get_keylog_path
 _filter_black_frames = _MODULE._filter_black_frames
+_filter_identical_noop_frames = _MODULE._filter_identical_noop_frames
 
 
 def test_get_keylog_path() -> None:
@@ -29,6 +31,16 @@ def test_get_keylog_path() -> None:
     out_p = _get_keylog_path(filename_s)
     assert out_p == Path(
         "/tmp/uploads/0.1.0/u123/keylogs/input_abc-def_seg0007.msgpack"
+    )
+
+
+def test_get_keylog_path_accepts_filtered_suffix() -> None:
+    filename_s = (
+        "/tmp/uploads/0.1.0/u123/recordings/recording_abc-def_seg0007_filtered.mp4"
+    )
+    out_p = _get_keylog_path(filename_s)
+    assert out_p == Path(
+        "/tmp/uploads/0.1.0/u123/keylogs/input_abc-def_seg0007_filtered.msgpack"
     )
 
 
@@ -240,6 +252,137 @@ def test_filter_black_frames_ignores_top_bar_fraction() -> None:
     assert with_crop_segments[1][1] == ["a2"]
 
 
+def test_filter_identical_noop_frames_keeps_run_boundaries() -> None:
+    frames_THWC = np.zeros((7, 2, 2, 3), dtype=np.uint8)
+    frames_THWC[0] = 10
+    frames_THWC[1] = 20
+    frames_THWC[2] = 20
+    frames_THWC[3] = 20
+    frames_THWC[4] = 30
+    frames_THWC[5] = 30
+    frames_THWC[6] = 30
+    actions_L = [
+        "MOUSE:0,0,0 ; W",
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+    ]
+
+    out_frames, out_actions = _filter_identical_noop_frames(frames_THWC, actions_L)
+
+    assert out_actions == [
+        "MOUSE:0,0,0 ; W",
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+        "NO_OP",
+    ]
+    assert out_frames.shape[0] == len(out_actions)
+    assert np.array_equal(out_frames[1], out_frames[2])
+    assert np.array_equal(out_frames[3], out_frames[4])
+
+
+def test_filter_identical_noop_frames_keeps_non_noop_identical_frames() -> None:
+    frames_THWC = np.zeros((4, 2, 2, 3), dtype=np.uint8)
+    actions_L = [
+        "MOUSE:0,0,0 ; Ctrl",
+        "MOUSE:0,0,0 ; Ctrl",
+        "NO_OP",
+        "NO_OP",
+    ]
+
+    out_frames, out_actions = _filter_identical_noop_frames(frames_THWC, actions_L)
+
+    assert out_actions == actions_L
+    assert out_frames.shape[0] == 4
+
+
+def test_filter_identical_noop_frames_uses_mad_tolerance() -> None:
+    frames_THWC = np.zeros((5, 10, 10, 3), dtype=np.uint8)
+    frames_THWC[0] = 10
+    frames_THWC[1] = 20
+    frames_THWC[2] = frames_THWC[1]
+    frames_THWC[2, 0, 0, 0] = 21  # MAD ~= 0.0033
+    frames_THWC[3] = frames_THWC[2]
+    frames_THWC[4] = 30
+    actions_L = ["MOUSE:0,0,0 ; W", "NO_OP", "NO_OP", "NO_OP", "MOUSE:0,0,0 ; Ctrl"]
+
+    out_frames, out_actions = _filter_identical_noop_frames(
+        frames_THWC, actions_L, mad_threshold_f=0.01
+    )
+
+    assert out_actions == [
+        "MOUSE:0,0,0 ; W",
+        "NO_OP",
+        "NO_OP",
+        "MOUSE:0,0,0 ; Ctrl",
+    ]
+    assert out_frames.shape[0] == len(out_actions)
+
+
+def test_filter_identical_noop_frames_tolerance_is_configurable() -> None:
+    frames_THWC = np.zeros((4, 10, 10, 3), dtype=np.uint8)
+    frames_THWC[1] = 20
+    frames_THWC[2] = frames_THWC[1]
+    frames_THWC[2, 0, 0, 0] = 21  # MAD ~= 0.0033
+    actions_L = ["NO_OP", "NO_OP", "NO_OP", "NO_OP"]
+
+    out_frames, out_actions = _filter_identical_noop_frames(
+        frames_THWC, actions_L, mad_threshold_f=0.001
+    )
+
+    assert out_actions == actions_L
+    assert out_frames.shape[0] == len(actions_L)
+
+
+def test_filter_identical_noop_frames_does_not_drop_meaningful_changes() -> None:
+    frames_THWC = np.zeros((4, 10, 10, 3), dtype=np.uint8)
+    frames_THWC[2, :, :, 0] = 40  # MAD ~= 13.33
+    actions_L = ["NO_OP", "NO_OP", "NO_OP", "NO_OP"]
+
+    out_frames, out_actions = _filter_identical_noop_frames(
+        frames_THWC, actions_L, mad_threshold_f=0.01
+    )
+
+    assert out_actions == actions_L
+    assert out_frames.shape[0] == len(actions_L)
+
+
+def test_filter_identical_noop_frames_rejects_negative_tolerance() -> None:
+    frames_THWC = np.zeros((3, 2, 2, 3), dtype=np.uint8)
+    actions_L = ["NO_OP", "NO_OP", "NO_OP"]
+
+    with pytest.raises(ValueError, match="mad_threshold_f must be non-negative"):
+        _filter_identical_noop_frames(frames_THWC, actions_L, mad_threshold_f=-0.1)
+
+
+def test_chunk_video_records_after_identical_noop_filter_keeps_fixed_sequence_length() -> (
+    None
+):
+    frames_THWC = np.zeros((10, 2, 2, 3), dtype=np.uint8)
+    frames_THWC[0] = 10
+    frames_THWC[9] = 11
+    actions_L = ["MOUSE:0,0,0 ; W"] + ["NO_OP"] * 8 + ["MOUSE:0,0,0 ; Ctrl"]
+    video_info_d = {"filename": "/tmp/v.mp4", "path": "x/v.mp4"}
+
+    filtered_frames, filtered_actions = _filter_identical_noop_frames(
+        frames_THWC, actions_L
+    )
+    chunks_L = _chunk_video_records(
+        video_tensor=filtered_frames,
+        video_info=video_info_d,
+        chunk_size=4,
+        actions=filtered_actions,
+    )
+
+    assert len(chunks_L) == 1
+    assert int(chunks_L[0]["sequence_length"]) == 4
+    assert len(chunks_L[0]["actions"]) == 4
+
+
 def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
     original_preprocess = _MODULE.preprocess_video
     seen_filter_flags: list[bool] = []
@@ -254,6 +397,9 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
         top_bar_fraction: float,
         black_ratio: float,
         filter_pure_noop_chunks: bool = False,
+        filter_identical_noop_frames: bool = False,
+        identical_noop_mad_threshold: float = 0.01,
+        decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
             idx,
@@ -263,6 +409,9 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
             chunk_size,
             top_bar_fraction,
             black_ratio,
+            filter_identical_noop_frames,
+            identical_noop_mad_threshold,
+            decode_timeout_sec,
         )
         seen_filter_flags.append(filter_pure_noop_chunks)
         chunk_d = {
@@ -287,6 +436,10 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
                 4,
                 0.15,
                 0.95,
+                False,
+                False,
+                0.01,
+                0,
             ),
             (
                 1,
@@ -299,6 +452,10 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
                 4,
                 0.15,
                 0.95,
+                False,
+                False,
+                0.01,
+                0,
             ),
         ]
         out_rows_L = _MODULE._process_video_shard(worker_idx=0, shard_args=shard_args)
@@ -330,6 +487,9 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
         top_bar_fraction: float,
         black_ratio: float,
         filter_pure_noop_chunks: bool = False,
+        filter_identical_noop_frames: bool = False,
+        identical_noop_mad_threshold: float = 0.01,
+        decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
             idx,
@@ -340,6 +500,9 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
             chunk_size,
             top_bar_fraction,
             black_ratio,
+            filter_identical_noop_frames,
+            identical_noop_mad_threshold,
+            decode_timeout_sec,
         )
         seen_filter_flags.append(filter_pure_noop_chunks)
         return [], []
@@ -361,6 +524,9 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
                     0.15,
                     0.95,
                     True,
+                    False,
+                    0.01,
+                    0,
                 )
             ],
         )
@@ -368,3 +534,196 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
         _MODULE.preprocess_video = original_preprocess
 
     assert seen_filter_flags == [True]
+
+
+def test_process_video_shard_forwards_filter_identical_noop_flag(
+    tmp_path: Path,
+) -> None:
+    original_preprocess = _MODULE.preprocess_video
+    seen_filter_flags: list[bool] = []
+
+    def _fake_preprocess(
+        idx: int,
+        video_info: dict[str, object],
+        target_width: int,
+        target_height: int,
+        target_fps: int,
+        chunk_size: int,
+        top_bar_fraction: float,
+        black_ratio: float,
+        filter_pure_noop_chunks: bool = False,
+        filter_identical_noop_frames: bool = False,
+        identical_noop_mad_threshold: float = 0.01,
+        decode_timeout_sec: int = 0,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        del (
+            idx,
+            video_info,
+            target_width,
+            target_height,
+            target_fps,
+            chunk_size,
+            top_bar_fraction,
+            black_ratio,
+            filter_pure_noop_chunks,
+            identical_noop_mad_threshold,
+            decode_timeout_sec,
+        )
+        seen_filter_flags.append(filter_identical_noop_frames)
+        return [], []
+
+    try:
+        _MODULE.preprocess_video = _fake_preprocess
+        _MODULE._process_video_shard(
+            worker_idx=0,
+            shard_args=[
+                (
+                    0,
+                    {"filename": "/a.mp4", "path": "/abs/a.mp4"},
+                    str(tmp_path),
+                    160,
+                    90,
+                    10,
+                    4,
+                    4,
+                    0.15,
+                    0.95,
+                    False,
+                    True,
+                    0.01,
+                    0,
+                )
+            ],
+        )
+    finally:
+        _MODULE.preprocess_video = original_preprocess
+
+    assert seen_filter_flags == [True]
+
+
+def test_process_video_shard_forwards_decode_timeout(tmp_path: Path) -> None:
+    original_preprocess = _MODULE.preprocess_video
+    seen_decode_timeouts: list[int] = []
+
+    def _fake_preprocess(
+        idx: int,
+        video_info: dict[str, object],
+        target_width: int,
+        target_height: int,
+        target_fps: int,
+        chunk_size: int,
+        top_bar_fraction: float,
+        black_ratio: float,
+        filter_pure_noop_chunks: bool = False,
+        filter_identical_noop_frames: bool = False,
+        identical_noop_mad_threshold: float = 0.01,
+        decode_timeout_sec: int = 0,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        del (
+            idx,
+            video_info,
+            target_width,
+            target_height,
+            target_fps,
+            chunk_size,
+            top_bar_fraction,
+            black_ratio,
+            filter_pure_noop_chunks,
+            filter_identical_noop_frames,
+            identical_noop_mad_threshold,
+        )
+        seen_decode_timeouts.append(int(decode_timeout_sec))
+        return [], []
+
+    try:
+        _MODULE.preprocess_video = _fake_preprocess
+        _MODULE._process_video_shard(
+            worker_idx=0,
+            shard_args=[
+                (
+                    0,
+                    {"filename": "/a.mp4", "path": "/abs/a.mp4"},
+                    str(tmp_path),
+                    160,
+                    90,
+                    10,
+                    4,
+                    4,
+                    0.15,
+                    0.95,
+                    False,
+                    False,
+                    0.01,
+                    123,
+                )
+            ],
+        )
+    finally:
+        _MODULE.preprocess_video = original_preprocess
+
+    assert seen_decode_timeouts == [123]
+
+
+def test_process_video_shard_forwards_identical_noop_mad_threshold(
+    tmp_path: Path,
+) -> None:
+    original_preprocess = _MODULE.preprocess_video
+    seen_thresholds: list[float] = []
+
+    def _fake_preprocess(
+        idx: int,
+        video_info: dict[str, object],
+        target_width: int,
+        target_height: int,
+        target_fps: int,
+        chunk_size: int,
+        top_bar_fraction: float,
+        black_ratio: float,
+        filter_pure_noop_chunks: bool = False,
+        filter_identical_noop_frames: bool = False,
+        identical_noop_mad_threshold: float = 0.01,
+        decode_timeout_sec: int = 0,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        del (
+            idx,
+            video_info,
+            target_width,
+            target_height,
+            target_fps,
+            chunk_size,
+            top_bar_fraction,
+            black_ratio,
+            filter_pure_noop_chunks,
+            filter_identical_noop_frames,
+            decode_timeout_sec,
+        )
+        seen_thresholds.append(float(identical_noop_mad_threshold))
+        return [], []
+
+    try:
+        _MODULE.preprocess_video = _fake_preprocess
+        _MODULE._process_video_shard(
+            worker_idx=0,
+            shard_args=[
+                (
+                    0,
+                    {"filename": "/a.mp4", "path": "/abs/a.mp4"},
+                    str(tmp_path),
+                    160,
+                    90,
+                    10,
+                    4,
+                    4,
+                    0.15,
+                    0.95,
+                    False,
+                    True,
+                    0.0125,
+                    0,
+                )
+            ],
+        )
+    finally:
+        _MODULE.preprocess_video = original_preprocess
+
+    assert seen_thresholds == [0.0125]
