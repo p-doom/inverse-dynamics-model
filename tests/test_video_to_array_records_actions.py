@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import pickle
 from pathlib import Path
 import importlib.util
@@ -7,6 +8,7 @@ import importlib.util
 from array_record.python.array_record_module import ArrayRecordReader
 import msgpack
 import numpy as np
+from PIL import Image
 
 _MODULE_PATH = (
     Path(__file__).resolve().parents[1] / "data" / "video_to_array_records.py"
@@ -21,7 +23,22 @@ _actions_from_keylog_file = _MODULE._actions_from_keylog_file
 _chunk_video_records = _MODULE._chunk_video_records
 _write_chunk_records = _MODULE._write_chunk_records
 _get_keylog_path = _MODULE._get_keylog_path
-_filter_black_frames = _MODULE._filter_black_frames
+
+
+def _jpeg_encode_frame(frame: np.ndarray, quality: int = 85) -> bytes:
+    buf = io.BytesIO()
+    Image.fromarray(frame).save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def _make_jpeg_chunk(frames_THWC: np.ndarray, actions: list[str], path: str) -> dict:
+    T = frames_THWC.shape[0]
+    return {
+        "jpeg_frames": [_jpeg_encode_frame(frames_THWC[t]) for t in range(T)],
+        "sequence_length": T,
+        "actions": actions,
+        "path": path,
+    }
 
 
 def test_get_keylog_path() -> None:
@@ -184,18 +201,16 @@ def test_chunk_video_records_keeps_pure_noop_chunks_by_default() -> None:
 
 
 def test_write_chunk_records_can_mix_multiple_videos(tmp_path: Path) -> None:
-    chunk0_d = {
-        "raw_video": np.zeros((4, 2, 2, 3), dtype=np.uint8).tobytes(),
-        "sequence_length": 4,
-        "actions": ["a0", "a1", "a2", "a3"],
-        "path": "/abs/v0.mp4",
-    }
-    chunk1_d = {
-        "raw_video": np.ones((4, 2, 2, 3), dtype=np.uint8).tobytes(),
-        "sequence_length": 4,
-        "actions": ["b0", "b1", "b2", "b3"],
-        "path": "/abs/v1.mp4",
-    }
+    chunk0_d = _make_jpeg_chunk(
+        np.zeros((4, 2, 2, 3), dtype=np.uint8),
+        ["a0", "a1", "a2", "a3"],
+        "/abs/v0.mp4",
+    )
+    chunk1_d = _make_jpeg_chunk(
+        np.ones((4, 2, 2, 3), dtype=np.uint8),
+        ["b0", "b1", "b2", "b3"],
+        "/abs/v1.mp4",
+    )
     out_rows_L = _write_chunk_records(
         chunk_records=[chunk0_d, chunk1_d],
         output_folder=str(tmp_path),
@@ -214,32 +229,6 @@ def test_write_chunk_records_can_mix_multiple_videos(tmp_path: Path) -> None:
     assert {rec0_d["path"], rec1_d["path"]} == {"/abs/v0.mp4", "/abs/v1.mp4"}
 
 
-def test_filter_black_frames_ignores_top_bar_fraction() -> None:
-    frames_THWC = np.full((3, 4, 4, 3), 255, dtype=np.uint8)
-    frames_THWC[1, 1:, :, :] = 0
-    actions_L = ["a0", "a1", "a2"]
-
-    no_crop_segments = _filter_black_frames(
-        frames=frames_THWC,
-        actions=actions_L,
-        threshold=10.0,
-        black_ratio=0.95,
-        top_bar_fraction=0.0,
-    )
-    with_crop_segments = _filter_black_frames(
-        frames=frames_THWC,
-        actions=actions_L,
-        threshold=10.0,
-        black_ratio=0.95,
-        top_bar_fraction=0.25,
-    )
-
-    assert len(no_crop_segments) == 1
-    assert len(with_crop_segments) == 2
-    assert with_crop_segments[0][1] == ["a0"]
-    assert with_crop_segments[1][1] == ["a2"]
-
-
 def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
     original_preprocess = _MODULE.preprocess_video
     seen_filter_flags: list[bool] = []
@@ -251,9 +240,8 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
         target_height: int,
         target_fps: int,
         chunk_size: int,
-        top_bar_fraction: float,
-        black_ratio: float,
         filter_pure_noop_chunks: bool = False,
+        **kwargs,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
             idx,
@@ -261,16 +249,14 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
             target_height,
             target_fps,
             chunk_size,
-            top_bar_fraction,
-            black_ratio,
+            kwargs,
         )
         seen_filter_flags.append(filter_pure_noop_chunks)
-        chunk_d = {
-            "raw_video": np.zeros((4, 2, 2, 3), dtype=np.uint8).tobytes(),
-            "sequence_length": 4,
-            "actions": ["x0", "x1", "x2", "x3"],
-            "path": str(video_info["path"]),
-        }
+        chunk_d = _make_jpeg_chunk(
+            np.zeros((4, 2, 2, 3), dtype=np.uint8),
+            ["x0", "x1", "x2", "x3"],
+            str(video_info["path"]),
+        )
         return [chunk_d], []
 
     try:
@@ -285,8 +271,6 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
                 10,
                 4,
                 4,
-                0.15,
-                0.95,
             ),
             (
                 1,
@@ -297,8 +281,6 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
                 10,
                 4,
                 4,
-                0.15,
-                0.95,
             ),
         ]
         out_rows_L = _MODULE._process_video_shard(worker_idx=0, shard_args=shard_args)
@@ -327,9 +309,8 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
         target_height: int,
         target_fps: int,
         chunk_size: int,
-        top_bar_fraction: float,
-        black_ratio: float,
         filter_pure_noop_chunks: bool = False,
+        **kwargs,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
             idx,
@@ -338,8 +319,7 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
             target_height,
             target_fps,
             chunk_size,
-            top_bar_fraction,
-            black_ratio,
+            kwargs,
         )
         seen_filter_flags.append(filter_pure_noop_chunks)
         return [], []
@@ -358,8 +338,6 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
                     10,
                     4,
                     4,
-                    0.15,
-                    0.95,
                     True,
                 )
             ],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import io
 import os
 import pickle
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 from array_record.python.array_record_module import ArrayRecordReader
 import grain
 import numpy as np
+from PIL import Image
 
 
 def derive_record_key(rec_d: dict[str, Any]) -> str:
@@ -19,52 +21,32 @@ def derive_record_key(rec_d: dict[str, Any]) -> str:
 
 
 class EpisodeLengthFilter(grain.transforms.Filter):
-    def __init__(
-        self,
-        seq_len: int,
-        image_h: int,
-        image_w: int,
-        image_c: int = 3,
-    ):
+    def __init__(self, seq_len: int):
         self.seq_len = seq_len
-        self.image_h = image_h
-        self.image_w = image_w
-        self.image_c = image_c
 
     def filter(self, element: Any) -> bool:
         try:
             rec_d = pickle.loads(element)
             T = int(rec_d["sequence_length"])
-            raw_b = rec_d["raw_video"]
             actions_L = rec_d["actions"]
-            if T < self.seq_len or not isinstance(raw_b, bytes):
+            if T < self.seq_len:
                 return False
-            exp_n = T * self.image_h * self.image_w * self.image_c
-            if len(raw_b) != exp_n:
+            if len(actions_L) != T:
                 return False
-            return len(actions_L) == T
+            jpeg_L = rec_d["jpeg_frames"]
+            return isinstance(jpeg_L, list) and len(jpeg_L) == T
         except Exception:
             return False
 
 
 class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
-    def __init__(
-        self,
-        seq_len: int,
-        image_h: int,
-        image_w: int,
-        image_c: int = 3,
-    ):
+    def __init__(self, seq_len: int):
         self.seq_len = seq_len
-        self.image_h = image_h
-        self.image_w = image_w
-        self.image_c = image_c
 
     def random_map(self, element: Any, rng: np.random.Generator) -> Any:
         rec_d = pickle.loads(element)
         T = int(rec_d["sequence_length"])
 
-        raw_b = rec_d["raw_video"]
         actions_L = rec_d.get("actions")
         if actions_L is None:
             raise ValueError("missing actions")
@@ -77,11 +59,12 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         start_i = int(rng.integers(0, max_start_i + 1)) if max_start_i > 0 else 0
         end_i = start_i + self.seq_len
 
-        frames_THWC = np.frombuffer(raw_b, dtype=np.uint8).reshape(
-            T, self.image_h, self.image_w, self.image_c
+        frames_THWC = np.stack(
+            [np.array(Image.open(io.BytesIO(b))) for b in rec_d["jpeg_frames"][start_i:end_i]]
         )
+
         return {
-            "frames": frames_THWC[start_i:end_i],
+            "frames": frames_THWC,
             "actions": list(actions_L[start_i:end_i]),
         }
 
@@ -108,9 +91,6 @@ def get_dataloader(
     array_record_paths: list[str],
     seq_len: int,
     global_batch_size: int,
-    image_h: int,
-    image_w: int,
-    image_c: int,
     rank: int,
     world_size: int,
     seed: int,
@@ -150,18 +130,8 @@ def get_dataloader(
         seed=seed + epoch_i,
     )
     ops = [
-        EpisodeLengthFilter(
-            seq_len=seq_len,
-            image_h=image_h,
-            image_w=image_w,
-            image_c=image_c,
-        ),
-        ProcessEpisodeAndSlice(
-            seq_len=seq_len,
-            image_h=image_h,
-            image_w=image_w,
-            image_c=image_c,
-        ),
+        EpisodeLengthFilter(seq_len=seq_len),
+        ProcessEpisodeAndSlice(seq_len=seq_len),
         BuildSFTExampleFromFrames(),
         grain.transforms.Batch(
             batch_size=global_batch_size // world_size,
@@ -185,16 +155,8 @@ def get_dataloader(
 def count_valid_records(
     array_record_paths: list[str],
     seq_len: int,
-    image_h: int,
-    image_w: int,
-    image_c: int,
 ) -> int:
-    filt = EpisodeLengthFilter(
-        seq_len=seq_len,
-        image_h=image_h,
-        image_w=image_w,
-        image_c=image_c,
-    )
+    filt = EpisodeLengthFilter(seq_len=seq_len)
     valid_n = 0
     for path_s in array_record_paths:
         reader = ArrayRecordReader(path_s)

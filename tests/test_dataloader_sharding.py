@@ -1,11 +1,19 @@
+import io
 import pickle
 from pathlib import Path
 
 import numpy as np
 import pytest
 from array_record.python.array_record_module import ArrayRecordWriter
+from PIL import Image
 
 from idm.utils.data import get_dataloader
+
+
+def _jpeg_encode_frame(frame: np.ndarray, quality: int = 85) -> bytes:
+    buf = io.BytesIO()
+    Image.fromarray(frame).save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
 
 
 def _write_dummy_arrayrecord(
@@ -15,7 +23,7 @@ def _write_dummy_arrayrecord(
     for r_i in range(n_records):
         frames_THWC = np.full((T, H, W, C), r_i % 255, dtype=np.uint8)
         rec_d = {
-            "raw_video": frames_THWC.tobytes(),
+            "jpeg_frames": [_jpeg_encode_frame(frames_THWC[t]) for t in range(T)],
             "sequence_length": T,
             "path": f"r{r_i}.mp4",
             "actions": [f"a{r_i}_{t_i}" for t_i in range(T)],
@@ -38,9 +46,6 @@ def test_ddp_shards_are_disjoint(tmp_path: Path):
         array_record_paths=[str(p)],
         seq_len=4,
         global_batch_size=4,
-        image_h=2,
-        image_w=2,
-        image_c=3,
         rank=0,
         world_size=2,
         seed=123,
@@ -52,9 +57,6 @@ def test_ddp_shards_are_disjoint(tmp_path: Path):
         array_record_paths=[str(p)],
         seq_len=4,
         global_batch_size=4,
-        image_h=2,
-        image_w=2,
-        image_c=3,
         rank=1,
         world_size=2,
         seed=123,
@@ -74,9 +76,6 @@ def test_epoch_shuffle_is_deterministic(tmp_path: Path):
         array_record_paths=[str(p)],
         seq_len=4,
         global_batch_size=4,
-        image_h=2,
-        image_w=2,
-        image_c=3,
         rank=0,
         world_size=2,
         seed=999,
@@ -98,9 +97,6 @@ def test_batch_size_must_divide_world_size(tmp_path: Path):
             array_record_paths=[str(p)],
             seq_len=4,
             global_batch_size=3,
-            image_h=2,
-            image_w=2,
-            image_c=3,
             rank=0,
             world_size=2,
             seed=0,
@@ -117,9 +113,6 @@ def test_num_epochs_none_keeps_iterator_running(tmp_path: Path):
         array_record_paths=[str(p)],
         seq_len=4,
         global_batch_size=4,
-        image_h=2,
-        image_w=2,
-        image_c=3,
         rank=0,
         world_size=1,
         seed=7,

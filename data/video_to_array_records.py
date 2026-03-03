@@ -1,8 +1,10 @@
+import io
 import json
 import multiprocessing as mp
 import os
 import pickle
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +13,8 @@ import numpy as np
 import tyro
 from array_record.python.array_record_module import ArrayRecordWriter
 import ffmpeg
+from PIL import Image
+from tqdm import tqdm
 
 """
 This file processes video files by converting them into array records.
@@ -18,7 +22,7 @@ It splits videos into chunks of a specified size and saves them in a specified o
 The script uses multiprocessing to handle multiple videos concurrently and generates metadata for the processed videos.
 """
 
-RECORDING_RE = re.compile(r"^recording_([0-9a-fA-F-]+)_seg(\d+)\.mp4$")
+RECORDING_RE = re.compile(r"^recording_([0-9a-fA-F-]+)_seg(\d+)(_[a-z]+)?\.mp4$")
 KEY_NAME_MAP = {
     "Return": "Enter",
     "Escape": "Esc",
@@ -59,11 +63,10 @@ class Args:
     target_width: int = 160
     target_height: int = 90
     target_fps: int = 10
-    top_bar_fraction: float = 0.15
-    black_ratio: float = 0.95
     chunk_size: int = 160
     chunks_per_file: int = 100
     filter_pure_noop_chunks: bool = False
+    jpeg_quality: int = 85
     seed: int = 0
     num_workers: int = 0
     max_videos: int = 0
@@ -159,10 +162,11 @@ def _get_keylog_path(filename: str) -> Path:
     ), f"Invalid recording filename: {filename}. Expected recording_<session-id>_seg####.mp4"
     session_id_s = match.group(1)
     seg_idx_i = int(match.group(2))
+    suffix_s = match.group(3) or ""
     return (
         Path(filename).parent.parent
         / "keylogs"
-        / (f"input_{session_id_s}_seg{seg_idx_i:04d}.msgpack")
+        / (f"input_{session_id_s}_seg{seg_idx_i:04d}{suffix_s}.msgpack")
     )
 
 
@@ -293,22 +297,24 @@ def _failed_result(
     ]
 
 
+def _jpeg_encode_chunk(frames: np.ndarray, quality: int = 85) -> list[bytes]:
+    encoded = []
+    for frame in frames:
+        buf = io.BytesIO()
+        Image.fromarray(frame).save(buf, format="JPEG", quality=quality)
+        encoded.append(buf.getvalue())
+    return encoded
+
+
 def _chunk_video_records(
     video_tensor,
     video_info: dict[str, object],
     chunk_size: int,
     actions: list[str] | None = None,
     filter_pure_noop_chunks: bool = False,
-) -> list[dict[str, bytes | int | list[str] | str]]:
-    """
-    Split one decoded video into fixed-length chunk records.
-
-    Args:
-        chunk_size: Number of frames per video chunk
-
-    Returns:
-        Chunk records ready to be serialized into ArrayRecord files
-    """
+    jpeg_quality: int = 85,
+) -> list[dict]:
+    """Split one decoded video into fixed-length JPEG-encoded chunk records."""
     current_episode_len = video_tensor.shape[0]
     if current_episode_len < chunk_size:
         raise ValueError(
@@ -319,7 +325,7 @@ def _chunk_video_records(
             f"Action length mismatch: len(actions)={len(actions)} != frames={current_episode_len}"
         )
 
-    file_chunks: list[dict[str, bytes | int | list[str] | str]] = []
+    file_chunks: list[dict] = []
     for start_idx in range(0, current_episode_len - chunk_size + 1, chunk_size):
         chunk = video_tensor[start_idx : start_idx + chunk_size]
         chunk_actions = (
@@ -332,8 +338,8 @@ def _chunk_video_records(
         ):
             continue
 
-        chunk_record = {
-            "raw_video": chunk.tobytes(),
+        chunk_record: dict = {
+            "jpeg_frames": _jpeg_encode_chunk(chunk, jpeg_quality),
             "sequence_length": chunk_size,
             "path": str(video_info.get("path", "")),
         }
@@ -345,7 +351,7 @@ def _chunk_video_records(
 
 
 def _write_chunk_batch(
-    batch_chunks: list[dict[str, bytes | int | list[str] | str]],
+    batch_chunks: list[dict],
     output_folder: str,
     worker_idx: int,
     file_index: int,
@@ -371,7 +377,7 @@ def _write_chunk_batch(
 
 
 def _write_chunk_records(
-    chunk_records: list[dict[str, bytes | int | list[str] | str]],
+    chunk_records: list[dict],
     output_folder: str,
     chunks_per_file: int,
     worker_idx: int,
@@ -403,23 +409,12 @@ def preprocess_video(
     target_height,
     target_fps,
     chunk_size,
-    top_bar_fraction,
-    black_ratio,
     filter_pure_noop_chunks=False,
+    jpeg_quality=85,
 ):
     """
     Preprocess a video file by reading it, resizing, changing its frame rate,
     and then chunking it into smaller segments to be saved as ArrayRecord files.
-
-    Args:
-        idx (int): Index of the video being processed.
-        in_filename (str): Path to the input video file.
-        target_width (int): The target width for resizing the video frames.
-        target_height (int): The target height for resizing the video frames.
-        target_fps (int): The target frames per second for the output video.
-        chunk_size (int): Number of frames per chunk.
-        top_bar_fraction (float): Top fraction of the frame ignored for black-frame detection.
-        black_ratio (float): Fraction of pixels that must be below threshold.
 
     Returns:
         tuple: (chunk_records, failed_rows)
@@ -428,6 +423,7 @@ def preprocess_video(
     in_filename = str(video_info["filename"])
     print(f"Processing video {idx}, Filename: {in_filename}")
     try:
+        t0 = time.monotonic()
         out, _ = (
             ffmpeg.input(in_filename)
             .filter("fps", fps=target_fps, round="up")
@@ -441,6 +437,7 @@ def preprocess_video(
             .output("pipe:", format="rawvideo", pix_fmt="rgb24")
             .run(capture_stdout=True, quiet=True)
         )
+        t_ffmpeg = time.monotonic() - t0
 
         frame_size = target_height * target_width * 3
         n_frames = len(out) // frame_size
@@ -452,44 +449,38 @@ def preprocess_video(
         frames = np.frombuffer(out, np.uint8).reshape(
             n_frames, target_height, target_width, 3
         )
+
+        t1 = time.monotonic()
         keylog_path = _get_keylog_path(in_filename)
         actions = _actions_from_keylog_file(
             keylog_path=keylog_path,
             n_frames=n_frames,
             target_fps=target_fps,
         )
+        t_keylog = time.monotonic() - t1
 
-        segments = _filter_black_frames(
-            frames=frames,
+        t2 = time.monotonic()
+        chunk_records = _chunk_video_records(
+            video_tensor=frames,
+            video_info=video_info,
+            chunk_size=chunk_size,
             actions=actions,
-            black_ratio=black_ratio,
-            top_bar_fraction=top_bar_fraction,
+            filter_pure_noop_chunks=filter_pure_noop_chunks,
+            jpeg_quality=jpeg_quality,
+        )
+        t_chunk = time.monotonic() - t2
+
+        print(
+            f"[timing] video {idx} ({n_frames} frames): "
+            f"ffmpeg={t_ffmpeg:.2f}s  keylog={t_keylog:.2f}s  "
+            f"chunking={t_chunk:.2f}s  "
+            f"total={t_ffmpeg + t_keylog + t_chunk:.2f}s"
         )
 
-        if len(segments) > 1:
-            print(f"Split video {idx} into {len(segments)} segments at black frames")
+        if not chunk_records:
+            return [], _failed_result(video_info, "all_chunks_filtered")
 
-        all_chunk_records = []
-        for seg_idx, (seg_frames, seg_actions) in enumerate(segments):
-            if len(seg_frames) < chunk_size:
-                print(
-                    f"Segment {seg_idx} of video {idx} has {len(seg_frames)} frames, skipping (need {chunk_size})"
-                )
-                continue
-
-            chunk_records = _chunk_video_records(
-                video_tensor=seg_frames,
-                video_info=video_info,
-                chunk_size=chunk_size,
-                actions=seg_actions,
-                filter_pure_noop_chunks=filter_pure_noop_chunks,
-            )
-            all_chunk_records.extend(chunk_records)
-
-        if not all_chunk_records:
-            return [], _failed_result(video_info, "all_segments_too_short")
-
-        return all_chunk_records, []
+        return chunk_records, []
     except Exception as e:
         print(f"Error processing video {idx} ({in_filename}): {e}")
         return [], _failed_result(video_info, f"decode_error:{e}")
@@ -505,7 +496,7 @@ def _process_video_shard(
     output_folder = str(shard_args[0][2])
     chunks_per_file = int(shard_args[0][7])
     next_file_index = 0
-    pending_chunks: list[dict[str, bytes | int | list[str] | str]] = []
+    pending_chunks: list[dict] = []
     shard_results: list[dict[str, object]] = []
 
     for video_arg in shard_args:
@@ -515,9 +506,8 @@ def _process_video_shard(
         target_height = int(video_arg[4])
         target_fps = int(video_arg[5])
         chunk_size = int(video_arg[6])
-        top_bar_fraction = float(video_arg[8]) if len(video_arg) > 8 else 0.15
-        black_ratio = float(video_arg[9]) if len(video_arg) > 9 else 0.95
-        filter_pure_noop_chunks = bool(video_arg[10]) if len(video_arg) > 10 else False
+        filter_pure_noop_chunks = bool(video_arg[8]) if len(video_arg) > 8 else False
+        jpeg_quality = int(video_arg[9]) if len(video_arg) > 9 else 85
 
         chunk_records, failed_rows = preprocess_video(
             idx=idx,
@@ -526,9 +516,8 @@ def _process_video_shard(
             target_height=target_height,
             target_fps=target_fps,
             chunk_size=chunk_size,
-            top_bar_fraction=top_bar_fraction,
-            black_ratio=black_ratio,
             filter_pure_noop_chunks=filter_pure_noop_chunks,
+            jpeg_quality=jpeg_quality,
         )
         if failed_rows:
             shard_results.extend(failed_rows)
@@ -538,6 +527,7 @@ def _process_video_shard(
         if flush_n <= 0:
             continue
 
+        t_w0 = time.monotonic()
         shard_results.extend(
             _write_chunk_records(
                 chunk_records=pending_chunks[:flush_n],
@@ -547,10 +537,13 @@ def _process_video_shard(
                 start_file_index=next_file_index,
             )
         )
+        t_w = time.monotonic() - t_w0
+        print(f"[timing] worker {worker_idx} write {flush_n} chunks: {t_w:.2f}s")
         next_file_index += flush_n // chunks_per_file
         pending_chunks = pending_chunks[flush_n:]
 
     if pending_chunks:
+        t_w0 = time.monotonic()
         shard_results.extend(
             _write_chunk_records(
                 chunk_records=pending_chunks,
@@ -560,95 +553,10 @@ def _process_video_shard(
                 start_file_index=next_file_index,
             )
         )
+        t_w = time.monotonic() - t_w0
+        print(f"[timing] worker {worker_idx} write {len(pending_chunks)} chunks (tail): {t_w:.2f}s")
 
     return shard_results
-
-
-def _is_nearly_black(
-    frame: np.ndarray,
-    threshold: float = 10.0,
-    black_ratio: float = 0.95,
-    top_bar_fraction: float = 0.15,
-) -> bool:
-    """
-    Check if a frame is nearly black.
-
-    Args:
-        frame: RGB frame of shape (H, W, 3)
-        threshold: Pixel brightness threshold (0-255)
-        black_ratio: Fraction of pixels that must be below threshold
-        top_bar_fraction: Top fraction of the frame to ignore
-
-    Returns:
-        True if frame is nearly black
-    """
-    crop_fraction = min(max(top_bar_fraction, 0.0), 0.99)
-    crop_start = int(frame.shape[0] * crop_fraction)
-    brightness = frame[crop_start:].mean(axis=2)
-    black_pixels = (brightness < threshold).sum()
-    total_pixels = brightness.size
-    return (black_pixels / total_pixels) >= black_ratio
-
-
-def _filter_black_frames(
-    frames: np.ndarray,
-    actions: list[str] | None,
-    threshold: float = 10.0,
-    black_ratio: float = 0.95,
-    top_bar_fraction: float = 0.15,
-) -> list[tuple[np.ndarray, list[str] | None]]:
-    """
-    Split video at nearly-black frame sequences.
-
-    Args:
-        frames: Video frames of shape (N, H, W, 3)
-        actions: List of action labels (or None)
-        threshold: Pixel brightness threshold
-        black_ratio: Fraction of pixels that must be below threshold
-        top_bar_fraction: Top fraction of the frame to ignore
-
-    Returns:
-        List of (frames, actions) tuples for each non-black segment
-    """
-    n_frames = len(frames)
-    if n_frames == 0:
-        return []
-
-    is_black = np.array(
-        [
-            _is_nearly_black(
-                frame=frames[i],
-                threshold=threshold,
-                black_ratio=black_ratio,
-                top_bar_fraction=top_bar_fraction,
-            )
-            for i in range(n_frames)
-        ]
-    )
-
-    if not is_black.any():
-        return [(frames, actions)]
-
-    segments = []
-    start_idx = None
-
-    for i in range(n_frames):
-        if not is_black[i]:
-            if start_idx is None:
-                start_idx = i
-        else:
-            if start_idx is not None:
-                seg_frames = frames[start_idx:i]
-                seg_actions = actions[start_idx:i] if actions else None
-                segments.append((seg_frames, seg_actions))
-                start_idx = None
-
-    if start_idx is not None:
-        seg_frames = frames[start_idx:]
-        seg_actions = actions[start_idx:] if actions else None
-        segments.append((seg_frames, seg_actions))
-
-    return segments
 
 
 def save_split(pool_args, num_workers: int):
@@ -668,8 +576,16 @@ def save_split(pool_args, num_workers: int):
 
     results = []
     with mp.Pool(processes=num_processes) as pool:
-        for shard_result in pool.starmap(_process_video_shard, worker_jobs):
-            results.extend(shard_result)
+        async_results = [
+            pool.apply_async(_process_video_shard, (worker_idx, shard_args))
+            for worker_idx, shard_args in worker_jobs
+        ]
+        shard_video_counts = [len(shard_args) for _, shard_args in worker_jobs]
+        with tqdm(total=len(pool_args), desc="Videos", unit="vid") as pbar:
+            for ar, n_vids in zip(async_results, shard_video_counts):
+                shard_result = ar.get()
+                results.extend(shard_result)
+                pbar.update(n_vids)
     return results
 
 
@@ -732,8 +648,6 @@ def main():
 
     total_ratio = args.train_ratio + args.val_ratio + args.test_ratio
     assert np.isclose(total_ratio, 1.0), "Ratios must sum to 1.0"
-    assert 0.0 <= args.top_bar_fraction < 1.0, "top_bar_fraction must be in [0, 1)"
-    assert 0.0 <= args.black_ratio <= 1.0, "black_ratio must be in [0, 1]"
 
     print("Converting video to array_record files...")
     input_files = _collect_input_videos(args.input_path)
@@ -767,9 +681,8 @@ def main():
                     args.target_fps,
                     args.chunk_size,
                     args.chunks_per_file,
-                    args.top_bar_fraction,
-                    args.black_ratio,
                     args.filter_pure_noop_chunks,
+                    args.jpeg_quality,
                 )
             )
 
@@ -804,10 +717,9 @@ def main():
         "target_height": args.target_height,
         "target_channels": 3,
         "target_fps": args.target_fps,
-        "top_bar_fraction": args.top_bar_fraction,
-        "black_ratio": args.black_ratio,
         "chunk_size": args.chunk_size,
         "filter_pure_noop_chunks": args.filter_pure_noop_chunks,
+        "jpeg_quality": args.jpeg_quality,
         "total_chunks": len(results),
         "total_video_chunks": total_video_chunks,
         "total_videos": len(input_files),
