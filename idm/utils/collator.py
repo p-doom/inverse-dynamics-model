@@ -278,6 +278,8 @@ class CollatorPrefetchIterator:
         raw_batch_d = next(self._raw_it)
         state_after_b = self._raw_it.get_state()
         model_batch_d = self._collator(raw_batch_d)
+        if "target_text" in raw_batch_d:
+            model_batch_d["target_text"] = raw_batch_d["target_text"]
         return state_after_b, model_batch_d
 
     def _submit_next(self) -> None:

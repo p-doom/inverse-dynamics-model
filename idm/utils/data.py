@@ -108,6 +108,35 @@ class ActionDensityFilter(grain.transforms.Filter):
             return False
 
 
+class ActionDensityRejectionSampler(grain.transforms.RandomMap):
+    def __init__(self, random_sample_fraction: float):
+        self.random_sample_fraction = float(random_sample_fraction)
+
+    def random_map(self, element: Any, rng: np.random.Generator) -> Any:
+        if self.random_sample_fraction >= 1.0:
+            return element
+        try:
+            actions_L = element["actions"]
+            if not actions_L:
+                return None
+            active_n = sum(
+                1 for action_s in actions_L if not action_is_no_op_b(action_s)
+            )
+            density_f = float(active_n) / float(len(actions_L))
+            keep_prob_f = (
+                self.random_sample_fraction
+                + (1.0 - self.random_sample_fraction) * density_f
+            )
+            return element if float(rng.random()) < keep_prob_f else None
+        except Exception:
+            return None
+
+
+class NotNoneFilter(grain.transforms.Filter):
+    def filter(self, element: Any) -> bool:
+        return element is not None
+
+
 class BuildSFTExampleFromFrames(grain.transforms.Map):
     def map(self, element: dict[str, Any]) -> dict[str, Any]:
         actions_L = element["actions"]
@@ -124,6 +153,13 @@ def find_array_record_paths(data_root: str, split: str) -> list[str]:
     if not paths:
         raise ValueError(f"No .array_record files found in {split_dir}")
     return paths
+
+
+def count_source_records(array_record_paths: list[str]) -> int:
+    if not array_record_paths:
+        raise ValueError("array_record_paths list cannot be empty.")
+    source = grain.sources.ArrayRecordDataSource(array_record_paths)
+    return int(len(source))
 
 
 def get_dataloader(
@@ -143,6 +179,7 @@ def get_dataloader(
     read_num_threads: int = 4,
     worker_buffer_size: int = 4,
     min_action_density: float = 0.0,
+    action_upsample_random_fraction: float = 1.0,
 ) -> grain.DataLoader:
     if not array_record_paths:
         raise ValueError("array_record_paths list cannot be empty.")
@@ -161,6 +198,8 @@ def get_dataloader(
         raise ValueError("worker_buffer_size must be >= 1.")
     if min_action_density < 0.0 or min_action_density > 1.0:
         raise ValueError("min_action_density must be in [0, 1].")
+    if action_upsample_random_fraction < 0.0 or action_upsample_random_fraction > 1.0:
+        raise ValueError("action_upsample_random_fraction must be in [0, 1].")
 
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
     sampler = grain.samplers.IndexSampler(
@@ -190,6 +229,15 @@ def get_dataloader(
     ]
     if min_action_density > 0.0:
         ops.append(ActionDensityFilter(min_action_density=min_action_density))
+    if action_upsample_random_fraction < 1.0:
+        ops.extend(
+            [
+                ActionDensityRejectionSampler(
+                    random_sample_fraction=action_upsample_random_fraction
+                ),
+                NotNoneFilter(),
+            ]
+        )
     ops.extend(
         [
             BuildSFTExampleFromFrames(),

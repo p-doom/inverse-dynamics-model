@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from array_record.python.array_record_module import ArrayRecordWriter
 
-from idm.utils.data import get_dataloader
+from idm.utils.data import count_source_records, get_dataloader
 
 
 def _write_dummy_arrayrecord(
@@ -153,3 +153,104 @@ def test_min_action_density_must_be_in_unit_interval(tmp_path: Path):
             prefetch_buffer_size=1,
             min_action_density=1.1,
         )
+
+
+def test_action_upsample_random_fraction_must_be_in_unit_interval(tmp_path: Path):
+    p = tmp_path / "d.array_record"
+    _write_dummy_arrayrecord(p)
+    with pytest.raises(ValueError):
+        get_dataloader(
+            array_record_paths=[str(p)],
+            seq_len=4,
+            global_batch_size=4,
+            image_h=2,
+            image_w=2,
+            image_c=3,
+            rank=0,
+            world_size=1,
+            seed=0,
+            epoch_i=0,
+            num_workers=0,
+            prefetch_buffer_size=1,
+            action_upsample_random_fraction=-0.1,
+        )
+
+
+def test_action_upsampling_r_zero_drops_pure_noop_sequences(tmp_path: Path):
+    p = tmp_path / "d.array_record"
+    writer = ArrayRecordWriter(str(p), "group_size:1")
+    frames_THWC = np.zeros((4, 2, 2, 3), dtype=np.uint8)
+    writer.write(
+        pickle.dumps(
+            {
+                "raw_video": frames_THWC.tobytes(),
+                "sequence_length": 4,
+                "path": "noop.mp4",
+                "actions": ["NO_OP", "NO_OP", "NO_OP", "NO_OP"],
+            }
+        )
+    )
+    writer.write(
+        pickle.dumps(
+            {
+                "raw_video": frames_THWC.tobytes(),
+                "sequence_length": 4,
+                "path": "active.mp4",
+                "actions": [
+                    "MOUSE:1,0,0",
+                    "MOUSE:1,0,0",
+                    "MOUSE:1,0,0",
+                    "MOUSE:1,0,0",
+                ],
+            }
+        )
+    )
+    writer.close()
+
+    dl_no_filter = get_dataloader(
+        array_record_paths=[str(p)],
+        seq_len=4,
+        global_batch_size=1,
+        image_h=2,
+        image_w=2,
+        image_c=3,
+        rank=0,
+        world_size=1,
+        seed=0,
+        epoch_i=0,
+        num_epochs=1,
+        num_workers=0,
+        prefetch_buffer_size=1,
+        action_upsample_random_fraction=1.0,
+    )
+    all_texts = [str(batch_d["target_text"][0]) for batch_d in dl_no_filter]
+    assert len(all_texts) == 2
+    assert any("NO_OP" in text_s for text_s in all_texts)
+    assert any("MOUSE:1,0,0" in text_s for text_s in all_texts)
+
+    dl_upsampled = get_dataloader(
+        array_record_paths=[str(p)],
+        seq_len=4,
+        global_batch_size=1,
+        image_h=2,
+        image_w=2,
+        image_c=3,
+        rank=0,
+        world_size=1,
+        seed=0,
+        epoch_i=0,
+        num_epochs=1,
+        num_workers=0,
+        prefetch_buffer_size=1,
+        action_upsample_random_fraction=0.0,
+    )
+    kept_texts = [str(batch_d["target_text"][0]) for batch_d in dl_upsampled]
+    assert len(kept_texts) == 1
+    assert "MOUSE:1,0,0" in kept_texts[0]
+    assert "NO_OP" not in kept_texts[0]
+
+
+def test_count_source_records_matches_written_records(tmp_path: Path):
+    p = tmp_path / "d.array_record"
+    _write_dummy_arrayrecord(p, n_records=7)
+    assert count_source_records([str(p)]) == 7

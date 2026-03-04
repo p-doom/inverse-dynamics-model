@@ -25,6 +25,7 @@ from idm.utils.checkpoint import (
 from idm.utils.actions import action_class_s
 from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
 from idm.utils.data import (
+    count_source_records,
     find_array_record_paths,
     get_dataloader,
 )
@@ -42,6 +43,7 @@ class Args:
     video_fps: float = 30.0
     seq_len: int = 128
     train_min_action_density: float = 0.0
+    train_action_upsample_random_fraction: float = 1.0
     global_batch_size: int = 8
     grad_accum: int = 1
     max_grad_norm: float = 1.0
@@ -155,7 +157,7 @@ def _to_device(
     skip_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     skip_keys = (
-        {"videos", "prompt_lens", "meta", "label_weights"}
+        {"videos", "prompt_lens", "meta", "label_weights", "target_text"}
         if skip_keys is None
         else set(skip_keys)
     )
@@ -717,6 +719,11 @@ def main() -> None:
         raise ValueError("--video_fps must be > 0.")
     if args.train_min_action_density < 0.0 or args.train_min_action_density > 1.0:
         raise ValueError("--train-min-action-density must be in [0, 1].")
+    if (
+        args.train_action_upsample_random_fraction < 0.0
+        or args.train_action_upsample_random_fraction > 1.0
+    ):
+        raise ValueError("--train-action-upsample-random-fraction must be in [0, 1].")
     if args.attn_implementation not in {"flash_attention_2", "sdpa", "auto"}:
         raise ValueError(
             "Unsupported --attn-implementation. "
@@ -749,6 +756,10 @@ def main() -> None:
     _assert_image_hwc_matches_metadata(args)
 
     array_paths = find_array_record_paths(args.data_root, "train")
+    train_total_records_i = count_source_records(array_paths)
+    train_attempted_global_samples_per_epoch_i = (
+        train_total_records_i // world_i
+    ) * world_i
 
     val_array_paths: list[str] = []
     if args.val_every > 0:
@@ -778,6 +789,11 @@ def main() -> None:
         print(
             f"loss_weights no_op={args.no_op_loss_weight:.4f} "
             f"mouse={args.mouse_loss_weight:.4f}"
+        )
+        print(
+            "train_data_sampler "
+            f"total_records={train_total_records_i} "
+            f"attempted_samples_per_epoch_global={train_attempted_global_samples_per_epoch_i}"
         )
         if mfu_enabled_b:
             print(
@@ -915,6 +931,7 @@ def main() -> None:
             read_num_threads=args.read_num_threads,
             worker_buffer_size=args.worker_buffer_size,
             min_action_density=args.train_min_action_density,
+            action_upsample_random_fraction=args.train_action_upsample_random_fraction,
         )
         raw_it = iter(loader)
         if pending_state_b is not None and epoch_i == resume_epoch_i:
@@ -928,6 +945,10 @@ def main() -> None:
         )
         batch_it = prefetched_it if prefetched_it is not None else raw_it
         epoch_step_start = global_step
+        epoch_kept_samples_n = 0
+        epoch_non_no_op_action_n = 0
+        epoch_action_total_n = 0
+        epoch_completed_b = False
         try:
             for batch_d in batch_it:
                 ddp_model.train()
@@ -952,7 +973,17 @@ def main() -> None:
                 log_micro_n += 1
                 log_tok_n += tok_n
                 log_input_tok_n += int(model_batch_d["input_ids"].numel())
-                log_sample_n += int(model_batch_d["input_ids"].shape[0])
+                kept_batch_samples_n = int(model_batch_d["input_ids"].shape[0])
+                log_sample_n += kept_batch_samples_n
+                epoch_kept_samples_n += kept_batch_samples_n
+                target_text_B = collated_batch_d.get("target_text")
+                if target_text_B is None:
+                    target_text_B = batch_d.get("target_text", [])
+                target_no_op_n_i, _, target_total_n_i = _action_type_counts_from_texts(
+                    [str(x) for x in target_text_B]
+                )
+                epoch_non_no_op_action_n += int(target_total_n_i - target_no_op_n_i)
+                epoch_action_total_n += int(target_total_n_i)
 
                 micro_in_accum_i += 1
                 loss = loss / args.grad_accum
@@ -1281,6 +1312,8 @@ def main() -> None:
 
                 if global_step >= args.max_steps:
                     break
+            else:
+                epoch_completed_b = True
         finally:
             if prefetched_it is not None:
                 prefetched_it.close()
@@ -1288,6 +1321,49 @@ def main() -> None:
             raise RuntimeError(
                 "No training steps in epoch; lower --train-min-action-density."
             )
+        epoch_kept_samples_t = torch.tensor(float(epoch_kept_samples_n), device=device)
+        epoch_non_no_op_action_t = torch.tensor(
+            float(epoch_non_no_op_action_n),
+            device=device,
+        )
+        epoch_action_total_t = torch.tensor(float(epoch_action_total_n), device=device)
+        if world_i > 1:
+            dist.all_reduce(epoch_kept_samples_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(epoch_non_no_op_action_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(epoch_action_total_t, op=dist.ReduceOp.SUM)
+        epoch_kept_non_no_op_rate_f = epoch_non_no_op_action_t.item() / max(
+            epoch_action_total_t.item(),
+            1.0,
+        )
+        if rank_i == 0:
+            epoch_log_d: dict[str, float] = {
+                "train_data/kept_non_no_op_rate": epoch_kept_non_no_op_rate_f,
+                "train_data/kept_samples": epoch_kept_samples_t.item(),
+                "train_data/kept_action_total": epoch_action_total_t.item(),
+            }
+            if epoch_completed_b:
+                epoch_accept_rate_f = epoch_kept_samples_t.item() / max(
+                    float(train_attempted_global_samples_per_epoch_i),
+                    1.0,
+                )
+                epoch_rejection_rate_f = min(max(1.0 - epoch_accept_rate_f, 0.0), 1.0)
+                epoch_log_d["train_data/accept_rate"] = epoch_accept_rate_f
+                epoch_log_d["train_data/rejection_rate"] = epoch_rejection_rate_f
+                epoch_log_d["train_data/attempted_samples"] = float(
+                    train_attempted_global_samples_per_epoch_i
+                )
+                print(
+                    f"epoch={epoch_i} train_data_kept_non_no_op_rate={epoch_kept_non_no_op_rate_f:.4f} "
+                    f"train_data_accept_rate={epoch_accept_rate_f:.4f} "
+                    f"train_data_rejection_rate={epoch_rejection_rate_f:.4f}"
+                )
+            else:
+                print(
+                    f"epoch={epoch_i} train_data_kept_non_no_op_rate={epoch_kept_non_no_op_rate_f:.4f} "
+                    "train_data_rejection_rate=na (partial epoch)"
+                )
+            if wandb_run is not None:
+                wandb_run.log(epoch_log_d, step=global_step)
         epoch_i += 1
 
     if rank_i == 0:

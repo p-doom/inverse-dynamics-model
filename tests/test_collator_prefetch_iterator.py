@@ -40,3 +40,14 @@ def test_collator_prefetch_iterator_collates_and_tracks_state():
             next(prefetch_it)
     finally:
         prefetch_it.close()
+
+
+def test_collator_prefetch_iterator_preserves_target_text_when_present():
+    raw_it = _FakeRawIterator([{"value": 1, "target_text": ["Frame 0: NO_OP"]}])
+    prefetch_it = CollatorPrefetchIterator(raw_it=raw_it, collator=_FakeCollator())
+    try:
+        out_d = next(prefetch_it)
+        assert out_d["value"] == 2
+        assert out_d["target_text"] == ["Frame 0: NO_OP"]
+    finally:
+        prefetch_it.close()
