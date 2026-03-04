@@ -132,3 +132,24 @@ def test_num_epochs_none_keeps_iterator_running(tmp_path: Path):
     for _ in range(5):
         batch_d = next(it)
         assert len(batch_d["target_text"]) == 4
+
+
+def test_min_action_density_must_be_in_unit_interval(tmp_path: Path):
+    p = tmp_path / "d.array_record"
+    _write_dummy_arrayrecord(p)
+    with pytest.raises(ValueError):
+        get_dataloader(
+            array_record_paths=[str(p)],
+            seq_len=4,
+            global_batch_size=4,
+            image_h=2,
+            image_w=2,
+            image_c=3,
+            rank=0,
+            world_size=1,
+            seed=0,
+            epoch_i=0,
+            num_workers=0,
+            prefetch_buffer_size=1,
+            min_action_density=1.1,
+        )
