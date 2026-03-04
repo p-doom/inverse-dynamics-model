@@ -334,11 +334,25 @@ def _wandb_action_confusion_matrix_chart_from_counts(
     )
 
 
+def _action_f1_from_counts(
+    correct_n_f: float,
+    pred_total_n_f: float,
+    target_total_n_f: float,
+) -> float:
+    precision_f = float(correct_n_f) / max(float(pred_total_n_f), 1.0)
+    recall_f = float(correct_n_f) / max(float(target_total_n_f), 1.0)
+    denom_f = precision_f + recall_f
+    if denom_f <= 0.0:
+        return 0.0
+    return 2.0 * precision_f * recall_f / denom_f
+
+
 def _build_val_wandb_log_d(
     *,
     val_loss_f: float,
     val_toks_per_s_f: float,
     val_action_acc_f: float,
+    val_action_f1_f: float,
     val_pred_no_op_rate_f: float,
     val_target_no_op_rate_f: float,
     val_pred_mouse_rate_f: float,
@@ -357,6 +371,7 @@ def _build_val_wandb_log_d(
         "val/loss": val_loss_f,
         "val/tokens_per_s": val_toks_per_s_f,
         "val_action/action_acc": val_action_acc_f,
+        "val_action/action_f1": val_action_f1_f,
         "val_action/pred_no_op_rate": val_pred_no_op_rate_f,
         "val_action/target_no_op_rate": val_target_no_op_rate_f,
         "val_action/pred_mouse_rate": val_pred_mouse_rate_f,
@@ -1235,6 +1250,11 @@ def main() -> None:
                     val_action_acc_f = val_action_correct_t.item() / max(
                         val_action_total_t.item(), 1.0
                     )
+                    val_action_f1_f = _action_f1_from_counts(
+                        correct_n_f=val_action_correct_t.item(),
+                        pred_total_n_f=val_pred_action_total_t.item(),
+                        target_total_n_f=val_target_action_total_t.item(),
+                    )
                     val_pred_no_op_rate_f = val_pred_no_op_t.item() / max(
                         val_pred_action_total_t.item(), 1.0
                     )
@@ -1268,6 +1288,7 @@ def main() -> None:
                             f"step={global_step} val_loss={val_loss_t.item():.6f} "
                             f"val_steps={args.val_steps} val_tokens_per_s={val_toks_per_s:.1f} "
                             f"val_action_acc={val_action_acc_f:.6f} "
+                            f"val_action_f1={val_action_f1_f:.6f} "
                             f"val_pred_no_op_rate={val_pred_no_op_rate_f:.4f} "
                             f"val_target_no_op_rate={val_target_no_op_rate_f:.4f} "
                             f"val_pred_mouse_rate={val_pred_mouse_rate_f:.4f} "
@@ -1298,6 +1319,7 @@ def main() -> None:
                                     val_loss_f=val_loss_t.item(),
                                     val_toks_per_s_f=val_toks_per_s,
                                     val_action_acc_f=val_action_acc_f,
+                                    val_action_f1_f=val_action_f1_f,
                                     val_pred_no_op_rate_f=val_pred_no_op_rate_f,
                                     val_target_no_op_rate_f=val_target_no_op_rate_f,
                                     val_pred_mouse_rate_f=val_pred_mouse_rate_f,
