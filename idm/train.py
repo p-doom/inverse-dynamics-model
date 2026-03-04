@@ -41,6 +41,7 @@ class Args:
     image_c: int = 3
     video_fps: float = 30.0
     seq_len: int = 128
+    train_min_action_density: float = 0.0
     global_batch_size: int = 8
     grad_accum: int = 1
     max_grad_norm: float = 1.0
@@ -714,6 +715,8 @@ def main() -> None:
         raise ValueError("--save_every must be >= 1.")
     if args.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
+    if args.train_min_action_density < 0.0 or args.train_min_action_density > 1.0:
+        raise ValueError("--train-min-action-density must be in [0, 1].")
     if args.attn_implementation not in {"flash_attention_2", "sdpa", "auto"}:
         raise ValueError(
             "Unsupported --attn-implementation. "
@@ -830,6 +833,7 @@ def main() -> None:
             prefetch_buffer_size=args.prefetch_buffer_size,
             read_num_threads=args.read_num_threads,
             worker_buffer_size=args.worker_buffer_size,
+            min_action_density=0.0,
         )
         val_it = iter(val_loader)
     trainable_params = [p for p in ddp_model.parameters() if p.requires_grad]
@@ -910,6 +914,7 @@ def main() -> None:
             prefetch_buffer_size=args.prefetch_buffer_size,
             read_num_threads=args.read_num_threads,
             worker_buffer_size=args.worker_buffer_size,
+            min_action_density=args.train_min_action_density,
         )
         raw_it = iter(loader)
         if pending_state_b is not None and epoch_i == resume_epoch_i:

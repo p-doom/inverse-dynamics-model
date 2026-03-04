@@ -48,6 +48,8 @@ MOUSE_X_QUANT_UNIT_F = 5.0
 MOUSE_Y_QUANT_UNIT_F = 4.0
 MOUSE_DELTA_CLIP_I = 1000
 MOUSE_SCROLL_CLIP_I = 5
+DEFAULT_MOUSE_DELTA_CLIP_PERCENTILE_F = 99.5
+DEFAULT_MOUSE_SCROLL_CLIP_PERCENTILE_F = 99.5
 DEFAULT_IDENTICAL_NOOP_MAD_THRESHOLD_F = 0.01
 
 
@@ -68,6 +70,8 @@ class Args:
     filter_pure_noop_chunks: bool = False
     filter_identical_noop_frames: bool = False
     identical_noop_mad_threshold: float = DEFAULT_IDENTICAL_NOOP_MAD_THRESHOLD_F
+    mouse_delta_clip_percentile: float = DEFAULT_MOUSE_DELTA_CLIP_PERCENTILE_F
+    mouse_scroll_clip_percentile: float = DEFAULT_MOUSE_SCROLL_CLIP_PERCENTILE_F
     seed: int = 0
     num_workers: int = 0
     max_videos: int = 0
@@ -142,6 +146,34 @@ def _quantize_and_clip(
     return int(np.clip(quant_i, -clip_abs_i, clip_abs_i))
 
 
+def _clip_abs_from_percentile(
+    values_f: list[float],
+    quant_unit_f: float,
+    max_clip_abs_i: int,
+    percentile_f: float,
+) -> int:
+    if quant_unit_f <= 0.0:
+        raise ValueError(f"quant_unit_f must be > 0, got {quant_unit_f}")
+    if not (0.0 < percentile_f <= 100.0):
+        raise ValueError(f"percentile_f must be in (0, 100], got {percentile_f}")
+    if max_clip_abs_i <= 0:
+        raise ValueError(f"max_clip_abs_i must be > 0, got {max_clip_abs_i}")
+    if percentile_f >= 100.0:
+        return max_clip_abs_i
+
+    values_N = np.asarray(values_f, dtype=np.float64)
+    values_N = values_N[np.isfinite(values_N)]
+    values_N = np.abs(values_N)
+    values_N = values_N[values_N > 0.0]
+    if values_N.size == 0:
+        return 1
+
+    clip_value_f = float(np.percentile(values_N, percentile_f))
+    clip_abs_i = int(np.ceil(clip_value_f / quant_unit_f))
+    clip_abs_i = int(np.clip(clip_abs_i, 1, max_clip_abs_i))
+    return clip_abs_i
+
+
 def _format_action(
     mouse_dx_i: int,
     mouse_dy_i: int,
@@ -176,6 +208,8 @@ def _actions_from_keylog_entries(
     entries: list[object],
     n_frames: int,
     target_fps: int,
+    mouse_delta_clip_percentile_f: float = DEFAULT_MOUSE_DELTA_CLIP_PERCENTILE_F,
+    mouse_scroll_clip_percentile_f: float = DEFAULT_MOUSE_SCROLL_CLIP_PERCENTILE_F,
 ) -> list[str]:
     if n_frames <= 0:
         return []
@@ -206,7 +240,10 @@ def _actions_from_keylog_entries(
         payload = event_tuple[1] if len(event_tuple) > 1 else None
         frame_events_d.setdefault(frame_idx_i, []).append((event_type_s, payload))
 
-    actions_L = []
+    frame_mouse_dx_L: list[float] = []
+    frame_mouse_dy_L: list[float] = []
+    frame_mouse_scroll_L: list[float] = []
+    frame_pressed_keys_L: list[set[str]] = []
     pressed_keys_s: set[str] = set()
     for frame_idx_i in range(n_frames):
         mouse_dx_f = 0.0
@@ -243,20 +280,51 @@ def _actions_from_keylog_entries(
             if event_type_s == "MouseScroll":
                 mouse_scroll_f += _mouse_scroll_delta(payload)
 
+        frame_mouse_dx_L.append(mouse_dx_f)
+        frame_mouse_dy_L.append(mouse_dy_f)
+        frame_mouse_scroll_L.append(mouse_scroll_f)
+        frame_pressed_keys_L.append(set(pressed_keys_s))
+
+    mouse_dx_clip_i = _clip_abs_from_percentile(
+        values_f=frame_mouse_dx_L,
+        quant_unit_f=MOUSE_X_QUANT_UNIT_F,
+        max_clip_abs_i=MOUSE_DELTA_CLIP_I,
+        percentile_f=mouse_delta_clip_percentile_f,
+    )
+    mouse_dy_clip_i = _clip_abs_from_percentile(
+        values_f=frame_mouse_dy_L,
+        quant_unit_f=MOUSE_Y_QUANT_UNIT_F,
+        max_clip_abs_i=MOUSE_DELTA_CLIP_I,
+        percentile_f=mouse_delta_clip_percentile_f,
+    )
+    mouse_scroll_clip_i = _clip_abs_from_percentile(
+        values_f=frame_mouse_scroll_L,
+        quant_unit_f=1.0,
+        max_clip_abs_i=MOUSE_SCROLL_CLIP_I,
+        percentile_f=mouse_scroll_clip_percentile_f,
+    )
+
+    actions_L: list[str] = []
+    for mouse_dx_f, mouse_dy_f, mouse_scroll_f, pressed_keys_s in zip(
+        frame_mouse_dx_L,
+        frame_mouse_dy_L,
+        frame_mouse_scroll_L,
+        frame_pressed_keys_L,
+    ):
         mouse_dx_i = _quantize_and_clip(
             value_f=mouse_dx_f,
             quant_unit_f=MOUSE_X_QUANT_UNIT_F,
-            clip_abs_i=MOUSE_DELTA_CLIP_I,
+            clip_abs_i=mouse_dx_clip_i,
         )
         mouse_dy_i = _quantize_and_clip(
             value_f=mouse_dy_f,
             quant_unit_f=MOUSE_Y_QUANT_UNIT_F,
-            clip_abs_i=MOUSE_DELTA_CLIP_I,
+            clip_abs_i=mouse_dy_clip_i,
         )
         mouse_scroll_i = _quantize_and_clip(
             value_f=mouse_scroll_f,
             quant_unit_f=1.0,
-            clip_abs_i=MOUSE_SCROLL_CLIP_I,
+            clip_abs_i=mouse_scroll_clip_i,
         )
         actions_L.append(
             _format_action(
@@ -273,6 +341,8 @@ def _actions_from_keylog_file(
     keylog_path: Path,
     n_frames: int,
     target_fps: int,
+    mouse_delta_clip_percentile_f: float = DEFAULT_MOUSE_DELTA_CLIP_PERCENTILE_F,
+    mouse_scroll_clip_percentile_f: float = DEFAULT_MOUSE_SCROLL_CLIP_PERCENTILE_F,
 ) -> list[str]:
     assert keylog_path.exists(), f"Missing keylog file: {keylog_path}"
     payload_b = keylog_path.read_bytes()
@@ -280,7 +350,11 @@ def _actions_from_keylog_file(
     entries = msgpack.unpackb(payload_b, raw=False)
     assert isinstance(entries, list), f"Keylog is not a msgpack list: {keylog_path}"
     return _actions_from_keylog_entries(
-        entries, n_frames=n_frames, target_fps=target_fps
+        entries,
+        n_frames=n_frames,
+        target_fps=target_fps,
+        mouse_delta_clip_percentile_f=mouse_delta_clip_percentile_f,
+        mouse_scroll_clip_percentile_f=mouse_scroll_clip_percentile_f,
     )
 
 
@@ -414,6 +488,8 @@ def preprocess_video(
     filter_pure_noop_chunks=False,
     filter_identical_noop_frames: bool = False,
     identical_noop_mad_threshold: float = DEFAULT_IDENTICAL_NOOP_MAD_THRESHOLD_F,
+    mouse_delta_clip_percentile: float = DEFAULT_MOUSE_DELTA_CLIP_PERCENTILE_F,
+    mouse_scroll_clip_percentile: float = DEFAULT_MOUSE_SCROLL_CLIP_PERCENTILE_F,
     decode_timeout_sec: int = 0,
 ):
     """
@@ -487,6 +563,8 @@ def preprocess_video(
             keylog_path=keylog_path,
             n_frames=n_frames,
             target_fps=target_fps,
+            mouse_delta_clip_percentile_f=mouse_delta_clip_percentile,
+            mouse_scroll_clip_percentile_f=mouse_scroll_clip_percentile,
         )
         if filter_identical_noop_frames:
             frames, actions = _filter_identical_noop_frames(
@@ -545,22 +623,46 @@ def _process_video_shard(
     shard_results: list[dict[str, object]] = []
 
     for video_arg in shard_args:
-        (
-            idx,
-            video_info,
-            _output_folder,
-            target_width,
-            target_height,
-            target_fps,
-            chunk_size,
-            _chunks_per_file,
-            top_bar_fraction,
-            black_ratio,
-            filter_pure_noop_chunks,
-            filter_identical_noop_frames,
-            identical_noop_mad_threshold,
-            decode_timeout_sec,
-        ) = video_arg
+        if len(video_arg) == 14:
+            (
+                idx,
+                video_info,
+                _output_folder,
+                target_width,
+                target_height,
+                target_fps,
+                chunk_size,
+                _chunks_per_file,
+                top_bar_fraction,
+                black_ratio,
+                filter_pure_noop_chunks,
+                filter_identical_noop_frames,
+                identical_noop_mad_threshold,
+                decode_timeout_sec,
+            ) = video_arg
+            mouse_delta_clip_percentile = DEFAULT_MOUSE_DELTA_CLIP_PERCENTILE_F
+            mouse_scroll_clip_percentile = DEFAULT_MOUSE_SCROLL_CLIP_PERCENTILE_F
+        elif len(video_arg) == 16:
+            (
+                idx,
+                video_info,
+                _output_folder,
+                target_width,
+                target_height,
+                target_fps,
+                chunk_size,
+                _chunks_per_file,
+                top_bar_fraction,
+                black_ratio,
+                filter_pure_noop_chunks,
+                filter_identical_noop_frames,
+                identical_noop_mad_threshold,
+                mouse_delta_clip_percentile,
+                mouse_scroll_clip_percentile,
+                decode_timeout_sec,
+            ) = video_arg
+        else:
+            raise ValueError(f"Unexpected shard arg format with len={len(video_arg)}")
 
         chunk_records, failed_rows = preprocess_video(
             idx=int(idx),
@@ -574,6 +676,8 @@ def _process_video_shard(
             filter_pure_noop_chunks=bool(filter_pure_noop_chunks),
             filter_identical_noop_frames=bool(filter_identical_noop_frames),
             identical_noop_mad_threshold=float(identical_noop_mad_threshold),
+            mouse_delta_clip_percentile=float(mouse_delta_clip_percentile),
+            mouse_scroll_clip_percentile=float(mouse_scroll_clip_percentile),
             decode_timeout_sec=int(decode_timeout_sec),
         )
         if failed_rows:
@@ -839,6 +943,12 @@ def main():
     assert (
         args.identical_noop_mad_threshold >= 0.0
     ), "identical_noop_mad_threshold must be non-negative"
+    assert (
+        0.0 < args.mouse_delta_clip_percentile <= 100.0
+    ), "mouse_delta_clip_percentile must be in (0, 100]"
+    assert (
+        0.0 < args.mouse_scroll_clip_percentile <= 100.0
+    ), "mouse_scroll_clip_percentile must be in (0, 100]"
 
     print("Converting video to array_record files...")
     input_files = _collect_input_videos(args.input_path)
@@ -877,6 +987,8 @@ def main():
                     args.filter_pure_noop_chunks,
                     args.filter_identical_noop_frames and split == "train",
                     args.identical_noop_mad_threshold,
+                    args.mouse_delta_clip_percentile,
+                    args.mouse_scroll_clip_percentile,
                     args.decode_timeout_sec,
                 )
             )
@@ -918,6 +1030,8 @@ def main():
         "filter_pure_noop_chunks": args.filter_pure_noop_chunks,
         "filter_identical_noop_frames_train": args.filter_identical_noop_frames,
         "identical_noop_mad_threshold": args.identical_noop_mad_threshold,
+        "mouse_delta_clip_percentile": args.mouse_delta_clip_percentile,
+        "mouse_scroll_clip_percentile": args.mouse_scroll_clip_percentile,
         "total_chunks": len(results),
         "total_video_chunks": total_video_chunks,
         "total_videos": len(input_files),
