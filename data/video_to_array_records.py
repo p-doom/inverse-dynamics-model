@@ -159,9 +159,11 @@ def _format_action(
 
 def _get_keylog_path(filename: str) -> Path:
     match = RECORDING_RE.match(Path(filename).name)
-    assert (
-        match is not None
-    ), f"Invalid recording filename: {filename}. Expected recording_<session-id>_seg####.mp4"
+    assert match is not None, (
+        f"Invalid recording filename: {filename}. "
+        "Expected recording_<session-id>_seg####.mp4 or "
+        "recording_<session-id>_seg####_filtered.mp4"
+    )
     session_id_s = match.group(1)
     seg_idx_i = int(match.group(2))
     filtered_suffix_s = str(match.group(3) or "")
@@ -698,9 +700,7 @@ def _filter_black_frames(
 
 
 def _frame_mad_f(lhs_frame: np.ndarray, rhs_frame: np.ndarray) -> float:
-    return float(
-        np.mean(np.abs(lhs_frame.astype(np.int16) - rhs_frame.astype(np.int16)))
-    )
+    return float(np.mean(np.abs(lhs_frame - rhs_frame), dtype=np.float64))
 
 
 def _filter_identical_noop_frames(
@@ -721,6 +721,7 @@ def _filter_identical_noop_frames(
     if n_frames <= 2:
         return frames, actions
 
+    frames_i16 = frames.astype(np.int16)
     keep_mask = np.ones(n_frames, dtype=bool)
     idx = 0
     while idx < n_frames:
@@ -733,7 +734,7 @@ def _filter_identical_noop_frames(
             next_idx = run_end + 1
             if actions[next_idx] != "NO_OP":
                 break
-            mad_f = _frame_mad_f(frames[next_idx], frames[run_end])
+            mad_f = _frame_mad_f(frames_i16[next_idx], frames_i16[run_end])
             if mad_f > mad_threshold_f:
                 break
             run_end = next_idx
