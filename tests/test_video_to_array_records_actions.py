@@ -24,7 +24,6 @@ _write_chunk_records = _MODULE._write_chunk_records
 _get_keylog_path = _MODULE._get_keylog_path
 _filter_black_frames = _MODULE._filter_black_frames
 _filter_identical_noop_frames = _MODULE._filter_identical_noop_frames
-_clip_abs_from_percentile = _MODULE._clip_abs_from_percentile
 
 
 def test_get_keylog_path() -> None:
@@ -95,39 +94,7 @@ def test_actions_clamp_mouse_motion_and_scroll_ranges() -> None:
 
     actions_L = _actions_from_keylog_entries(entries_L, n_frames=1, target_fps=10)
 
-    assert actions_L == ["MOUSE:1000,-1000,-5"]
-
-
-def test_clip_abs_from_percentile_reduces_outlier_clipping_window() -> None:
-    clip_abs_i = _clip_abs_from_percentile(
-        values_f=[0.0, 5.0, 5.0, 5.0, 5_000.0],
-        quant_unit_f=5.0,
-        max_clip_abs_i=1000,
-        percentile_f=99.5,
-    )
-
-    assert clip_abs_i < 1000
-    assert clip_abs_i >= 1
-
-
-def test_actions_percentile_clipping_downweights_extreme_outlier_frame() -> None:
-    entries_L = [
-        [0, ["MouseMove", [5.0, 0.0]]],
-        [100_000, ["MouseMove", [5.0, 0.0]]],
-        [200_000, ["MouseMove", [5_000.0, 0.0]]],
-    ]
-
-    actions_L = _actions_from_keylog_entries(
-        entries_L,
-        n_frames=3,
-        target_fps=10,
-        mouse_delta_clip_percentile_f=99.5,
-    )
-
-    assert actions_L[0] == "MOUSE:1,0,0"
-    assert actions_L[1] == "MOUSE:1,0,0"
-    assert actions_L[2].startswith("MOUSE:")
-    assert actions_L[2] != "MOUSE:1000,0,0"
+    assert actions_L == ["MOUSE:64,-64,-5"]
 
 
 def test_actions_track_pressed_key_state_across_frames() -> None:
@@ -432,8 +399,6 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
         filter_pure_noop_chunks: bool = False,
         filter_identical_noop_frames: bool = False,
         identical_noop_mad_threshold: float = 0.01,
-        mouse_delta_clip_percentile: float = 99.5,
-        mouse_scroll_clip_percentile: float = 99.5,
         decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
@@ -446,8 +411,6 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
             black_ratio,
             filter_identical_noop_frames,
             identical_noop_mad_threshold,
-            mouse_delta_clip_percentile,
-            mouse_scroll_clip_percentile,
             decode_timeout_sec,
         )
         seen_filter_flags.append(filter_pure_noop_chunks)
@@ -526,8 +489,6 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
         filter_pure_noop_chunks: bool = False,
         filter_identical_noop_frames: bool = False,
         identical_noop_mad_threshold: float = 0.01,
-        mouse_delta_clip_percentile: float = 99.5,
-        mouse_scroll_clip_percentile: float = 99.5,
         decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
@@ -541,8 +502,6 @@ def test_process_video_shard_forwards_filter_noop_flag(tmp_path: Path) -> None:
             black_ratio,
             filter_identical_noop_frames,
             identical_noop_mad_threshold,
-            mouse_delta_clip_percentile,
-            mouse_scroll_clip_percentile,
             decode_timeout_sec,
         )
         seen_filter_flags.append(filter_pure_noop_chunks)
@@ -595,8 +554,6 @@ def test_process_video_shard_forwards_filter_identical_noop_flag(
         filter_pure_noop_chunks: bool = False,
         filter_identical_noop_frames: bool = False,
         identical_noop_mad_threshold: float = 0.01,
-        mouse_delta_clip_percentile: float = 99.5,
-        mouse_scroll_clip_percentile: float = 99.5,
         decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
@@ -610,8 +567,6 @@ def test_process_video_shard_forwards_filter_identical_noop_flag(
             black_ratio,
             filter_pure_noop_chunks,
             identical_noop_mad_threshold,
-            mouse_delta_clip_percentile,
-            mouse_scroll_clip_percentile,
             decode_timeout_sec,
         )
         seen_filter_flags.append(filter_identical_noop_frames)
@@ -662,8 +617,6 @@ def test_process_video_shard_forwards_decode_timeout(tmp_path: Path) -> None:
         filter_pure_noop_chunks: bool = False,
         filter_identical_noop_frames: bool = False,
         identical_noop_mad_threshold: float = 0.01,
-        mouse_delta_clip_percentile: float = 99.5,
-        mouse_scroll_clip_percentile: float = 99.5,
         decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
@@ -678,8 +631,6 @@ def test_process_video_shard_forwards_decode_timeout(tmp_path: Path) -> None:
             filter_pure_noop_chunks,
             filter_identical_noop_frames,
             identical_noop_mad_threshold,
-            mouse_delta_clip_percentile,
-            mouse_scroll_clip_percentile,
         )
         seen_decode_timeouts.append(int(decode_timeout_sec))
         return [], []
@@ -731,8 +682,6 @@ def test_process_video_shard_forwards_identical_noop_mad_threshold(
         filter_pure_noop_chunks: bool = False,
         filter_identical_noop_frames: bool = False,
         identical_noop_mad_threshold: float = 0.01,
-        mouse_delta_clip_percentile: float = 99.5,
-        mouse_scroll_clip_percentile: float = 99.5,
         decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
@@ -746,8 +695,6 @@ def test_process_video_shard_forwards_identical_noop_mad_threshold(
             black_ratio,
             filter_pure_noop_chunks,
             filter_identical_noop_frames,
-            mouse_delta_clip_percentile,
-            mouse_scroll_clip_percentile,
             decode_timeout_sec,
         )
         seen_thresholds.append(float(identical_noop_mad_threshold))

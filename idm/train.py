@@ -927,6 +927,7 @@ def main() -> None:
             else None
         )
         batch_it = prefetched_it if prefetched_it is not None else raw_it
+        epoch_step_start = global_step
         try:
             for batch_d in batch_it:
                 ddp_model.train()
@@ -1283,6 +1284,10 @@ def main() -> None:
         finally:
             if prefetched_it is not None:
                 prefetched_it.close()
+        if global_step == epoch_step_start:
+            raise RuntimeError(
+                "No training steps in epoch; lower --train-min-action-density."
+            )
         epoch_i += 1
 
     if rank_i == 0:
