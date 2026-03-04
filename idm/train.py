@@ -555,6 +555,30 @@ def _run_validation_steps(
     )
 
 
+def _next_synced_batch(
+    batch_it: Any,
+    *,
+    world_i: int,
+    device: torch.device,
+) -> tuple[dict[str, Any] | None, bool]:
+    try:
+        batch_d = next(batch_it)
+        local_has_batch_i = 1
+    except StopIteration:
+        batch_d = None
+        local_has_batch_i = 0
+
+    if world_i <= 1:
+        return batch_d, (local_has_batch_i == 0)
+
+    has_batch_t = torch.tensor(float(local_has_batch_i), device=device)
+    dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
+    all_have_batch_b = bool(has_batch_t.item() >= 0.5)
+    if not all_have_batch_b:
+        return None, True
+    return batch_d, False
+
+
 def _resolve_resume_dir(args: Args) -> str:
     if not args.resume_from:
         return ""
@@ -950,7 +974,16 @@ def main() -> None:
         epoch_action_total_n = 0
         epoch_completed_b = False
         try:
-            for batch_d in batch_it:
+            while True:
+                batch_d, should_stop_epoch_b = _next_synced_batch(
+                    batch_it=batch_it,
+                    world_i=world_i,
+                    device=device,
+                )
+                if should_stop_epoch_b:
+                    epoch_completed_b = True
+                    break
+                assert batch_d is not None
                 ddp_model.train()
                 collated_batch_d = (
                     batch_d if prefetched_it is not None else collator(batch_d)
@@ -1312,8 +1345,6 @@ def main() -> None:
 
                 if global_step >= args.max_steps:
                     break
-            else:
-                epoch_completed_b = True
         finally:
             if prefetched_it is not None:
                 prefetched_it.close()

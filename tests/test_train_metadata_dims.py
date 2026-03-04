@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import pytest
+import torch
 
 _TRAIN_PATH = Path(__file__).resolve().parents[1] / "idm" / "train.py"
 _TRAIN_SPEC = importlib.util.spec_from_file_location(
@@ -38,3 +39,60 @@ def test_metadata_shape_check_raises_when_metadata_missing(tmp_path: Path):
     args = _TRAIN_MOD.Args(data_root=str(tmp_path), image_h=90, image_w=160, image_c=3)
     with pytest.raises(ValueError, match="metadata.json not found"):
         _TRAIN_MOD._assert_image_hwc_matches_metadata(args)
+
+
+class _OneBatchIterator:
+    def __init__(self):
+        self._done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._done:
+            raise StopIteration
+        self._done = True
+        return {"x": 1}
+
+
+def test_next_synced_batch_single_rank_iterates_then_stops():
+    it = _OneBatchIterator()
+    batch_d, stop_b = _TRAIN_MOD._next_synced_batch(
+        batch_it=it,
+        world_i=1,
+        device=torch.device("cpu"),
+    )
+    assert not stop_b
+    assert batch_d == {"x": 1}
+
+    batch_d, stop_b = _TRAIN_MOD._next_synced_batch(
+        batch_it=it,
+        world_i=1,
+        device=torch.device("cpu"),
+    )
+    assert stop_b
+    assert batch_d is None
+
+
+def test_next_synced_batch_multi_rank_truncates_when_any_rank_exhausted(monkeypatch):
+    # Simulate this rank having a batch while another rank is exhausted.
+    class _AlwaysBatchIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return {"x": 1}
+
+    def _fake_all_reduce(tensor_t, op=None):
+        del op
+        tensor_t.fill_(0.0)
+
+    monkeypatch.setattr(_TRAIN_MOD.dist, "all_reduce", _fake_all_reduce)
+
+    batch_d, stop_b = _TRAIN_MOD._next_synced_batch(
+        batch_it=_AlwaysBatchIterator(),
+        world_i=2,
+        device=torch.device("cpu"),
+    )
+    assert stop_b
+    assert batch_d is None
