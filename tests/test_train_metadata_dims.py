@@ -96,3 +96,31 @@ def test_next_synced_batch_multi_rank_truncates_when_any_rank_exhausted(monkeypa
     )
     assert stop_b
     assert batch_d is None
+
+
+def test_train_batch_split_sizes_returns_expected_sizes():
+    base_batch_i, dense_batch_i = _TRAIN_MOD._train_batch_split_sizes(
+        global_batch_size=16,
+        world_i=4,
+        dense_mix_fraction=0.25,
+    )
+    assert base_batch_i == 12
+    assert dense_batch_i == 4
+
+
+def test_train_batch_split_sizes_rejects_invalid_fraction():
+    with pytest.raises(ValueError):
+        _TRAIN_MOD._train_batch_split_sizes(
+            global_batch_size=16,
+            world_i=4,
+            dense_mix_fraction=1.0,
+        )
+
+
+def test_train_batch_split_sizes_rejects_unrealizable_per_rank_split():
+    with pytest.raises(ValueError):
+        _TRAIN_MOD._train_batch_split_sizes(
+            global_batch_size=4,
+            world_i=4,
+            dense_mix_fraction=0.25,
+        )

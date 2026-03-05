@@ -30,16 +30,25 @@ def test_train_args_exposes_loss_weighting_flags_with_defaults():
     assert args.mouse_loss_weight == 1.0
 
 
-def test_train_args_exposes_action_upsample_random_fraction_with_default():
+def test_train_args_exposes_dense_mix_flags_with_defaults():
     anns = _TRAIN_MOD.Args.__annotations__
-    assert "train_action_upsample_random_fraction" in anns
+    assert "train_dense_mix_fraction" in anns
+    assert "train_dense_min_action_density" in anns
     args = _TRAIN_MOD.Args()
-    assert args.train_action_upsample_random_fraction == 1.0
+    assert args.train_dense_mix_fraction == 0.25
+    assert args.train_dense_min_action_density == 0.02
+
+
+def test_train_args_no_longer_exposes_old_train_density_flags():
+    anns = _TRAIN_MOD.Args.__annotations__
+    assert "train_min_action_density" not in anns
+    assert "train_action_upsample_random_fraction" not in anns
 
 
 def test_get_dataloader_does_not_accept_actions_map():
     sig = inspect.signature(data.get_dataloader)
     assert "actions_map_d" not in sig.parameters
+    assert "action_upsample_random_fraction" not in sig.parameters
 
 
 def test_count_valid_records_does_not_accept_actions_map():

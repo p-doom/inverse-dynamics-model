@@ -25,6 +25,7 @@ from idm.utils.checkpoint import (
 from idm.utils.actions import action_class_s
 from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
 from idm.utils.data import (
+    DenseMixedBatchIterator,
     count_source_records,
     find_array_record_paths,
     get_dataloader,
@@ -42,8 +43,8 @@ class Args:
     image_c: int = 3
     video_fps: float = 30.0
     seq_len: int = 128
-    train_min_action_density: float = 0.0
-    train_action_upsample_random_fraction: float = 1.0
+    train_dense_mix_fraction: float = 0.25
+    train_dense_min_action_density: float = 0.02
     global_batch_size: int = 8
     grad_accum: int = 1
     max_grad_norm: float = 1.0
@@ -594,6 +595,30 @@ def _next_synced_batch(
     return batch_d, False
 
 
+def _train_batch_split_sizes(
+    *,
+    global_batch_size: int,
+    world_i: int,
+    dense_mix_fraction: float,
+) -> tuple[int, int]:
+    if dense_mix_fraction <= 0.0 or dense_mix_fraction >= 1.0:
+        raise ValueError("--train-dense-mix-fraction must be in (0, 1).")
+    if global_batch_size % world_i != 0:
+        raise ValueError(
+            f"global_batch_size ({global_batch_size}) must divide world_size ({world_i})."
+        )
+    per_rank_batch_i = global_batch_size // world_i
+    dense_per_rank_i = int(round(per_rank_batch_i * dense_mix_fraction))
+    if dense_per_rank_i <= 0 or dense_per_rank_i >= per_rank_batch_i:
+        raise ValueError(
+            "Invalid dense batch split. Increase --global-batch-size or adjust "
+            "--train-dense-mix-fraction so both base and dense per-rank batch "
+            "counts are at least 1."
+        )
+    base_per_rank_i = per_rank_batch_i - dense_per_rank_i
+    return base_per_rank_i * world_i, dense_per_rank_i * world_i
+
+
 def _resolve_resume_dir(args: Args) -> str:
     if not args.resume_from:
         return ""
@@ -756,13 +781,13 @@ def main() -> None:
         raise ValueError("--save_every must be >= 1.")
     if args.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
-    if args.train_min_action_density < 0.0 or args.train_min_action_density > 1.0:
-        raise ValueError("--train-min-action-density must be in [0, 1].")
+    if args.train_dense_mix_fraction <= 0.0 or args.train_dense_mix_fraction >= 1.0:
+        raise ValueError("--train-dense-mix-fraction must be in (0, 1).")
     if (
-        args.train_action_upsample_random_fraction < 0.0
-        or args.train_action_upsample_random_fraction > 1.0
+        args.train_dense_min_action_density < 0.0
+        or args.train_dense_min_action_density > 1.0
     ):
-        raise ValueError("--train-action-upsample-random-fraction must be in [0, 1].")
+        raise ValueError("--train-dense-min-action-density must be in [0, 1].")
     if args.attn_implementation not in {"flash_attention_2", "sdpa", "auto"}:
         raise ValueError(
             "Unsupported --attn-implementation. "
@@ -796,9 +821,11 @@ def main() -> None:
 
     array_paths = find_array_record_paths(args.data_root, "train")
     train_total_records_i = count_source_records(array_paths)
-    train_attempted_global_samples_per_epoch_i = (
-        train_total_records_i // world_i
-    ) * world_i
+    train_base_batch_size_i, train_dense_batch_size_i = _train_batch_split_sizes(
+        global_batch_size=args.global_batch_size,
+        world_i=world_i,
+        dense_mix_fraction=args.train_dense_mix_fraction,
+    )
 
     val_array_paths: list[str] = []
     if args.val_every > 0:
@@ -832,7 +859,10 @@ def main() -> None:
         print(
             "train_data_sampler "
             f"total_records={train_total_records_i} "
-            f"attempted_samples_per_epoch_global={train_attempted_global_samples_per_epoch_i}"
+            f"dense_mix_fraction={args.train_dense_mix_fraction:.4f} "
+            f"dense_min_action_density={args.train_dense_min_action_density:.4f} "
+            f"base_global_batch_size={train_base_batch_size_i} "
+            f"dense_global_batch_size={train_dense_batch_size_i}"
         )
         if mfu_enabled_b:
             print(
@@ -954,10 +984,10 @@ def main() -> None:
 
     while global_step < args.max_steps:
         # Rebuild each epoch for deterministic seed+epoch reshuffle.
-        loader = get_dataloader(
+        base_loader = get_dataloader(
             array_record_paths=array_paths,
             seq_len=args.seq_len,
-            global_batch_size=args.global_batch_size,
+            global_batch_size=train_base_batch_size_i,
             image_h=args.image_h,
             image_w=args.image_w,
             image_c=args.image_c,
@@ -969,10 +999,29 @@ def main() -> None:
             prefetch_buffer_size=args.prefetch_buffer_size,
             read_num_threads=args.read_num_threads,
             worker_buffer_size=args.worker_buffer_size,
-            min_action_density=args.train_min_action_density,
-            action_upsample_random_fraction=args.train_action_upsample_random_fraction,
+            min_action_density=0.0,
         )
-        raw_it = iter(loader)
+        dense_loader = get_dataloader(
+            array_record_paths=array_paths,
+            seq_len=args.seq_len,
+            global_batch_size=train_dense_batch_size_i,
+            image_h=args.image_h,
+            image_w=args.image_w,
+            image_c=args.image_c,
+            rank=rank_i,
+            world_size=world_i,
+            seed=args.seed,
+            epoch_i=epoch_i,
+            num_workers=args.num_workers,
+            prefetch_buffer_size=args.prefetch_buffer_size,
+            read_num_threads=args.read_num_threads,
+            worker_buffer_size=args.worker_buffer_size,
+            min_action_density=args.train_dense_min_action_density,
+        )
+        raw_it = DenseMixedBatchIterator(
+            base_it=iter(base_loader),
+            dense_it=iter(dense_loader),
+        )
         if pending_state_b is not None and epoch_i == resume_epoch_i:
             raw_it.set_state(pending_state_b)
             pending_state_b = None
@@ -1372,7 +1421,8 @@ def main() -> None:
                 prefetched_it.close()
         if global_step == epoch_step_start:
             raise RuntimeError(
-                "No training steps in epoch; lower --train-min-action-density."
+                "No training steps in epoch; lower --train-dense-min-action-density "
+                "or --train-dense-mix-fraction."
             )
         epoch_kept_samples_t = torch.tensor(float(epoch_kept_samples_n), device=device)
         epoch_non_no_op_action_t = torch.tensor(
@@ -1393,28 +1443,12 @@ def main() -> None:
                 "train_data/kept_non_no_op_rate": epoch_kept_non_no_op_rate_f,
                 "train_data/kept_samples": epoch_kept_samples_t.item(),
                 "train_data/kept_action_total": epoch_action_total_t.item(),
+                "train_data/epoch_completed": float(epoch_completed_b),
             }
-            if epoch_completed_b:
-                epoch_accept_rate_f = epoch_kept_samples_t.item() / max(
-                    float(train_attempted_global_samples_per_epoch_i),
-                    1.0,
-                )
-                epoch_rejection_rate_f = min(max(1.0 - epoch_accept_rate_f, 0.0), 1.0)
-                epoch_log_d["train_data/accept_rate"] = epoch_accept_rate_f
-                epoch_log_d["train_data/rejection_rate"] = epoch_rejection_rate_f
-                epoch_log_d["train_data/attempted_samples"] = float(
-                    train_attempted_global_samples_per_epoch_i
-                )
-                print(
-                    f"epoch={epoch_i} train_data_kept_non_no_op_rate={epoch_kept_non_no_op_rate_f:.4f} "
-                    f"train_data_accept_rate={epoch_accept_rate_f:.4f} "
-                    f"train_data_rejection_rate={epoch_rejection_rate_f:.4f}"
-                )
-            else:
-                print(
-                    f"epoch={epoch_i} train_data_kept_non_no_op_rate={epoch_kept_non_no_op_rate_f:.4f} "
-                    "train_data_rejection_rate=na (partial epoch)"
-                )
+            print(
+                f"epoch={epoch_i} train_data_kept_non_no_op_rate={epoch_kept_non_no_op_rate_f:.4f} "
+                f"train_data_epoch_completed={int(epoch_completed_b)}"
+            )
             if wandb_run is not None:
                 wandb_run.log(epoch_log_d, step=global_step)
         epoch_i += 1

@@ -108,33 +108,57 @@ class ActionDensityFilter(grain.transforms.Filter):
             return False
 
 
-class ActionDensityRejectionSampler(grain.transforms.RandomMap):
-    def __init__(self, random_sample_fraction: float):
-        self.random_sample_fraction = float(random_sample_fraction)
-
-    def random_map(self, element: Any, rng: np.random.Generator) -> Any:
-        if self.random_sample_fraction >= 1.0:
-            return element
-        try:
-            actions_L = element["actions"]
-            if not actions_L:
-                return None
-            active_n = sum(
-                1 for action_s in actions_L if not action_is_no_op_b(action_s)
-            )
-            density_f = float(active_n) / float(len(actions_L))
-            keep_prob_f = (
-                self.random_sample_fraction
-                + (1.0 - self.random_sample_fraction) * density_f
-            )
-            return element if float(rng.random()) < keep_prob_f else None
-        except Exception:
-            return None
+def _concat_batch_values(lhs_val: Any, rhs_val: Any) -> Any:
+    if isinstance(lhs_val, np.ndarray) and isinstance(rhs_val, np.ndarray):
+        return np.concatenate((lhs_val, rhs_val), axis=0)
+    if isinstance(lhs_val, list) and isinstance(rhs_val, list):
+        return lhs_val + rhs_val
+    if isinstance(lhs_val, tuple) and isinstance(rhs_val, tuple):
+        return lhs_val + rhs_val
+    raise TypeError(
+        "Unsupported mixed-batch value types: "
+        f"{type(lhs_val)!r} and {type(rhs_val)!r}"
+    )
 
 
-class NotNoneFilter(grain.transforms.Filter):
-    def filter(self, element: Any) -> bool:
-        return element is not None
+def concat_batches(
+    base_batch_d: dict[str, Any],
+    dense_batch_d: dict[str, Any],
+) -> dict[str, Any]:
+    if base_batch_d.keys() != dense_batch_d.keys():
+        raise ValueError("base and dense batch keys must match for mixed batching.")
+    return {
+        key_s: _concat_batch_values(base_batch_d[key_s], dense_batch_d[key_s])
+        for key_s in base_batch_d.keys()
+    }
+
+
+class DenseMixedBatchIterator:
+    def __init__(self, base_it: Any, dense_it: Any):
+        self._base_it = base_it
+        self._dense_it = dense_it
+
+    def __iter__(self) -> "DenseMixedBatchIterator":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        base_batch_d = next(self._base_it)
+        dense_batch_d = next(self._dense_it)
+        return concat_batches(base_batch_d=base_batch_d, dense_batch_d=dense_batch_d)
+
+    def get_state(self) -> bytes:
+        return pickle.dumps(
+            {
+                "base_state_b": self._base_it.get_state(),
+                "dense_state_b": self._dense_it.get_state(),
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    def set_state(self, state_b: bytes) -> None:
+        state_d = pickle.loads(state_b)
+        self._base_it.set_state(state_d["base_state_b"])
+        self._dense_it.set_state(state_d["dense_state_b"])
 
 
 class BuildSFTExampleFromFrames(grain.transforms.Map):
@@ -179,7 +203,6 @@ def get_dataloader(
     read_num_threads: int = 4,
     worker_buffer_size: int = 4,
     min_action_density: float = 0.0,
-    action_upsample_random_fraction: float = 1.0,
 ) -> grain.DataLoader:
     if not array_record_paths:
         raise ValueError("array_record_paths list cannot be empty.")
@@ -198,8 +221,6 @@ def get_dataloader(
         raise ValueError("worker_buffer_size must be >= 1.")
     if min_action_density < 0.0 or min_action_density > 1.0:
         raise ValueError("min_action_density must be in [0, 1].")
-    if action_upsample_random_fraction < 0.0 or action_upsample_random_fraction > 1.0:
-        raise ValueError("action_upsample_random_fraction must be in [0, 1].")
 
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
     sampler = grain.samplers.IndexSampler(
@@ -229,15 +250,6 @@ def get_dataloader(
     ]
     if min_action_density > 0.0:
         ops.append(ActionDensityFilter(min_action_density=min_action_density))
-    if action_upsample_random_fraction < 1.0:
-        ops.extend(
-            [
-                ActionDensityRejectionSampler(
-                    random_sample_fraction=action_upsample_random_fraction
-                ),
-                NotNoneFilter(),
-            ]
-        )
     ops.extend(
         [
             BuildSFTExampleFromFrames(),
