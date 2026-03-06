@@ -2,26 +2,37 @@ from __future__ import annotations
 
 import argparse
 import base64
-from collections import Counter
 from dataclasses import dataclass, field
 import glob
-import io
 import json
 import os
 import pickle
 from pathlib import Path
-import re
+import tempfile
 from typing import Any, Iterator
 
 import numpy as np
+import torch
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+from idm.utils.action_text import (
+    normalize_action,
+    parse_frame_actions,
+    per_action_stats_from_actions,
+)
 
 
 DEFAULT_INSTRUCTION = (
     "Given the video frames, output the action text for each frame in order."
 )
+DEFAULT_SGLANG_INSTRUCTION = (
+    "Given the video, output exactly one line per frame in this format: "
+    "Frame <index>: <ACTION>. Use IDM action strings like NO_OP, "
+    "MOUSE:dx,dy,dz, or MOUSE:dx,dy,dz ; <pressed_keys>. "
+    "Do not add explanations."
+)
 GRID_COLS_DEFAULT = 8
 GRID_TEXT_H_DEFAULT = 40
-_FRAME_ACTION_RE = re.compile(r"^frame\s+(\d+)\s*:\s*(.*)$", re.IGNORECASE)
 
 
 @dataclass
@@ -36,11 +47,13 @@ class SlidingWindowConfig:
 class Args:
     data_root: str = ""
     split: str = "val"
+    backend: str = "sglang"
     sglang_url: str = "http://localhost:30000"
     output_dir: str = "./eval_results"
     image_h: int = 90
     image_w: int = 160
     image_c: int = 3
+    video_fps: float = 30.0
     seq_len: int = 128
     stride: int = 64
     center_start: int = 32
@@ -49,6 +62,10 @@ class Args:
     visualize: bool = False
     instruction_text: str = DEFAULT_INSTRUCTION
     model: str = "default"
+    hf_model_path: str = ""
+    hf_attn_implementation: str = "auto"
+    hf_precision: str = "bf16"
+    hf_device: str = "cuda"
     max_tokens: int = 1024
     max_frames_per_request: int = 16
     request_timeout_s: int = 120
@@ -67,35 +84,10 @@ class EvalMetrics:
         return self.correct / self.total if self.total > 0 else 0.0
 
     def get_per_action_accuracy(self) -> dict[str, dict[str, float]]:
-        gt_norm = [normalize_action(a) for a in self.all_ground_truth]
-        pred_norm = [normalize_action(a) for a in self.all_predictions]
-
-        gt_counts = Counter(gt_norm)
-        pred_counts = Counter(pred_norm)
-        correct_counts = Counter(
-            gt for gt, pred in zip(gt_norm, pred_norm) if gt == pred
+        return per_action_stats_from_actions(
+            pred_actions_L=self.all_predictions,
+            gt_actions_L=self.all_ground_truth,
         )
-
-        per_action: dict[str, dict[str, float]] = {}
-        for action in sorted(set(gt_norm) | set(pred_norm)):
-            tp = correct_counts[action]
-            gt_total = gt_counts[action]
-            pred_total = pred_counts[action]
-            recall = tp / gt_total if gt_total else 0.0
-            precision = tp / pred_total if pred_total else 0.0
-            f1 = (
-                2 * precision * recall / (precision + recall)
-                if (precision + recall) > 0
-                else 0.0
-            )
-            per_action[action] = {
-                "recall": recall,
-                "precision": precision,
-                "f1": f1,
-                "support": gt_total,
-                "predicted_count": pred_total,
-            }
-        return per_action
 
 
 @dataclass
@@ -107,46 +99,19 @@ class VideoEvalResult:
     selected_mask: list[bool]
 
 
-def normalize_action(action_s: str) -> str:
-    return action_s.strip().lower()
-
-
-def parse_frame_actions(text_s: str, expected_n: int | None = None) -> list[str]:
-    indexed_actions: dict[int, str] = {}
-    max_idx_i = -1
-    for raw_line_s in text_s.splitlines():
-        line_s = raw_line_s.strip()
-        if not line_s:
-            continue
-        match = _FRAME_ACTION_RE.match(line_s)
-        if match is None:
-            continue
-        frame_idx_i = int(match.group(1))
-        action_s = match.group(2).strip()
-        indexed_actions[frame_idx_i] = action_s
-        max_idx_i = max(max_idx_i, frame_idx_i)
-
-    actions_L = [""] * (max_idx_i + 1) if max_idx_i >= 0 else []
-    for frame_idx_i, action_s in indexed_actions.items():
-        if frame_idx_i >= 0:
-            actions_L[frame_idx_i] = action_s
-
-    if expected_n is None:
-        return actions_L
-    if expected_n < 0:
-        raise ValueError(f"expected_n must be >= 0, got {expected_n}.")
-    return (actions_L + [""] * expected_n)[:expected_n]
-
-
 def _parse_args() -> Args:
-    parser = argparse.ArgumentParser(description="Evaluate IDM via SGLang endpoint.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate IDM via SGLang endpoint or local HF generation."
+    )
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--split", default="val")
+    parser.add_argument("--backend", choices=["sglang", "hf"], default="sglang")
     parser.add_argument("--sglang-url", default="http://localhost:30000")
     parser.add_argument("--output-dir", default="./eval_results")
     parser.add_argument("--image-h", type=int, default=90)
     parser.add_argument("--image-w", type=int, default=160)
     parser.add_argument("--image-c", type=int, default=3)
+    parser.add_argument("--video-fps", type=float, default=30.0)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--stride", type=int, default=64)
     parser.add_argument("--center-start", type=int, default=32)
@@ -155,6 +120,12 @@ def _parse_args() -> Args:
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--instruction-text", default=DEFAULT_INSTRUCTION)
     parser.add_argument("--model", default="default")
+    parser.add_argument("--hf-model-path", default="")
+    parser.add_argument("--hf-attn-implementation", default="auto")
+    parser.add_argument(
+        "--hf-precision", choices=["bf16", "fp16", "fp32"], default="bf16"
+    )
+    parser.add_argument("--hf-device", default="cuda")
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-frames-per-request", type=int, default=16)
     parser.add_argument("--request-timeout-s", type=int, default=120)
@@ -162,11 +133,13 @@ def _parse_args() -> Args:
     return Args(
         data_root=ns.data_root,
         split=ns.split,
+        backend=ns.backend,
         sglang_url=ns.sglang_url,
         output_dir=ns.output_dir,
         image_h=ns.image_h,
         image_w=ns.image_w,
         image_c=ns.image_c,
+        video_fps=ns.video_fps,
         seq_len=ns.seq_len,
         stride=ns.stride,
         center_start=ns.center_start,
@@ -175,6 +148,10 @@ def _parse_args() -> Args:
         visualize=ns.visualize,
         instruction_text=ns.instruction_text,
         model=ns.model,
+        hf_model_path=ns.hf_model_path,
+        hf_attn_implementation=ns.hf_attn_implementation,
+        hf_precision=ns.hf_precision,
+        hf_device=ns.hf_device,
         max_tokens=ns.max_tokens,
         max_frames_per_request=ns.max_frames_per_request,
         request_timeout_s=ns.request_timeout_s,
@@ -186,8 +163,10 @@ def _validate_args(args: Args) -> None:
         raise ValueError(f"--data-root does not exist: {args.data_root}")
     if not args.split.strip():
         raise ValueError("--split cannot be empty.")
-    if not args.sglang_url.strip():
-        raise ValueError("--sglang-url cannot be empty.")
+    if args.backend == "sglang" and not args.sglang_url.strip():
+        raise ValueError("--sglang-url cannot be empty for backend=sglang.")
+    if args.backend == "hf" and not args.hf_model_path.strip():
+        raise ValueError("--hf-model-path cannot be empty for backend=hf.")
     if args.seq_len <= 0:
         raise ValueError("--seq-len must be >= 1.")
     if args.stride <= 0:
@@ -206,6 +185,12 @@ def _validate_args(args: Args) -> None:
         raise ValueError("--max-frames-per-request must be > 0.")
     if args.request_timeout_s <= 0:
         raise ValueError("--request-timeout-s must be > 0.")
+    if args.video_fps <= 0:
+        raise ValueError("--video-fps must be > 0.")
+    if args.hf_attn_implementation not in {"auto", "flash_attention_2", "sdpa"}:
+        raise ValueError(
+            "--hf-attn-implementation must be one of: auto, flash_attention_2, sdpa."
+        )
 
 
 def find_array_record_paths(data_root: str, split: str) -> list[str]:
@@ -256,21 +241,52 @@ def _window_coverage_counts(
     return in_any_count, in_used_count
 
 
-def _frames_to_base64(frames: np.ndarray) -> list[str]:
+def _frames_to_mp4_data_uri(frames: np.ndarray, fps: float) -> str:
     try:
-        from PIL import Image
+        import cv2
     except ModuleNotFoundError as exc:  # pragma: no cover
         raise ModuleNotFoundError(
-            "Pillow is required for frame encoding. Install with `pip install pillow`."
+            "OpenCV is required for SGLang video payload encoding. Install with `pip install opencv-python`."
         ) from exc
 
-    out: list[str] = []
-    for frame in frames:
-        img = Image.fromarray(frame)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        out.append(base64.b64encode(buf.getvalue()).decode())
-    return out
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError(
+            f"Expected frames with shape [T, H, W, 3], got {tuple(frames.shape)}."
+        )
+
+    h_i = int(frames.shape[1])
+    w_i = int(frames.shape[2])
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+
+    writer = cv2.VideoWriter(
+        str(tmp_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (w_i, h_i),
+    )
+    if not writer.isOpened():
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("Failed to open OpenCV VideoWriter for MP4 encoding.")
+
+    try:
+        for frame in frames:
+            if frame.dtype == np.uint8:
+                frame_u8 = frame
+            else:
+                frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
+            writer.write(cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+    try:
+        video_bytes = tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if not video_bytes:
+        raise RuntimeError("Encoded MP4 payload is empty.")
+    return f"data:video/mp4;base64,{base64.b64encode(video_bytes).decode()}"
 
 
 def _create_video_grid(
@@ -443,26 +459,37 @@ def _coerce_message_content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _effective_instruction_text(backend: str, instruction_text: str) -> str:
+    if backend == "sglang" and instruction_text.strip() == DEFAULT_INSTRUCTION:
+        return DEFAULT_SGLANG_INSTRUCTION
+    return instruction_text
+
+
 class IDMEvaluator:
     def __init__(
         self,
+        backend: str = "sglang",
         sglang_url: str = "http://localhost:30000",
+        hf_model_path: str = "",
+        hf_attn_implementation: str = "auto",
+        hf_precision: str = "bf16",
+        hf_device: str = "cuda",
         config: SlidingWindowConfig | None = None,
         instruction_text: str = DEFAULT_INSTRUCTION,
         model: str = "default",
+        video_fps: float = 30.0,
         max_tokens: int = 1024,
         max_frames_per_request: int = 16,
         request_timeout_s: int = 120,
     ):
-        import openai
-
-        base_url = sglang_url.rstrip("/")
-        if not base_url.endswith("/v1"):
-            base_url = f"{base_url}/v1"
-        self.client = openai.OpenAI(base_url=base_url, api_key="dummy")
+        self.backend = backend
         self.config = config or SlidingWindowConfig()
-        self.instruction_text = instruction_text
+        self.instruction_text = _effective_instruction_text(
+            backend=backend,
+            instruction_text=instruction_text,
+        )
         self.model = model
+        self.video_fps = float(video_fps)
         self.max_tokens = max_tokens
         self.max_frames_per_request = max_frames_per_request
         self.request_timeout_s = request_timeout_s
@@ -472,17 +499,70 @@ class IDMEvaluator:
             "yes",
             "on",
         }
+        self.client = None
+        self.hf_processor = None
+        self.hf_model = None
+        self.hf_device = torch.device(hf_device)
+        self.hf_precision = hf_precision
 
-    def _predict_segment_single_call(self, frames: np.ndarray) -> list[str]:
-        content: list[dict[str, Any]] = []
-        for b64 in _frames_to_base64(frames):
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                }
+        if self.backend == "sglang":
+            import openai
+
+            base_url = sglang_url.rstrip("/")
+            if not base_url.endswith("/v1"):
+                base_url = f"{base_url}/v1"
+            self.client = openai.OpenAI(base_url=base_url, api_key="dummy")
+        elif self.backend == "hf":
+            if self.hf_device.type == "cuda" and not torch.cuda.is_available():
+                raise RuntimeError(
+                    "backend=hf with --hf-device cuda requires visible CUDA devices."
+                )
+            hf_dtype = {
+                "bf16": torch.bfloat16,
+                "fp16": torch.float16,
+                "fp32": torch.float32,
+            }[hf_precision]
+            model_kwargs: dict[str, Any] = {
+                "torch_dtype": hf_dtype,
+                "trust_remote_code": True,
+            }
+            if hf_attn_implementation != "auto":
+                model_kwargs["attn_implementation"] = hf_attn_implementation
+            self.hf_processor = AutoProcessor.from_pretrained(
+                hf_model_path,
+                trust_remote_code=True,
             )
-        content.append({"type": "text", "text": self.instruction_text})
+            self.hf_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                hf_model_path,
+                **model_kwargs,
+            ).to(self.hf_device)
+            self.hf_model.eval()
+        else:
+            raise ValueError(f"Unsupported backend: {self.backend}")
+
+    def _video_input(self, frames_SHWC: np.ndarray) -> list[Any]:
+        return [frames_SHWC[i] for i in range(frames_SHWC.shape[0])]
+
+    def _video_metadata(self, frames_SHWC: np.ndarray) -> dict[str, Any]:
+        return {
+            "total_num_frames": int(frames_SHWC.shape[0]),
+            "fps": float(self.video_fps),
+            "frames_indices": list(range(int(frames_SHWC.shape[0]))),
+        }
+
+    def _build_sglang_content(self, frames: np.ndarray) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "video_url",
+                "video_url": {"url": _frames_to_mp4_data_uri(frames, self.video_fps)},
+            },
+            {"type": "text", "text": self.instruction_text},
+        ]
+
+    def _predict_segment_single_call_sglang(self, frames: np.ndarray) -> list[str]:
+        if self.client is None:
+            raise RuntimeError("SGLang client is not initialized.")
+        content = self._build_sglang_content(frames)
 
         response = self.client.chat.completions.create(
             model=self.model,
@@ -511,6 +591,100 @@ class IDMEvaluator:
             print("[IDM_EVAL_DEBUG] raw_response_end")
         return parsed
 
+    def _predict_segment_single_call_hf(self, frames: np.ndarray) -> list[str]:
+        if self.hf_model is None or self.hf_processor is None:
+            raise RuntimeError("HF backend is not initialized.")
+
+        prompt_msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video"},
+                    {"type": "text", "text": self.instruction_text},
+                ],
+            }
+        ]
+        prompt_text = self.hf_processor.apply_chat_template(
+            prompt_msgs,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_kwargs: dict[str, Any] = {
+            "text": [prompt_text],
+            "videos": [self._video_input(frames)],
+            "padding": True,
+            "return_tensors": "pt",
+            "video_metadata": [self._video_metadata(frames)],
+        }
+        enc_d = self.hf_processor(**prompt_kwargs)
+        enc_d.pop("token_type_ids", None)
+        prompt_len_i = int(enc_d["attention_mask"].sum(dim=1).item())
+
+        model_inputs_d: dict[str, Any] = {}
+        for key_s, val in enc_d.items():
+            if isinstance(val, torch.Tensor):
+                model_inputs_d[key_s] = val.to(self.hf_device)
+            else:
+                model_inputs_d[key_s] = val
+
+        gen_kwargs = {
+            "max_new_tokens": min(self.max_tokens, max(64, int(len(frames) * 12))),
+            "do_sample": False,
+            "use_cache": True,
+        }
+        tokenizer = self.hf_processor.tokenizer
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_id is not None:
+            gen_kwargs["pad_token_id"] = int(pad_id)
+        if eos_id is not None:
+            gen_kwargs["eos_token_id"] = int(eos_id)
+
+        with torch.no_grad():
+            if self.hf_device.type == "cuda" and self.hf_precision in {"bf16", "fp16"}:
+                amp_dtype = (
+                    torch.bfloat16 if self.hf_precision == "bf16" else torch.float16
+                )
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    generated_ids_BS = self.hf_model.generate(
+                        **model_inputs_d,
+                        **gen_kwargs,
+                    )
+            else:
+                generated_ids_BS = self.hf_model.generate(
+                    **model_inputs_d,
+                    **gen_kwargs,
+                )
+
+        pred_ids_L = [
+            int(x) for x in generated_ids_BS[0, prompt_len_i:].detach().cpu().tolist()
+        ]
+        content_text = str(tokenizer.decode(pred_ids_L, skip_special_tokens=True))
+        parsed = parse_frame_actions(content_text, expected_n=len(frames))
+
+        if self.debug_raw:
+            preview = (
+                content_text
+                if len(content_text) <= 6000
+                else content_text[:6000] + "\n...[truncated]"
+            )
+            non_empty = sum(1 for x in parsed if x.strip())
+            print(
+                "[IDM_EVAL_DEBUG] backend=hf "
+                f"parsed_non_empty={non_empty}/{len(parsed)}"
+            )
+            print("[IDM_EVAL_DEBUG] raw_response_begin")
+            print(preview)
+            print("[IDM_EVAL_DEBUG] raw_response_end")
+        return parsed
+
+    def _predict_segment_single_call(self, frames: np.ndarray) -> list[str]:
+        if self.backend == "sglang":
+            return self._predict_segment_single_call_sglang(frames)
+        if self.backend == "hf":
+            return self._predict_segment_single_call_hf(frames)
+        raise ValueError(f"Unsupported backend: {self.backend}")
+
     def predict_segment(self, frames: np.ndarray) -> list[str]:
         n_frames = int(len(frames))
         if n_frames <= 0:
@@ -535,6 +709,7 @@ class IDMEvaluator:
                 "vlm cache",
                 "cache size",
                 "multimodal embedding cache",
+                "out of memory",
                 "timed out",
                 "timeout",
                 "connection error",
@@ -708,10 +883,16 @@ def main() -> None:
         center_end=args.center_end,
     )
     evaluator = IDMEvaluator(
+        backend=args.backend,
         sglang_url=args.sglang_url,
+        hf_model_path=args.hf_model_path,
+        hf_attn_implementation=args.hf_attn_implementation,
+        hf_precision=args.hf_precision,
+        hf_device=args.hf_device,
         config=cfg,
         instruction_text=args.instruction_text,
         model=args.model,
+        video_fps=args.video_fps,
         max_tokens=args.max_tokens,
         max_frames_per_request=args.max_frames_per_request,
         request_timeout_s=args.request_timeout_s,
@@ -750,8 +931,14 @@ def main() -> None:
         "config": {
             "data_root": args.data_root,
             "split": args.split,
+            "backend": args.backend,
             "sglang_url": args.sglang_url,
             "model": args.model,
+            "hf_model_path": args.hf_model_path,
+            "hf_attn_implementation": args.hf_attn_implementation,
+            "hf_precision": args.hf_precision,
+            "hf_device": args.hf_device,
+            "video_fps": args.video_fps,
             "seq_len": args.seq_len,
             "stride": args.stride,
             "center_start": args.center_start,

@@ -22,6 +22,7 @@ from idm.utils.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from idm.utils.action_text import parse_frame_actions
 from idm.utils.actions import action_class_s
 from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
 from idm.utils.data import (
@@ -167,16 +168,7 @@ def _to_device(
 
 
 def _actions_from_target_text(target_s: str) -> list[str]:
-    actions_L = []
-    for line_s in target_s.splitlines():
-        line_s = line_s.strip()
-        if not line_s.startswith("Frame "):
-            continue
-        parts_L = line_s.split(":", 1)
-        if len(parts_L) != 2:
-            continue
-        actions_L.append(parts_L[1].strip())
-    return actions_L
+    return parse_frame_actions(target_s)
 
 
 def _action_class_s(action_s: str) -> str:
