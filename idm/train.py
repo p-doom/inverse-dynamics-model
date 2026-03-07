@@ -31,14 +31,18 @@ from idm.utils.data import (
 )
 from idm.utils.lr_schedules import LRScheduleArgs, lr_at_step
 
+"""
+torchrun     --nnodes=$SLURM_NNODES     --nproc_per_node=4     --rdzv_id=$SLURM_JOB_ID     --rdzv_backend=c10d     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT     idm/train.py       --data-root /p/scratch/envcomp/crowd-cast/crowd-cast-2026-02-18/array_records       --model-id /p/scratch/envcomp/rieger7/Qwen3-VL-2B-Instruct       --attn-implementation sdpa
+"""
+
 
 @dataclass
 class Args:
     model_id: str = "Qwen/Qwen3-VL-2B-Instruct"
     attn_implementation: str = "flash_attention_2"
     data_root: str = ""
-    image_h: int = 90
-    image_w: int = 160
+    image_h: int = 270
+    image_w: int = 480
     image_c: int = 3
     video_fps: float = 30.0
     seq_len: int = 128
@@ -82,7 +86,7 @@ class Args:
     wandb_project: str = "idm"
     wandb_entity: str = ""
     wandb_run_name: str = ""
-    wandb_mode: str = "online"
+    wandb_mode: str = "offline"
     mfu_peak_flops: float = 0.0
 
 

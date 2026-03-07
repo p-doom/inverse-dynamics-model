@@ -17,19 +17,12 @@ from copy import deepcopy
 
 import numpy as np
 
+"""
+python evaluate/generate_hf.py   --data-root /p/scratch/envcomp/crowd-cast/crowd-cast-2026-02-18/array_records   --split train   --base-model /p/scratch/envcomp/rieger7/Qwen3-VL-2B-Instruct --adapter /p/home/jusers/rieger7/juwels/idm/inverse-dynamics-model/runs/default/checkpoints/step_00000100/adapter/ --attn-implementation "sdpa"  --max-videos 4
+"""
 
 DEFAULT_INSTRUCTION = (
-    """Given the video frames, output the action text for each frame in order.
-Example output:
-Frame 0: no_op
-Frame 1: key_up:o
-Frame 2: key_down:o
-Frame 3: mouse_move
-Frame 4: mouse_down:left
-...
-Frame 20: key_up:shift
-...
-Now output actions for the given frames:"""
+    """Given the video frames, output the action text for each frame in order."""
 )
 GRID_COLS_DEFAULT = 8
 GRID_TEXT_H_DEFAULT = 40
@@ -49,7 +42,8 @@ class Args:
     num_gpus: int = 4
     data_root: str = ""
     split: str = "val"
-    model: str = ""
+    base_model: str = ""
+    adapter: str | None = None
     output_dir: str = "./eval_results"
     image_h: int = 90
     image_w: int = 160
@@ -132,7 +126,7 @@ def worker_fn(rank: int, args: Args, video_paths: list[str]):
         center_start=args.center_start, center_end=args.center_end
     )
     evaluator = IDMEvaluatorHF(
-        model_name_or_path=args.model, config=cfg,
+        model_name_or_path=args.base_model, adapter_path=args.adapter, config=cfg,
         instruction_text=args.instruction_text, max_tokens=args.max_tokens,
         max_frames_per_request=args.max_frames_per_request,
         video_fps=args.video_fps, dtype=args.dtype,
@@ -202,10 +196,11 @@ def _parse_args() -> Args:
     )
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--split", default="val")
-    parser.add_argument("--model", required=True, help="HF model name or local path.")
+    parser.add_argument("--base-model", default="", help="Base HF model id/path (e.g. Qwen/Qwen3-VL-2B-Instruct)")
+    parser.add_argument("--adapter", default="", help="Path to LoRA adapter dir (e.g. .../checkpoints/step_00000100/adapter)")
     parser.add_argument("--output-dir", default="./eval_results")
-    parser.add_argument("--image-h", type=int, default=90)
-    parser.add_argument("--image-w", type=int, default=160)
+    parser.add_argument("--image-h", type=int, default=270)
+    parser.add_argument("--image-w", type=int, default=480)
     parser.add_argument("--image-c", type=int, default=3)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--stride", type=int, default=64)
@@ -234,7 +229,8 @@ def _parse_args() -> Args:
     return Args(
         data_root=ns.data_root,
         split=ns.split,
-        model=ns.model,
+        base_model=ns.base_model,
+        adapter=ns.adapter,
         output_dir=ns.output_dir,
         image_h=ns.image_h,
         image_w=ns.image_w,
@@ -260,8 +256,8 @@ def _validate_args(args: Args) -> None:
         raise ValueError(f"--data-root does not exist: {args.data_root}")
     if not args.split.strip():
         raise ValueError("--split cannot be empty.")
-    if not args.model.strip():
-        raise ValueError("--model cannot be empty.")
+    if not args.base_model.strip():
+        raise ValueError("--base-model cannot be empty.")
     if args.seq_len <= 0:
         raise ValueError("--seq-len must be >= 1.")
     if args.stride <= 0:
@@ -483,6 +479,7 @@ class IDMEvaluatorHF:
     def __init__(
         self,
         model_name_or_path: str,
+        adapter_path: str | None = None,
         config: SlidingWindowConfig | None = None,
         instruction_text: str = DEFAULT_INSTRUCTION,
         max_tokens: int = 128,
@@ -494,6 +491,7 @@ class IDMEvaluatorHF:
     ):
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
+        from peft import PeftModel
 
         _dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -514,6 +512,13 @@ class IDMEvaluatorHF:
             attn_implementation=attn_implementation,
             trust_remote_code=True,
         )
+        if adapter_path:
+            print(f"Loading LoRA adapter from {adapter_path} ...")
+            self.model = PeftModel.from_pretrained(self.model, adapter_path, is_trainable=False)
+            self.model = self.model.merge_and_unload()
+            self.model.config.use_cache = True  
+        else:
+            print("No adapter path provided, using base model without adapter. Prompt might be unsuited for that model.")
         self.model.eval()
         self.device = device
         self._torch_dtype = torch_dtype
@@ -800,7 +805,8 @@ def main() -> None:
         "config": {
             "data_root": args.data_root,
             "split": args.split,
-            "model": args.model,
+            "base_model": args.base_model,
+            "adapter": args.adapter,
             "seq_len": args.seq_len,
             "stride": args.stride,
             "center_start": args.center_start,
