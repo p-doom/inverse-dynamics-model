@@ -351,6 +351,32 @@ def test_action_accuracy_filter_keeps_original_frame_alignment():
     assert total_n == 1
 
 
+def test_action_f1_from_counts_matches_precision_recall_formula():
+    f1_f = _TRAIN_MOD._action_f1_from_counts(
+        correct_n_f=6.0,
+        pred_total_n_f=10.0,
+        target_total_n_f=8.0,
+    )
+    expected_precision_f = 6.0 / 10.0
+    expected_recall_f = 6.0 / 8.0
+    expected_f1_f = (
+        2.0
+        * expected_precision_f
+        * expected_recall_f
+        / (expected_precision_f + expected_recall_f)
+    )
+    assert f1_f == pytest.approx(expected_f1_f)
+
+
+def test_action_f1_from_counts_is_zero_when_no_matches():
+    f1_f = _TRAIN_MOD._action_f1_from_counts(
+        correct_n_f=0.0,
+        pred_total_n_f=0.0,
+        target_total_n_f=0.0,
+    )
+    assert f1_f == pytest.approx(0.0)
+
+
 def test_action_accuracy_counts_from_texts_populates_per_class_counts():
     pred_text = [
         "Frame 0: NO_OP\nFrame 1: MOUSE:3,0,0 ; W\nFrame 2: KEY_DOWN:W",
@@ -499,6 +525,7 @@ def test_build_val_wandb_log_d_uses_fresh_val_action_split(monkeypatch):
         val_loss_f=1.23,
         val_toks_per_s_f=45.6,
         val_action_acc_f=0.7,
+        val_action_f1_f=0.65,
         val_pred_no_op_rate_f=0.1,
         val_target_no_op_rate_f=0.2,
         val_pred_mouse_rate_f=0.3,
@@ -516,6 +543,7 @@ def test_build_val_wandb_log_d_uses_fresh_val_action_split(monkeypatch):
 
     assert log_d["val/loss"] == pytest.approx(1.23)
     assert log_d["val/tokens_per_s"] == pytest.approx(45.6)
+    assert log_d["val_action/action_f1"] == pytest.approx(0.65)
     assert "val_action/action_acc_no_op" in log_d
     assert "val/action_acc_no_op" not in log_d
     assert log_d["val_action/confusion_matrix"] == "chart-obj"
@@ -544,6 +572,7 @@ def test_build_val_wandb_log_d_skips_confusion_chart_when_no_counts(monkeypatch)
         val_loss_f=0.1,
         val_toks_per_s_f=1.0,
         val_action_acc_f=0.0,
+        val_action_f1_f=0.0,
         val_pred_no_op_rate_f=0.0,
         val_target_no_op_rate_f=0.0,
         val_pred_mouse_rate_f=0.0,

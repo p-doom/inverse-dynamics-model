@@ -9,6 +9,8 @@ from array_record.python.array_record_module import ArrayRecordReader
 import grain
 import numpy as np
 
+from idm.utils.actions import action_is_no_op_b
+
 
 def derive_record_key(rec_d: dict[str, Any]) -> str:
     path_s = rec_d.get("path")
@@ -86,6 +88,26 @@ class ProcessEpisodeAndSlice(grain.transforms.RandomMap):
         }
 
 
+class ActionDensityFilter(grain.transforms.Filter):
+    def __init__(self, min_action_density: float):
+        self.min_action_density = float(min_action_density)
+
+    def filter(self, element: Any) -> bool:
+        if self.min_action_density <= 0.0:
+            return True
+        try:
+            actions_L = element["actions"]
+            if not actions_L:
+                return False
+            active_n = sum(
+                1 for action_s in actions_L if not action_is_no_op_b(action_s)
+            )
+            density_f = float(active_n) / float(len(actions_L))
+            return density_f >= self.min_action_density
+        except Exception:
+            return False
+
+
 class BuildSFTExampleFromFrames(grain.transforms.Map):
     def map(self, element: dict[str, Any]) -> dict[str, Any]:
         actions_L = element["actions"]
@@ -120,6 +142,7 @@ def get_dataloader(
     prefetch_buffer_size: int = 8,
     read_num_threads: int = 4,
     worker_buffer_size: int = 4,
+    min_action_density: float = 0.0,
 ) -> grain.DataLoader:
     if not array_record_paths:
         raise ValueError("array_record_paths list cannot be empty.")
@@ -136,6 +159,8 @@ def get_dataloader(
         raise ValueError("read_num_threads must be >= 1.")
     if worker_buffer_size <= 0:
         raise ValueError("worker_buffer_size must be >= 1.")
+    if min_action_density < 0.0 or min_action_density > 1.0:
+        raise ValueError("min_action_density must be in [0, 1].")
 
     source = grain.sources.ArrayRecordDataSource(array_record_paths)
     sampler = grain.samplers.IndexSampler(
@@ -162,12 +187,18 @@ def get_dataloader(
             image_w=image_w,
             image_c=image_c,
         ),
-        BuildSFTExampleFromFrames(),
-        grain.transforms.Batch(
-            batch_size=global_batch_size // world_size,
-            drop_remainder=True,
-        ),
     ]
+    if min_action_density > 0.0:
+        ops.append(ActionDensityFilter(min_action_density=min_action_density))
+    ops.extend(
+        [
+            BuildSFTExampleFromFrames(),
+            grain.transforms.Batch(
+                batch_size=global_batch_size // world_size,
+                drop_remainder=True,
+            ),
+        ]
+    )
     read_opts = grain.ReadOptions(
         prefetch_buffer_size=prefetch_buffer_size,
         num_threads=read_num_threads,

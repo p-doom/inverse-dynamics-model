@@ -6,6 +6,7 @@ import pytest
 grain = pytest.importorskip("grain")
 
 from idm.utils.data import (  # noqa: E402
+    ActionDensityFilter,
     BuildSFTExampleFromFrames,
     EpisodeLengthFilter,
     ProcessEpisodeAndSlice,
@@ -68,3 +69,21 @@ def test_build_sft_example_outputs_all_actions_text():
     assert "Frame 0: left" in out_d["target_text"]
     assert "Frame 1: jump" in out_d["target_text"]
     assert "Frame 2: shoot" in out_d["target_text"]
+
+
+def test_action_density_filter_rejects_too_sparse_sequence():
+    filt = ActionDensityFilter(min_action_density=0.5)
+    element_d = {
+        "frames": np.zeros((4, 2, 2, 3), dtype=np.uint8),
+        "actions": ["NO_OP", "NO_OP", "NO_OP", "MOUSE:1,0,0"],
+    }
+    assert not filt.filter(element_d)
+
+
+def test_action_density_filter_accepts_sufficiently_active_sequence():
+    filt = ActionDensityFilter(min_action_density=0.5)
+    element_d = {
+        "frames": np.zeros((4, 2, 2, 3), dtype=np.uint8),
+        "actions": ["NO_OP", "MOUSE:1,0,0", "MOUSE:0,0,0 ; W", "NO_OP"],
+    }
+    assert filt.filter(element_d)

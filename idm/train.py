@@ -46,6 +46,7 @@ class Args:
     image_c: int = 3
     video_fps: float = 30.0
     seq_len: int = 128
+    train_min_action_density: float = 0.0
     global_batch_size: int = 8
     grad_accum: int = 1
     max_grad_norm: float = 1.0
@@ -327,11 +328,25 @@ def _wandb_action_confusion_matrix_chart_from_counts(
     )
 
 
+def _action_f1_from_counts(
+    correct_n_f: float,
+    pred_total_n_f: float,
+    target_total_n_f: float,
+) -> float:
+    precision_f = float(correct_n_f) / max(float(pred_total_n_f), 1.0)
+    recall_f = float(correct_n_f) / max(float(target_total_n_f), 1.0)
+    denom_f = precision_f + recall_f
+    if denom_f <= 0.0:
+        return 0.0
+    return 2.0 * precision_f * recall_f / denom_f
+
+
 def _build_val_wandb_log_d(
     *,
     val_loss_f: float,
     val_toks_per_s_f: float,
     val_action_acc_f: float,
+    val_action_f1_f: float,
     val_pred_no_op_rate_f: float,
     val_target_no_op_rate_f: float,
     val_pred_mouse_rate_f: float,
@@ -350,6 +365,7 @@ def _build_val_wandb_log_d(
         "val/loss": val_loss_f,
         "val/tokens_per_s": val_toks_per_s_f,
         "val_action/action_acc": val_action_acc_f,
+        "val_action/action_f1": val_action_f1_f,
         "val_action/pred_no_op_rate": val_pred_no_op_rate_f,
         "val_action/target_no_op_rate": val_target_no_op_rate_f,
         "val_action/pred_mouse_rate": val_pred_mouse_rate_f,
@@ -710,6 +726,8 @@ def main() -> None:
         raise ValueError("--save_every must be >= 1.")
     if args.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
+    if args.train_min_action_density < 0.0 or args.train_min_action_density > 1.0:
+        raise ValueError("--train-min-action-density must be in [0, 1].")
     if args.attn_implementation not in {"flash_attention_2", "sdpa", "auto"}:
         raise ValueError(
             "Unsupported --attn-implementation. "
@@ -826,6 +844,7 @@ def main() -> None:
             prefetch_buffer_size=args.prefetch_buffer_size,
             read_num_threads=args.read_num_threads,
             worker_buffer_size=args.worker_buffer_size,
+            min_action_density=0.0,
         )
         val_it = iter(val_loader)
     trainable_params = [p for p in ddp_model.parameters() if p.requires_grad]
@@ -906,6 +925,7 @@ def main() -> None:
             prefetch_buffer_size=args.prefetch_buffer_size,
             read_num_threads=args.read_num_threads,
             worker_buffer_size=args.worker_buffer_size,
+            min_action_density=args.train_min_action_density,
         )
         raw_it = iter(loader)
         if pending_state_b is not None and epoch_i == resume_epoch_i:
@@ -918,6 +938,7 @@ def main() -> None:
             else None
         )
         batch_it = prefetched_it if prefetched_it is not None else raw_it
+        epoch_step_start = global_step
         try:
             for batch_d in batch_it:
                 ddp_model.train()
@@ -1161,6 +1182,11 @@ def main() -> None:
                     val_action_acc_f = val_action_correct_t.item() / max(
                         val_action_total_t.item(), 1.0
                     )
+                    val_action_f1_f = _action_f1_from_counts(
+                        correct_n_f=val_action_correct_t.item(),
+                        pred_total_n_f=val_pred_action_total_t.item(),
+                        target_total_n_f=val_target_action_total_t.item(),
+                    )
                     val_pred_no_op_rate_f = val_pred_no_op_t.item() / max(
                         val_pred_action_total_t.item(), 1.0
                     )
@@ -1194,6 +1220,7 @@ def main() -> None:
                             f"step={global_step} val_loss={val_loss_t.item():.6f} "
                             f"val_steps={args.val_steps} val_tokens_per_s={val_toks_per_s:.1f} "
                             f"val_action_acc={val_action_acc_f:.6f} "
+                            f"val_action_f1={val_action_f1_f:.6f} "
                             f"val_pred_no_op_rate={val_pred_no_op_rate_f:.4f} "
                             f"val_target_no_op_rate={val_target_no_op_rate_f:.4f} "
                             f"val_pred_mouse_rate={val_pred_mouse_rate_f:.4f} "
@@ -1224,6 +1251,7 @@ def main() -> None:
                                     val_loss_f=val_loss_t.item(),
                                     val_toks_per_s_f=val_toks_per_s,
                                     val_action_acc_f=val_action_acc_f,
+                                    val_action_f1_f=val_action_f1_f,
                                     val_pred_no_op_rate_f=val_pred_no_op_rate_f,
                                     val_target_no_op_rate_f=val_target_no_op_rate_f,
                                     val_pred_mouse_rate_f=val_pred_mouse_rate_f,
@@ -1274,6 +1302,10 @@ def main() -> None:
         finally:
             if prefetched_it is not None:
                 prefetched_it.close()
+        if global_step == epoch_step_start:
+            raise RuntimeError(
+                "No training steps in epoch; lower --train-min-action-density."
+            )
         epoch_i += 1
 
     if rank_i == 0:
