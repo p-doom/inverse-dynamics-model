@@ -23,6 +23,11 @@ from idm.utils.checkpoint import (
     save_checkpoint,
 )
 from idm.utils.actions import action_class_s
+from idm.utils.action_metrics import (
+    action_event_match_counts,
+    actions_from_target_text,
+    precision_recall_f1_from_counts,
+)
 from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
 from idm.utils.data import (
     count_source_records,
@@ -170,16 +175,7 @@ def _to_device(
 
 
 def _actions_from_target_text(target_s: str) -> list[str]:
-    actions_L = []
-    for line_s in target_s.splitlines():
-        line_s = line_s.strip()
-        if not line_s.startswith("Frame "):
-            continue
-        parts_L = line_s.split(":", 1)
-        if len(parts_L) != 2:
-            continue
-        actions_L.append(parts_L[1].strip())
-    return actions_L
+    return actions_from_target_text(target_s)
 
 
 def _action_class_s(action_s: str) -> str:
@@ -365,6 +361,12 @@ def _build_val_wandb_log_d(
     val_action_total_no_op_f: float,
     val_action_total_mouse_f: float,
     val_action_total_keyboard_f: float,
+    val_precision_strict_f: float,
+    val_recall_strict_f: float,
+    val_f1_strict_f: float,
+    val_precision_tolerant_f: float,
+    val_recall_tolerant_f: float,
+    val_f1_tolerant_f: float,
     val_confusion_counts_NM: list[list[int]],
 ) -> dict[str, Any]:
     log_d: dict[str, Any] = {
@@ -384,6 +386,12 @@ def _build_val_wandb_log_d(
         "val_action/action_total_no_op": val_action_total_no_op_f,
         "val_action/action_total_mouse": val_action_total_mouse_f,
         "val_action/action_total_keyboard": val_action_total_keyboard_f,
+        "val_action/precision_strict": val_precision_strict_f,
+        "val_action/recall_strict": val_recall_strict_f,
+        "val_action/f1_strict": val_f1_strict_f,
+        "val_action/precision_tolerant": val_precision_tolerant_f,
+        "val_action/recall_tolerant": val_recall_tolerant_f,
+        "val_action/f1_tolerant": val_f1_tolerant_f,
     }
     confusion_chart = _wandb_action_confusion_matrix_chart_from_counts(
         val_confusion_counts_NM
@@ -442,6 +450,12 @@ def _run_validation_steps(
     val_target_action_total_n = 0
     val_action_class_counts_d: dict[str, int] = {}
     val_action_confusion_counts_d: dict[str, int] = {}
+    val_strict_tp_n = 0
+    val_strict_fp_n = 0
+    val_strict_fn_n = 0
+    val_tolerant_tp_n = 0
+    val_tolerant_fp_n = 0
+    val_tolerant_fn_n = 0
 
     with torch.no_grad():
         for _ in range(val_steps):
@@ -522,6 +536,18 @@ def _run_validation_steps(
                 target_mouse_i,
                 target_total_i,
             ) = _action_type_counts_from_texts(target_text_L)
+            strict_tp_i, strict_fp_i, strict_fn_i = action_event_match_counts(
+                pred_text_B=pred_text_B,
+                target_text_B=target_text_L,
+                tolerance_frames=0,
+                ignore_no_op=True,
+            )
+            tolerant_tp_i, tolerant_fp_i, tolerant_fn_i = action_event_match_counts(
+                pred_text_B=pred_text_B,
+                target_text_B=target_text_L,
+                tolerance_frames=5,
+                ignore_no_op=True,
+            )
             val_action_correct_n += correct_i
             val_action_total_n += total_i
             val_pred_no_op_n += pred_no_op_i
@@ -530,6 +556,12 @@ def _run_validation_steps(
             val_target_no_op_n += target_no_op_i
             val_target_mouse_n += target_mouse_i
             val_target_action_total_n += target_total_i
+            val_strict_tp_n += strict_tp_i
+            val_strict_fp_n += strict_fp_i
+            val_strict_fn_n += strict_fn_i
+            val_tolerant_tp_n += tolerant_tp_i
+            val_tolerant_fp_n += tolerant_fp_i
+            val_tolerant_fn_n += tolerant_fn_i
 
     ddp_model.train()
     val_loss_f = val_loss_num / max(float(val_tok_n), 1.0)
@@ -558,6 +590,12 @@ def _run_validation_steps(
         action_stats_out_d["class_keyboard_total_n"] = val_action_class_counts_d.get(
             "keyboard_total_n", 0
         )
+        action_stats_out_d["strict_tp_n"] = val_strict_tp_n
+        action_stats_out_d["strict_fp_n"] = val_strict_fp_n
+        action_stats_out_d["strict_fn_n"] = val_strict_fn_n
+        action_stats_out_d["tolerant_tp_n"] = val_tolerant_tp_n
+        action_stats_out_d["tolerant_fp_n"] = val_tolerant_fp_n
+        action_stats_out_d["tolerant_fn_n"] = val_tolerant_fn_n
         for target_class_s in _ACTION_CLASS_NAMES:
             for pred_class_s in _ACTION_CONFUSION_PRED_CLASS_NAMES:
                 key_s = _action_confusion_count_key(target_class_s, pred_class_s)
@@ -1215,6 +1253,30 @@ def main() -> None:
                         float(val_action_stats_d.get("class_keyboard_total_n", 0)),
                         device=device,
                     )
+                    val_strict_tp_t = torch.tensor(
+                        float(val_action_stats_d.get("strict_tp_n", 0)),
+                        device=device,
+                    )
+                    val_strict_fp_t = torch.tensor(
+                        float(val_action_stats_d.get("strict_fp_n", 0)),
+                        device=device,
+                    )
+                    val_strict_fn_t = torch.tensor(
+                        float(val_action_stats_d.get("strict_fn_n", 0)),
+                        device=device,
+                    )
+                    val_tolerant_tp_t = torch.tensor(
+                        float(val_action_stats_d.get("tolerant_tp_n", 0)),
+                        device=device,
+                    )
+                    val_tolerant_fp_t = torch.tensor(
+                        float(val_action_stats_d.get("tolerant_fp_n", 0)),
+                        device=device,
+                    )
+                    val_tolerant_fn_t = torch.tensor(
+                        float(val_action_stats_d.get("tolerant_fn_n", 0)),
+                        device=device,
+                    )
                     val_confusion_counts_t = torch.tensor(
                         _action_confusion_matrix_counts_from_stats(val_action_stats_d),
                         device=device,
@@ -1243,6 +1305,12 @@ def main() -> None:
                             val_class_keyboard_total_t,
                             op=dist.ReduceOp.SUM,
                         )
+                        dist.all_reduce(val_strict_tp_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_strict_fp_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_strict_fn_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_tolerant_tp_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_tolerant_fp_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_tolerant_fn_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_confusion_counts_t, op=dist.ReduceOp.SUM)
                     val_loss_t = val_loss_num_t / torch.clamp(val_tok_t, min=1.0)
                     val_dt = max(time.time() - val_t0, 1e-9)
@@ -1279,6 +1347,24 @@ def main() -> None:
                         val_class_keyboard_correct_t.item()
                         / max(val_class_keyboard_total_t.item(), 1.0)
                     )
+                    (
+                        val_precision_strict_f,
+                        val_recall_strict_f,
+                        val_f1_strict_f,
+                    ) = precision_recall_f1_from_counts(
+                        tp_n=val_strict_tp_t.item(),
+                        fp_n=val_strict_fp_t.item(),
+                        fn_n=val_strict_fn_t.item(),
+                    )
+                    (
+                        val_precision_tolerant_f,
+                        val_recall_tolerant_f,
+                        val_f1_tolerant_f,
+                    ) = precision_recall_f1_from_counts(
+                        tp_n=val_tolerant_tp_t.item(),
+                        fp_n=val_tolerant_fp_t.item(),
+                        fn_n=val_tolerant_fn_t.item(),
+                    )
                     val_confusion_counts_NM = [
                         [int(x) for x in row]
                         for row in val_confusion_counts_t.detach().cpu().tolist()
@@ -1295,7 +1381,13 @@ def main() -> None:
                             f"val_target_mouse_rate={val_target_mouse_rate_f:.4f} "
                             f"val_action_acc_no_op={val_action_acc_no_op_f:.4f} "
                             f"val_action_acc_mouse={val_action_acc_mouse_f:.4f} "
-                            f"val_action_acc_keyboard={val_action_acc_keyboard_f:.4f}"
+                            f"val_action_acc_keyboard={val_action_acc_keyboard_f:.4f} "
+                            f"val_precision_strict={val_precision_strict_f:.4f} "
+                            f"val_recall_strict={val_recall_strict_f:.4f} "
+                            f"val_f1_strict={val_f1_strict_f:.4f} "
+                            f"val_precision_tolerant={val_precision_tolerant_f:.4f} "
+                            f"val_recall_tolerant={val_recall_tolerant_f:.4f} "
+                            f"val_f1_tolerant={val_f1_tolerant_f:.4f}"
                         )
                         if val_examples_L:
                             for ex_i, (pred_s, target_s) in enumerate(
@@ -1332,6 +1424,12 @@ def main() -> None:
                                     val_action_total_no_op_f=val_class_no_op_total_t.item(),
                                     val_action_total_mouse_f=val_class_mouse_total_t.item(),
                                     val_action_total_keyboard_f=val_class_keyboard_total_t.item(),
+                                    val_precision_strict_f=val_precision_strict_f,
+                                    val_recall_strict_f=val_recall_strict_f,
+                                    val_f1_strict_f=val_f1_strict_f,
+                                    val_precision_tolerant_f=val_precision_tolerant_f,
+                                    val_recall_tolerant_f=val_recall_tolerant_f,
+                                    val_f1_tolerant_f=val_f1_tolerant_f,
                                     val_confusion_counts_NM=val_confusion_counts_NM,
                                 ),
                                 step=global_step,
