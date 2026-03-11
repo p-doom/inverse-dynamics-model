@@ -6,9 +6,11 @@ import pytest
 grain = pytest.importorskip("grain")
 
 from idm.utils.data import (  # noqa: E402
+    ActionDensityRejectionSampler,
     ActionDensityFilter,
     BuildSFTExampleFromFrames,
     EpisodeLengthFilter,
+    NotNoneFilter,
     ProcessEpisodeAndSlice,
 )
 
@@ -87,3 +89,55 @@ def test_action_density_filter_accepts_sufficiently_active_sequence():
         "actions": ["NO_OP", "MOUSE:1,0,0", "MOUSE:0,0,0 ; W", "NO_OP"],
     }
     assert filt.filter(element_d)
+
+
+def test_action_density_rejection_sampler_keeps_all_when_random_fraction_is_one():
+    tr = ActionDensityRejectionSampler(random_sample_fraction=1.0)
+    element_d = {
+        "frames": np.zeros((4, 2, 2, 3), dtype=np.uint8),
+        "actions": ["NO_OP", "NO_OP", "NO_OP", "NO_OP"],
+    }
+    out_d = tr.random_map(element_d, np.random.default_rng(0))
+    assert out_d == element_d
+
+
+def test_action_density_rejection_sampler_drops_all_noop_when_random_fraction_is_zero():
+    tr = ActionDensityRejectionSampler(random_sample_fraction=0.0)
+    element_d = {
+        "frames": np.zeros((4, 2, 2, 3), dtype=np.uint8),
+        "actions": ["NO_OP", "NO_OP", "NO_OP", "NO_OP"],
+    }
+    out_d = tr.random_map(element_d, np.random.default_rng(0))
+    assert out_d is None
+
+
+def test_action_density_rejection_sampler_keeps_all_active_when_random_fraction_is_zero():
+    tr = ActionDensityRejectionSampler(random_sample_fraction=0.0)
+    element_d = {
+        "frames": np.zeros((4, 2, 2, 3), dtype=np.uint8),
+        "actions": ["MOUSE:1,0,0", "MOUSE:1,0,0", "MOUSE:1,0,0", "MOUSE:1,0,0"],
+    }
+    out_d = tr.random_map(element_d, np.random.default_rng(0))
+    assert out_d == element_d
+
+
+def test_action_density_rejection_sampler_matches_expected_keep_rate():
+    tr = ActionDensityRejectionSampler(random_sample_fraction=0.5)
+    element_d = {
+        "frames": np.zeros((4, 2, 2, 3), dtype=np.uint8),
+        "actions": ["NO_OP", "NO_OP", "MOUSE:1,0,0", "NO_OP"],
+    }
+    # density = 0.25 -> expected keep probability = 0.5 + 0.5 * 0.25 = 0.625
+    trials_n = 4000
+    kept_n = 0
+    rng = np.random.default_rng(123)
+    for _ in range(trials_n):
+        kept_n += int(tr.random_map(element_d, rng) is not None)
+    keep_rate_f = float(kept_n) / float(trials_n)
+    assert keep_rate_f == pytest.approx(0.625, abs=0.03)
+
+
+def test_not_none_filter_accepts_only_non_none():
+    filt = NotNoneFilter()
+    assert filt.filter({"x": 1})
+    assert not filt.filter(None)
