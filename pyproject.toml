@@ -32,6 +32,12 @@ dev = [
   "pytest",
 ]
 
+[dependency-groups]
+dev = [
+  "pre-commit",
+  "pytest",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -40,6 +46,10 @@ build-backend = "setuptools.build_meta"
 include = ["idm*"]
 
 [tool.uv]
+default-groups = ["dev"]
 override-dependencies = [
   "nvidia-cudnn-cu12==9.16.0.29; sys_platform == 'linux'",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -25,9 +25,9 @@ from idm.utils.checkpoint import (
 from idm.utils.actions import action_class_s
 from idm.utils.action_metrics import (
     action_event_match_counts,
-    actions_from_target_text,
     precision_recall_f1_from_counts,
 )
+from idm.utils.action_text import parse_frame_actions
 from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
 from idm.utils.data import (
     count_source_records,
@@ -179,7 +179,7 @@ def _to_device(
 
 
 def _actions_from_target_text(target_s: str) -> list[str]:
-    return actions_from_target_text(target_s)
+    return parse_frame_actions(str(target_s))
 
 
 def _action_class_s(action_s: str) -> str:

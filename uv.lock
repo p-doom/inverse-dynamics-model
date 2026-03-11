@@ -929,6 +929,12 @@ dev = [
     { name = "pytest" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pre-commit" },
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "array-record", specifier = ">=0.7.2" },
@@ -950,6 +956,12 @@ requires-dist = [
     { name = "wandb" },
 ]
 provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pre-commit" },
+    { name = "pytest" },
+]
 
 [[package]]
 name = "idna"
