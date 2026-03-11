@@ -22,10 +22,15 @@ from idm.utils.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from idm.utils.action_text import parse_frame_actions
 from idm.utils.actions import action_class_s
+from idm.utils.action_metrics import (
+    action_event_match_counts,
+    actions_from_target_text,
+    precision_recall_f1_from_counts,
+)
 from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
 from idm.utils.data import (
+    count_source_records,
     find_array_record_paths,
     get_dataloader,
 )
@@ -47,6 +52,7 @@ class Args:
     video_fps: float = 30.0
     seq_len: int = 128
     train_min_action_density: float = 0.0
+    train_action_upsample_random_fraction: float = 1.0
     global_batch_size: int = 8
     grad_accum: int = 1
     max_grad_norm: float = 1.0
@@ -160,7 +166,7 @@ def _to_device(
     skip_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     skip_keys = (
-        {"videos", "prompt_lens", "meta", "label_weights"}
+        {"videos", "prompt_lens", "meta", "label_weights", "target_text"}
         if skip_keys is None
         else set(skip_keys)
     )
@@ -173,7 +179,7 @@ def _to_device(
 
 
 def _actions_from_target_text(target_s: str) -> list[str]:
-    return parse_frame_actions(target_s)
+    return actions_from_target_text(target_s)
 
 
 def _action_class_s(action_s: str) -> str:
@@ -359,6 +365,12 @@ def _build_val_wandb_log_d(
     val_action_total_no_op_f: float,
     val_action_total_mouse_f: float,
     val_action_total_keyboard_f: float,
+    val_precision_strict_f: float,
+    val_recall_strict_f: float,
+    val_f1_strict_f: float,
+    val_precision_tolerant_f: float,
+    val_recall_tolerant_f: float,
+    val_f1_tolerant_f: float,
     val_confusion_counts_NM: list[list[int]],
 ) -> dict[str, Any]:
     log_d: dict[str, Any] = {
@@ -378,6 +390,12 @@ def _build_val_wandb_log_d(
         "val_action/action_total_no_op": val_action_total_no_op_f,
         "val_action/action_total_mouse": val_action_total_mouse_f,
         "val_action/action_total_keyboard": val_action_total_keyboard_f,
+        "val_action/precision_strict": val_precision_strict_f,
+        "val_action/recall_strict": val_recall_strict_f,
+        "val_action/f1_strict": val_f1_strict_f,
+        "val_action/precision_tolerant": val_precision_tolerant_f,
+        "val_action/recall_tolerant": val_recall_tolerant_f,
+        "val_action/f1_tolerant": val_f1_tolerant_f,
     }
     confusion_chart = _wandb_action_confusion_matrix_chart_from_counts(
         val_confusion_counts_NM
@@ -436,6 +454,12 @@ def _run_validation_steps(
     val_target_action_total_n = 0
     val_action_class_counts_d: dict[str, int] = {}
     val_action_confusion_counts_d: dict[str, int] = {}
+    val_strict_tp_n = 0
+    val_strict_fp_n = 0
+    val_strict_fn_n = 0
+    val_tolerant_tp_n = 0
+    val_tolerant_fp_n = 0
+    val_tolerant_fn_n = 0
 
     with torch.no_grad():
         for _ in range(val_steps):
@@ -516,6 +540,18 @@ def _run_validation_steps(
                 target_mouse_i,
                 target_total_i,
             ) = _action_type_counts_from_texts(target_text_L)
+            strict_tp_i, strict_fp_i, strict_fn_i = action_event_match_counts(
+                pred_text_B=pred_text_B,
+                target_text_B=target_text_L,
+                tolerance_frames=0,
+                ignore_no_op=True,
+            )
+            tolerant_tp_i, tolerant_fp_i, tolerant_fn_i = action_event_match_counts(
+                pred_text_B=pred_text_B,
+                target_text_B=target_text_L,
+                tolerance_frames=5,
+                ignore_no_op=True,
+            )
             val_action_correct_n += correct_i
             val_action_total_n += total_i
             val_pred_no_op_n += pred_no_op_i
@@ -524,6 +560,12 @@ def _run_validation_steps(
             val_target_no_op_n += target_no_op_i
             val_target_mouse_n += target_mouse_i
             val_target_action_total_n += target_total_i
+            val_strict_tp_n += strict_tp_i
+            val_strict_fp_n += strict_fp_i
+            val_strict_fn_n += strict_fn_i
+            val_tolerant_tp_n += tolerant_tp_i
+            val_tolerant_fp_n += tolerant_fp_i
+            val_tolerant_fn_n += tolerant_fn_i
 
     ddp_model.train()
     val_loss_f = val_loss_num / max(float(val_tok_n), 1.0)
@@ -552,6 +594,12 @@ def _run_validation_steps(
         action_stats_out_d["class_keyboard_total_n"] = val_action_class_counts_d.get(
             "keyboard_total_n", 0
         )
+        action_stats_out_d["strict_tp_n"] = val_strict_tp_n
+        action_stats_out_d["strict_fp_n"] = val_strict_fp_n
+        action_stats_out_d["strict_fn_n"] = val_strict_fn_n
+        action_stats_out_d["tolerant_tp_n"] = val_tolerant_tp_n
+        action_stats_out_d["tolerant_fp_n"] = val_tolerant_fp_n
+        action_stats_out_d["tolerant_fn_n"] = val_tolerant_fn_n
         for target_class_s in _ACTION_CLASS_NAMES:
             for pred_class_s in _ACTION_CONFUSION_PRED_CLASS_NAMES:
                 key_s = _action_confusion_count_key(target_class_s, pred_class_s)
@@ -562,6 +610,30 @@ def _run_validation_steps(
         val_action_correct_n,
         val_action_total_n,
     )
+
+
+def _next_synced_batch(
+    batch_it: Any,
+    *,
+    world_i: int,
+    device: torch.device,
+) -> tuple[dict[str, Any] | None, bool]:
+    try:
+        batch_d = next(batch_it)
+        local_has_batch_i = 1
+    except StopIteration:
+        batch_d = None
+        local_has_batch_i = 0
+
+    if world_i <= 1:
+        return batch_d, (local_has_batch_i == 0)
+
+    has_batch_t = torch.tensor(float(local_has_batch_i), device=device)
+    dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
+    all_have_batch_b = bool(has_batch_t.item() >= 0.5)
+    if not all_have_batch_b:
+        return None, True
+    return batch_d, False
 
 
 def _resolve_resume_dir(args: Args) -> str:
@@ -728,6 +800,11 @@ def main() -> None:
         raise ValueError("--video_fps must be > 0.")
     if args.train_min_action_density < 0.0 or args.train_min_action_density > 1.0:
         raise ValueError("--train-min-action-density must be in [0, 1].")
+    if (
+        args.train_action_upsample_random_fraction < 0.0
+        or args.train_action_upsample_random_fraction > 1.0
+    ):
+        raise ValueError("--train-action-upsample-random-fraction must be in [0, 1].")
     if args.attn_implementation not in {"flash_attention_2", "sdpa", "auto"}:
         raise ValueError(
             "Unsupported --attn-implementation. "
@@ -760,6 +837,10 @@ def main() -> None:
     _assert_image_hwc_matches_metadata(args)
 
     array_paths = find_array_record_paths(args.data_root, "train")
+    train_total_records_i = count_source_records(array_paths)
+    train_attempted_global_samples_per_epoch_i = (
+        train_total_records_i // world_i
+    ) * world_i
 
     val_array_paths: list[str] = []
     if args.val_every > 0:
@@ -789,6 +870,11 @@ def main() -> None:
         print(
             f"loss_weights no_op={args.no_op_loss_weight:.4f} "
             f"mouse={args.mouse_loss_weight:.4f}"
+        )
+        print(
+            "train_data_sampler "
+            f"total_records={train_total_records_i} "
+            f"attempted_samples_per_epoch_global={train_attempted_global_samples_per_epoch_i}"
         )
         if mfu_enabled_b:
             print(
@@ -926,6 +1012,7 @@ def main() -> None:
             read_num_threads=args.read_num_threads,
             worker_buffer_size=args.worker_buffer_size,
             min_action_density=args.train_min_action_density,
+            action_upsample_random_fraction=args.train_action_upsample_random_fraction,
         )
         raw_it = iter(loader)
         if pending_state_b is not None and epoch_i == resume_epoch_i:
@@ -939,8 +1026,21 @@ def main() -> None:
         )
         batch_it = prefetched_it if prefetched_it is not None else raw_it
         epoch_step_start = global_step
+        epoch_kept_samples_n = 0
+        epoch_non_no_op_action_n = 0
+        epoch_action_total_n = 0
+        epoch_completed_b = False
         try:
-            for batch_d in batch_it:
+            while True:
+                batch_d, should_stop_epoch_b = _next_synced_batch(
+                    batch_it=batch_it,
+                    world_i=world_i,
+                    device=device,
+                )
+                if should_stop_epoch_b:
+                    epoch_completed_b = True
+                    break
+                assert batch_d is not None
                 ddp_model.train()
                 collated_batch_d = (
                     batch_d if prefetched_it is not None else collator(batch_d)
@@ -963,7 +1063,17 @@ def main() -> None:
                 log_micro_n += 1
                 log_tok_n += tok_n
                 log_input_tok_n += int(model_batch_d["input_ids"].numel())
-                log_sample_n += int(model_batch_d["input_ids"].shape[0])
+                kept_batch_samples_n = int(model_batch_d["input_ids"].shape[0])
+                log_sample_n += kept_batch_samples_n
+                epoch_kept_samples_n += kept_batch_samples_n
+                target_text_B = collated_batch_d.get("target_text")
+                if target_text_B is None:
+                    target_text_B = batch_d.get("target_text", [])
+                target_no_op_n_i, _, target_total_n_i = _action_type_counts_from_texts(
+                    [str(x) for x in target_text_B]
+                )
+                epoch_non_no_op_action_n += int(target_total_n_i - target_no_op_n_i)
+                epoch_action_total_n += int(target_total_n_i)
 
                 micro_in_accum_i += 1
                 loss = loss / args.grad_accum
@@ -1147,6 +1257,30 @@ def main() -> None:
                         float(val_action_stats_d.get("class_keyboard_total_n", 0)),
                         device=device,
                     )
+                    val_strict_tp_t = torch.tensor(
+                        float(val_action_stats_d.get("strict_tp_n", 0)),
+                        device=device,
+                    )
+                    val_strict_fp_t = torch.tensor(
+                        float(val_action_stats_d.get("strict_fp_n", 0)),
+                        device=device,
+                    )
+                    val_strict_fn_t = torch.tensor(
+                        float(val_action_stats_d.get("strict_fn_n", 0)),
+                        device=device,
+                    )
+                    val_tolerant_tp_t = torch.tensor(
+                        float(val_action_stats_d.get("tolerant_tp_n", 0)),
+                        device=device,
+                    )
+                    val_tolerant_fp_t = torch.tensor(
+                        float(val_action_stats_d.get("tolerant_fp_n", 0)),
+                        device=device,
+                    )
+                    val_tolerant_fn_t = torch.tensor(
+                        float(val_action_stats_d.get("tolerant_fn_n", 0)),
+                        device=device,
+                    )
                     val_confusion_counts_t = torch.tensor(
                         _action_confusion_matrix_counts_from_stats(val_action_stats_d),
                         device=device,
@@ -1175,6 +1309,12 @@ def main() -> None:
                             val_class_keyboard_total_t,
                             op=dist.ReduceOp.SUM,
                         )
+                        dist.all_reduce(val_strict_tp_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_strict_fp_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_strict_fn_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_tolerant_tp_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_tolerant_fp_t, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_tolerant_fn_t, op=dist.ReduceOp.SUM)
                         dist.all_reduce(val_confusion_counts_t, op=dist.ReduceOp.SUM)
                     val_loss_t = val_loss_num_t / torch.clamp(val_tok_t, min=1.0)
                     val_dt = max(time.time() - val_t0, 1e-9)
@@ -1211,6 +1351,24 @@ def main() -> None:
                         val_class_keyboard_correct_t.item()
                         / max(val_class_keyboard_total_t.item(), 1.0)
                     )
+                    (
+                        val_precision_strict_f,
+                        val_recall_strict_f,
+                        val_f1_strict_f,
+                    ) = precision_recall_f1_from_counts(
+                        tp_n=val_strict_tp_t.item(),
+                        fp_n=val_strict_fp_t.item(),
+                        fn_n=val_strict_fn_t.item(),
+                    )
+                    (
+                        val_precision_tolerant_f,
+                        val_recall_tolerant_f,
+                        val_f1_tolerant_f,
+                    ) = precision_recall_f1_from_counts(
+                        tp_n=val_tolerant_tp_t.item(),
+                        fp_n=val_tolerant_fp_t.item(),
+                        fn_n=val_tolerant_fn_t.item(),
+                    )
                     val_confusion_counts_NM = [
                         [int(x) for x in row]
                         for row in val_confusion_counts_t.detach().cpu().tolist()
@@ -1227,7 +1385,13 @@ def main() -> None:
                             f"val_target_mouse_rate={val_target_mouse_rate_f:.4f} "
                             f"val_action_acc_no_op={val_action_acc_no_op_f:.4f} "
                             f"val_action_acc_mouse={val_action_acc_mouse_f:.4f} "
-                            f"val_action_acc_keyboard={val_action_acc_keyboard_f:.4f}"
+                            f"val_action_acc_keyboard={val_action_acc_keyboard_f:.4f} "
+                            f"val_precision_strict={val_precision_strict_f:.4f} "
+                            f"val_recall_strict={val_recall_strict_f:.4f} "
+                            f"val_f1_strict={val_f1_strict_f:.4f} "
+                            f"val_precision_tolerant={val_precision_tolerant_f:.4f} "
+                            f"val_recall_tolerant={val_recall_tolerant_f:.4f} "
+                            f"val_f1_tolerant={val_f1_tolerant_f:.4f}"
                         )
                         if val_examples_L:
                             for ex_i, (pred_s, target_s) in enumerate(
@@ -1264,6 +1428,12 @@ def main() -> None:
                                     val_action_total_no_op_f=val_class_no_op_total_t.item(),
                                     val_action_total_mouse_f=val_class_mouse_total_t.item(),
                                     val_action_total_keyboard_f=val_class_keyboard_total_t.item(),
+                                    val_precision_strict_f=val_precision_strict_f,
+                                    val_recall_strict_f=val_recall_strict_f,
+                                    val_f1_strict_f=val_f1_strict_f,
+                                    val_precision_tolerant_f=val_precision_tolerant_f,
+                                    val_recall_tolerant_f=val_recall_tolerant_f,
+                                    val_f1_tolerant_f=val_f1_tolerant_f,
                                     val_confusion_counts_NM=val_confusion_counts_NM,
                                 ),
                                 step=global_step,
@@ -1306,6 +1476,49 @@ def main() -> None:
             raise RuntimeError(
                 "No training steps in epoch; lower --train-min-action-density."
             )
+        epoch_kept_samples_t = torch.tensor(float(epoch_kept_samples_n), device=device)
+        epoch_non_no_op_action_t = torch.tensor(
+            float(epoch_non_no_op_action_n),
+            device=device,
+        )
+        epoch_action_total_t = torch.tensor(float(epoch_action_total_n), device=device)
+        if world_i > 1:
+            dist.all_reduce(epoch_kept_samples_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(epoch_non_no_op_action_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(epoch_action_total_t, op=dist.ReduceOp.SUM)
+        epoch_kept_non_no_op_rate_f = epoch_non_no_op_action_t.item() / max(
+            epoch_action_total_t.item(),
+            1.0,
+        )
+        if rank_i == 0:
+            epoch_log_d: dict[str, float] = {
+                "train_data/kept_non_no_op_rate": epoch_kept_non_no_op_rate_f,
+                "train_data/kept_samples": epoch_kept_samples_t.item(),
+                "train_data/kept_action_total": epoch_action_total_t.item(),
+            }
+            if epoch_completed_b:
+                epoch_accept_rate_f = epoch_kept_samples_t.item() / max(
+                    float(train_attempted_global_samples_per_epoch_i),
+                    1.0,
+                )
+                epoch_rejection_rate_f = min(max(1.0 - epoch_accept_rate_f, 0.0), 1.0)
+                epoch_log_d["train_data/accept_rate"] = epoch_accept_rate_f
+                epoch_log_d["train_data/rejection_rate"] = epoch_rejection_rate_f
+                epoch_log_d["train_data/attempted_samples"] = float(
+                    train_attempted_global_samples_per_epoch_i
+                )
+                print(
+                    f"epoch={epoch_i} train_data_kept_non_no_op_rate={epoch_kept_non_no_op_rate_f:.4f} "
+                    f"train_data_accept_rate={epoch_accept_rate_f:.4f} "
+                    f"train_data_rejection_rate={epoch_rejection_rate_f:.4f}"
+                )
+            else:
+                print(
+                    f"epoch={epoch_i} train_data_kept_non_no_op_rate={epoch_kept_non_no_op_rate_f:.4f} "
+                    "train_data_rejection_rate=na (partial epoch)"
+                )
+            if wandb_run is not None:
+                wandb_run.log(epoch_log_d, step=global_step)
         epoch_i += 1
 
     if rank_i == 0:

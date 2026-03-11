@@ -30,6 +30,13 @@ def test_train_args_exposes_loss_weighting_flags_with_defaults():
     assert args.mouse_loss_weight == 1.0
 
 
+def test_train_args_exposes_action_upsample_random_fraction_with_default():
+    anns = _TRAIN_MOD.Args.__annotations__
+    assert "train_action_upsample_random_fraction" in anns
+    args = _TRAIN_MOD.Args()
+    assert args.train_action_upsample_random_fraction == 1.0
+
+
 def test_get_dataloader_does_not_accept_actions_map():
     sig = inspect.signature(data.get_dataloader)
     assert "actions_map_d" not in sig.parameters
