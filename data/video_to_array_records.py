@@ -12,6 +12,7 @@ import numpy as np
 import tyro
 from array_record.python.array_record_module import ArrayRecordWriter
 import ffmpeg
+from idm.utils.actions import action_is_no_op_b
 
 """
 This file processes video files by converting them into array records.
@@ -48,6 +49,7 @@ MOUSE_X_QUANT_UNIT_F = 5.0
 MOUSE_Y_QUANT_UNIT_F = 4.0
 MOUSE_DELTA_CLIP_I = 64
 MOUSE_SCROLL_CLIP_I = 5
+MOUSE_DELTA_EXP_CURVATURE_F = 1.0
 
 
 @dataclass
@@ -67,6 +69,8 @@ class Args:
     drop_no_op_prob_train: float = 0.0
     mouse_delta_clip: int = MOUSE_DELTA_CLIP_I
     mouse_scroll_clip: int = MOUSE_SCROLL_CLIP_I
+    no_op_as_mouse_zero: bool = False
+    actions_stateful: bool = True
     seed: int = 0
     num_workers: int = 0
     max_videos: int = 0
@@ -106,12 +110,6 @@ def _normalize_button_name(name_s: str) -> str:
     return out_s.replace(" ", "_")
 
 
-def _parse_button(payload: object) -> str:
-    if isinstance(payload, list) and len(payload) >= 1:
-        return _normalize_button_name(str(payload[0]))
-    return "UNKNOWN_BUTTON"
-
-
 def _parse_two_floats(payload: object) -> tuple[float, float]:
     if not isinstance(payload, list) or len(payload) < 2:
         return float("nan"), float("nan")
@@ -141,15 +139,54 @@ def _quantize_and_clip(
     return int(np.clip(quant_i, -clip_abs_i, clip_abs_i))
 
 
+def _quantize_mouse_delta_exponential(
+    value_f: float,
+    quant_unit_f: float,
+    clip_abs_i: int,
+    curvature_f: float = MOUSE_DELTA_EXP_CURVATURE_F,
+) -> int:
+    if np.isnan(value_f) or clip_abs_i <= 0:
+        return 0
+    if curvature_f <= 0.0:
+        raise ValueError(f"curvature_f must be positive, got {curvature_f}")
+
+    sign_i = -1 if value_f < 0.0 else 1
+    abs_value_f = abs(value_f)
+    max_value_f = quant_unit_f * float(clip_abs_i)
+    if max_value_f <= 0.0:
+        return 0
+
+    normalized_f = min(abs_value_f / max_value_f, 1.0)
+    curved_f = np.log1p(curvature_f * normalized_f) / np.log1p(curvature_f)
+    quant_abs_i = int(np.rint(curved_f * float(clip_abs_i)))
+    quant_abs_i = int(np.clip(quant_abs_i, 0, clip_abs_i))
+    return int(sign_i * quant_abs_i)
+
+
+def _format_no_op(no_op_as_mouse_zero: bool) -> str:
+    if no_op_as_mouse_zero:
+        return "MOUSE:0,0,0"
+    return "NO_OP"
+
+
+def _parse_button_legacy(payload: object) -> str:
+    if isinstance(payload, list) and len(payload) >= 1:
+        out_s = str(payload[0]).strip()
+        if out_s:
+            return out_s.replace(" ", "_")
+    return "UNKNOWN_BUTTON"
+
+
 def _format_action(
     mouse_dx_i: int,
     mouse_dy_i: int,
     scroll_i: int,
     pressed_keys_s: set[str],
+    no_op_as_mouse_zero: bool = False,
 ) -> str:
     keys_L = sorted(pressed_keys_s)
     if mouse_dx_i == 0 and mouse_dy_i == 0 and scroll_i == 0 and not keys_L:
-        return "NO_OP"
+        return _format_no_op(no_op_as_mouse_zero=no_op_as_mouse_zero)
     mouse_s = f"MOUSE:{mouse_dx_i},{mouse_dy_i},{scroll_i}"
     if not keys_L:
         return mouse_s
@@ -179,6 +216,8 @@ def _actions_from_keylog_entries(
     target_fps: int,
     mouse_delta_clip: int = MOUSE_DELTA_CLIP_I,
     mouse_scroll_clip: int = MOUSE_SCROLL_CLIP_I,
+    no_op_as_mouse_zero: bool = False,
+    actions_stateful: bool = True,
 ) -> list[str]:
     if n_frames <= 0:
         return []
@@ -223,26 +262,35 @@ def _actions_from_keylog_entries(
         mouse_dx_f = 0.0
         mouse_dy_f = 0.0
         mouse_scroll_f = 0.0
+        frame_tokens_L: list[str] = []
         for event_type_s, payload in frame_events_d.get(frame_idx_i, []):
             if event_type_s == "KeyPress":
                 key_s = _parse_key_name(payload)
-                if key_s != "UNKNOWN_KEY":
+                if key_s != "UNKNOWN_KEY" and actions_stateful:
                     pressed_keys_s.add(key_s)
+                if key_s != "UNKNOWN_KEY" and not actions_stateful:
+                    frame_tokens_L.append(f"KEY_DOWN:{key_s}")
                 continue
             if event_type_s == "KeyRelease":
                 key_s = _parse_key_name(payload)
-                if key_s != "UNKNOWN_KEY":
+                if key_s != "UNKNOWN_KEY" and actions_stateful:
                     pressed_keys_s.discard(key_s)
+                if key_s != "UNKNOWN_KEY" and not actions_stateful:
+                    frame_tokens_L.append(f"KEY_UP:{key_s}")
                 continue
             if event_type_s == "MousePress":
-                button_s = _parse_button(payload)
-                if button_s != "UNKNOWN_BUTTON":
-                    pressed_keys_s.add(button_s)
+                button_s = _parse_button_legacy(payload)
+                if button_s != "UNKNOWN_BUTTON" and actions_stateful:
+                    pressed_keys_s.add(_normalize_button_name(button_s))
+                if button_s != "UNKNOWN_BUTTON" and not actions_stateful:
+                    frame_tokens_L.append(f"MOUSE_DOWN:{button_s}")
                 continue
             if event_type_s == "MouseRelease":
-                button_s = _parse_button(payload)
-                if button_s != "UNKNOWN_BUTTON":
-                    pressed_keys_s.discard(button_s)
+                button_s = _parse_button_legacy(payload)
+                if button_s != "UNKNOWN_BUTTON" and actions_stateful:
+                    pressed_keys_s.discard(_normalize_button_name(button_s))
+                if button_s != "UNKNOWN_BUTTON" and not actions_stateful:
+                    frame_tokens_L.append(f"MOUSE_UP:{button_s}")
                 continue
             if event_type_s == "MouseMove":
                 dx_f, dy_f = _parse_two_floats(payload)
@@ -254,12 +302,12 @@ def _actions_from_keylog_entries(
             if event_type_s == "MouseScroll":
                 mouse_scroll_f += _mouse_scroll_delta(payload)
 
-        mouse_dx_i = _quantize_and_clip(
+        mouse_dx_i = _quantize_mouse_delta_exponential(
             value_f=mouse_dx_f,
             quant_unit_f=MOUSE_X_QUANT_UNIT_F,
             clip_abs_i=mouse_delta_clip,
         )
-        mouse_dy_i = _quantize_and_clip(
+        mouse_dy_i = _quantize_mouse_delta_exponential(
             value_f=mouse_dy_f,
             quant_unit_f=MOUSE_Y_QUANT_UNIT_F,
             clip_abs_i=mouse_delta_clip,
@@ -269,14 +317,25 @@ def _actions_from_keylog_entries(
             quant_unit_f=1.0,
             clip_abs_i=mouse_scroll_clip,
         )
-        actions_L.append(
-            _format_action(
-                mouse_dx_i=mouse_dx_i,
-                mouse_dy_i=mouse_dy_i,
-                scroll_i=mouse_scroll_i,
-                pressed_keys_s=pressed_keys_s,
+
+        if actions_stateful:
+            actions_L.append(
+                _format_action(
+                    mouse_dx_i=mouse_dx_i,
+                    mouse_dy_i=mouse_dy_i,
+                    scroll_i=mouse_scroll_i,
+                    pressed_keys_s=pressed_keys_s,
+                    no_op_as_mouse_zero=no_op_as_mouse_zero,
+                )
             )
-        )
+            continue
+
+        if mouse_dx_i != 0 or mouse_dy_i != 0 or mouse_scroll_i != 0:
+            frame_tokens_L.append(f"MOUSE:{mouse_dx_i},{mouse_dy_i},{mouse_scroll_i}")
+        if frame_tokens_L:
+            actions_L.append(" + ".join(frame_tokens_L))
+        else:
+            actions_L.append(_format_no_op(no_op_as_mouse_zero=no_op_as_mouse_zero))
     return actions_L
 
 
@@ -286,6 +345,8 @@ def _actions_from_keylog_file(
     target_fps: int,
     mouse_delta_clip: int = MOUSE_DELTA_CLIP_I,
     mouse_scroll_clip: int = MOUSE_SCROLL_CLIP_I,
+    no_op_as_mouse_zero: bool = False,
+    actions_stateful: bool = True,
 ) -> list[str]:
     assert keylog_path.exists(), f"Missing keylog file: {keylog_path}"
     payload_b = keylog_path.read_bytes()
@@ -298,6 +359,8 @@ def _actions_from_keylog_file(
         target_fps=target_fps,
         mouse_delta_clip=mouse_delta_clip,
         mouse_scroll_clip=mouse_scroll_clip,
+        no_op_as_mouse_zero=no_op_as_mouse_zero,
+        actions_stateful=actions_stateful,
     )
 
 
@@ -425,6 +488,8 @@ def preprocess_video(
     drop_no_op_seed: int = 0,
     mouse_delta_clip: int = MOUSE_DELTA_CLIP_I,
     mouse_scroll_clip: int = MOUSE_SCROLL_CLIP_I,
+    no_op_as_mouse_zero: bool = False,
+    actions_stateful: bool = True,
     decode_timeout_sec: int = 0,
 ):
     """
@@ -500,6 +565,8 @@ def preprocess_video(
             target_fps=target_fps,
             mouse_delta_clip=int(mouse_delta_clip),
             mouse_scroll_clip=int(mouse_scroll_clip),
+            no_op_as_mouse_zero=bool(no_op_as_mouse_zero),
+            actions_stateful=bool(actions_stateful),
         )
         if drop_no_op_prob > 0.0:
             rng = np.random.default_rng(int(drop_no_op_seed))
@@ -574,6 +641,8 @@ def _process_video_shard(
             drop_no_op_seed,
             mouse_delta_clip,
             mouse_scroll_clip,
+            no_op_as_mouse_zero,
+            actions_stateful,
             decode_timeout_sec,
         ) = video_arg
 
@@ -590,6 +659,8 @@ def _process_video_shard(
             drop_no_op_seed=int(drop_no_op_seed),
             mouse_delta_clip=int(mouse_delta_clip),
             mouse_scroll_clip=int(mouse_scroll_clip),
+            no_op_as_mouse_zero=bool(no_op_as_mouse_zero),
+            actions_stateful=bool(actions_stateful),
             decode_timeout_sec=int(decode_timeout_sec),
         )
         if failed_rows:
@@ -732,7 +803,7 @@ def _drop_no_op_frames(
 
     n_frames = len(frames)
     is_noop_mask = np.fromiter(
-        (action_s == "NO_OP" for action_s in actions),
+        (action_is_no_op_b(action_s) for action_s in actions),
         dtype=bool,
         count=n_frames,
     )
@@ -875,6 +946,8 @@ def main():
                     args.seed + idx,
                     args.mouse_delta_clip,
                     args.mouse_scroll_clip,
+                    args.no_op_as_mouse_zero,
+                    args.actions_stateful,
                     args.decode_timeout_sec,
                 )
             )
@@ -916,6 +989,8 @@ def main():
         "drop_no_op_prob_train": args.drop_no_op_prob_train,
         "mouse_delta_clip": args.mouse_delta_clip,
         "mouse_scroll_clip": args.mouse_scroll_clip,
+        "no_op_as_mouse_zero": args.no_op_as_mouse_zero,
+        "actions_stateful": args.actions_stateful,
         "total_chunks": len(results),
         "total_video_chunks": total_video_chunks,
         "total_videos": len(input_files),
