@@ -24,6 +24,7 @@ _chunk_video_records = _MODULE._chunk_video_records
 _drop_no_op_frames = _MODULE._drop_no_op_frames
 _filter_black_frames = _MODULE._filter_black_frames
 _get_keylog_path = _MODULE._get_keylog_path
+_quantize_mouse_delta_exponential = _MODULE._quantize_mouse_delta_exponential
 _write_chunk_records = _MODULE._write_chunk_records
 
 
@@ -32,6 +33,8 @@ def test_args_expose_new_noop_drop_flag() -> None:
     assert "drop_no_op_prob_train" in field_names
     assert "mouse_delta_clip" in field_names
     assert "mouse_scroll_clip" in field_names
+    assert "no_op_as_mouse_zero" in field_names
+    assert "actions_stateful" in field_names
     assert "filter_pure_noop_chunks" not in field_names
     assert "filter_identical_noop_frames" not in field_names
     assert "identical_noop_mad_threshold" not in field_names
@@ -143,6 +146,47 @@ def test_actions_clamp_rejects_negative_clip_args() -> None:
         )
 
 
+def test_exponential_mouse_quantization_is_symmetric_and_clipped() -> None:
+    pos_i = _quantize_mouse_delta_exponential(
+        value_f=10_000.0,
+        quant_unit_f=5.0,
+        clip_abs_i=64,
+    )
+    neg_i = _quantize_mouse_delta_exponential(
+        value_f=-10_000.0,
+        quant_unit_f=5.0,
+        clip_abs_i=64,
+    )
+    near_zero_i = _quantize_mouse_delta_exponential(
+        value_f=2.0,
+        quant_unit_f=5.0,
+        clip_abs_i=64,
+    )
+
+    assert pos_i == 64
+    assert neg_i == -64
+    assert near_zero_i == 1
+
+
+def test_exponential_mouse_quantization_is_denser_near_zero_than_near_clip() -> None:
+    def _first_value_for_bin(bin_i: int) -> int:
+        for value_i in range(0, 5000):
+            out_i = _quantize_mouse_delta_exponential(
+                value_f=float(value_i),
+                quant_unit_f=5.0,
+                clip_abs_i=64,
+            )
+            if out_i >= bin_i:
+                return value_i
+        raise AssertionError(f"bin {bin_i} was not reached")
+
+    first_step_i = _first_value_for_bin(1) - _first_value_for_bin(0)
+    last_step_i = _first_value_for_bin(64) - _first_value_for_bin(63)
+
+    assert first_step_i < 5
+    assert last_step_i > 5
+
+
 def test_actions_track_pressed_key_state_across_frames() -> None:
     entries_L = [
         [0, ["KeyPress", [0, "KeyW"]]],
@@ -168,6 +212,38 @@ def test_actions_track_mouse_button_state_as_keys() -> None:
     assert actions_L[0] == "MOUSE:0,0,0 ; LMB"
     assert actions_L[1] == "NO_OP"
     assert actions_L[2] == "NO_OP"
+
+
+def test_actions_can_emit_mouse_zero_for_noop() -> None:
+    actions_L = _actions_from_keylog_entries(
+        entries=[],
+        n_frames=3,
+        target_fps=10,
+        no_op_as_mouse_zero=True,
+    )
+    assert actions_L == ["MOUSE:0,0,0"] * 3
+
+
+def test_actions_stateless_emits_frame_event_tokens_without_pressed_state() -> None:
+    entries_L = [
+        [0, ["KeyPress", [0, "KeyE"]]],
+        [0, ["MousePress", ["Left", 0.0, 0.0]]],
+        [10_000, ["MouseMove", [2.0, 0.0]]],
+        [250_000, ["KeyRelease", [0, "KeyE"]]],
+        [300_000, ["MouseRelease", ["Left", 0.0, 0.0]]],
+    ]
+
+    actions_L = _actions_from_keylog_entries(
+        entries_L,
+        n_frames=4,
+        target_fps=10,
+        actions_stateful=False,
+    )
+
+    assert actions_L[0] == "KEY_DOWN:E + MOUSE_DOWN:Left + MOUSE:1,0,0"
+    assert actions_L[1] == "NO_OP"
+    assert actions_L[2] == "KEY_UP:E"
+    assert actions_L[3] == "MOUSE_UP:Left"
 
 
 def test_chunk_video_records_embeds_action_slices() -> None:
@@ -298,6 +374,27 @@ def test_drop_no_op_frames_drops_only_noop_when_prob_one() -> None:
     assert np.array_equal(out_frames[1], frames_THWC[3])
 
 
+def test_drop_no_op_frames_treats_mouse_zero_as_noop() -> None:
+    frames_THWC = np.arange(5 * 2 * 2 * 3, dtype=np.uint8).reshape(5, 2, 2, 3)
+    actions_L = [
+        "MOUSE:0,0,0",
+        "MOUSE:1,0,0",
+        "MOUSE:0,0,0 ; W",
+        "NO_OP",
+        "KEY_DOWN:E",
+    ]
+
+    out_frames, out_actions = _drop_no_op_frames(
+        frames=frames_THWC,
+        actions=actions_L,
+        drop_prob_f=1.0,
+        rng=np.random.default_rng(0),
+    )
+
+    assert out_actions == ["MOUSE:1,0,0", "MOUSE:0,0,0 ; W", "KEY_DOWN:E"]
+    assert out_frames.shape[0] == len(out_actions)
+
+
 def test_drop_no_op_frames_is_deterministic_for_seed() -> None:
     frames_THWC = np.arange(100 * 2 * 2 * 3, dtype=np.uint8).reshape(100, 2, 2, 3)
     actions_L = ["NO_OP" if i % 2 == 0 else "MOUSE:1,0,0" for i in range(100)]
@@ -346,6 +443,8 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
     seen_drop_seeds: list[int] = []
     seen_mouse_delta_clips: list[int] = []
     seen_mouse_scroll_clips: list[int] = []
+    seen_no_op_as_mouse_zero: list[bool] = []
+    seen_actions_stateful: list[bool] = []
 
     def _fake_preprocess(
         idx: int,
@@ -360,6 +459,8 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
         drop_no_op_seed: int = 0,
         mouse_delta_clip: int = 64,
         mouse_scroll_clip: int = 5,
+        no_op_as_mouse_zero: bool = False,
+        actions_stateful: bool = True,
         decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
@@ -376,6 +477,8 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
         seen_drop_seeds.append(int(drop_no_op_seed))
         seen_mouse_delta_clips.append(int(mouse_delta_clip))
         seen_mouse_scroll_clips.append(int(mouse_scroll_clip))
+        seen_no_op_as_mouse_zero.append(bool(no_op_as_mouse_zero))
+        seen_actions_stateful.append(bool(actions_stateful))
         chunk_d = {
             "raw_video": np.zeros((4, 2, 2, 3), dtype=np.uint8).tobytes(),
             "sequence_length": 4,
@@ -402,6 +505,8 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
                 10,
                 12,
                 2,
+                True,
+                False,
                 0,
             ),
             (
@@ -419,6 +524,8 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
                 11,
                 12,
                 2,
+                True,
+                False,
                 0,
             ),
         ]
@@ -438,6 +545,8 @@ def test_process_video_shard_mixes_chunks_across_videos(tmp_path: Path) -> None:
     assert seen_drop_seeds == [10, 11]
     assert seen_mouse_delta_clips == [12, 12]
     assert seen_mouse_scroll_clips == [2, 2]
+    assert seen_no_op_as_mouse_zero == [True, True]
+    assert seen_actions_stateful == [False, False]
 
 
 def test_process_video_shard_forwards_decode_timeout(tmp_path: Path) -> None:
@@ -457,6 +566,8 @@ def test_process_video_shard_forwards_decode_timeout(tmp_path: Path) -> None:
         drop_no_op_seed: int = 0,
         mouse_delta_clip: int = 64,
         mouse_scroll_clip: int = 5,
+        no_op_as_mouse_zero: bool = False,
+        actions_stateful: bool = True,
         decode_timeout_sec: int = 0,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         del (
@@ -472,6 +583,8 @@ def test_process_video_shard_forwards_decode_timeout(tmp_path: Path) -> None:
             drop_no_op_seed,
             mouse_delta_clip,
             mouse_scroll_clip,
+            no_op_as_mouse_zero,
+            actions_stateful,
         )
         seen_decode_timeouts.append(int(decode_timeout_sec))
         return [], []
@@ -496,6 +609,8 @@ def test_process_video_shard_forwards_decode_timeout(tmp_path: Path) -> None:
                     10,
                     12,
                     2,
+                    False,
+                    True,
                     123,
                 )
             ],
