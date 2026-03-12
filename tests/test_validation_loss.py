@@ -306,6 +306,17 @@ def test_action_accuracy_counts_from_texts():
     assert total_n == 2
 
 
+def test_action_accuracy_counts_from_texts_uses_frame_indices():
+    pred_text = ["Frame 1: a\nFrame 2: b"]
+    target_text = ["Frame 0: a\nFrame 1: b"]
+    correct_n, total_n = _TRAIN_MOD._action_accuracy_counts_from_texts(
+        pred_text_B=pred_text,
+        target_text_B=target_text,
+    )
+    assert correct_n == 0
+    assert total_n == 2
+
+
 def test_action_accuracy_counts_from_texts_filters_no_op_and_mouse_actions():
     pred_text = [
         "Frame 0: NO_OP\nFrame 1: b\nFrame 2: MOUSE_MOVE\nFrame 3: z",

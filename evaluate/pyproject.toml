@@ -1,5 +1,5 @@
 [project]
-name = "idm"
+name = "idm-evaluate"
 version = "0.1.0"
 authors = [
   { email = "nikolas.rieger@tum.de" },
@@ -12,27 +12,10 @@ dependencies = [
   "array-record>=0.7.2",
   "msgpack>=1.0.8",
   "grain>=0.2.10",
-  "numpy",
-  "peft",
-  "pydantic==2.12.5",
-  "safetensors",
-  "torch==2.9.1",
-  "torchvision==0.24.1",
-  "transformers==4.57.1",
-  "tyro>=0.8.5",
-  "wandb",
-  "nvidia-cudnn-cu12==9.16.0.29; sys_platform == 'linux'",
-  "ffmpeg-python==0.2.0",
   "sglang[all]==0.5.9",
 ]
 
 [project.optional-dependencies]
-dev = [
-  "pre-commit",
-  "pytest",
-]
-
-[dependency-groups]
 dev = [
   "pre-commit",
   "pytest",
@@ -43,13 +26,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["idm*"]
-
-[tool.uv]
-default-groups = ["dev"]
-override-dependencies = [
-  "nvidia-cudnn-cu12==9.16.0.29; sys_platform == 'linux'",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+include = ["idm-evaluate*"]
