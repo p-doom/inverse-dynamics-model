@@ -372,6 +372,7 @@ def _build_val_wandb_log_d(
     val_recall_tolerant_f: float,
     val_f1_tolerant_f: float,
     val_confusion_counts_NM: list[list[int]],
+    val_examples_L: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     log_d: dict[str, Any] = {
         "val/loss": val_loss_f,
@@ -402,6 +403,25 @@ def _build_val_wandb_log_d(
     )
     if confusion_chart is not None:
         log_d["val_action/confusion_matrix"] = confusion_chart
+    if val_examples_L:
+        examples_table = wandb.Table(
+            columns=[
+                "example_id",
+                "pred_action_count",
+                "target_action_count",
+                "pred_raw",
+                "target_raw",
+            ]
+        )
+        for ex_i, (pred_s, target_s) in enumerate(val_examples_L, start=1):
+            examples_table.add_data(
+                ex_i,
+                len(_actions_from_target_text(pred_s)),
+                len(_actions_from_target_text(target_s)),
+                _truncate_for_log(pred_s, max_chars=4000),
+                _truncate_for_log(target_s, max_chars=4000),
+            )
+        log_d["val_action/examples"] = examples_table
     return log_d
 
 
@@ -1435,6 +1455,7 @@ def main() -> None:
                                     val_recall_tolerant_f=val_recall_tolerant_f,
                                     val_f1_tolerant_f=val_f1_tolerant_f,
                                     val_confusion_counts_NM=val_confusion_counts_NM,
+                                    val_examples_L=val_examples_L,
                                 ),
                                 step=global_step,
                             )
