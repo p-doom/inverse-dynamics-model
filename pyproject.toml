@@ -21,6 +21,8 @@ dependencies = [
   "wandb",
   "torchvision>=0.25.0",
   "ffmpeg-python==0.2.0",
+  "opencv-python>=4.13.0.92",
+  "scipy>=1.17.1",
 ]
 
 [project.optional-dependencies]
