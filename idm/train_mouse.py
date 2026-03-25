@@ -21,17 +21,17 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 import tyro
 import wandb
 
-from idm.utils.checkpoint import (
+from utils.checkpoint import (
     find_latest_checkpoint,
     load_checkpoint,
     save_checkpoint,
 )
-from idm.utils.collator import CollatorPrefetchIterator, VideoSFTCollator
-from idm.utils.data_jpeg import (
+from utils.collator import CollatorPrefetchIterator, VideoSFTCollator
+from utils.data_jpeg import (
     find_array_record_paths,
     get_dataloader,
 )
-from idm.utils.lr_schedules import LRScheduleArgs, lr_at_step
+from utils.lr_schedules import LRScheduleArgs, lr_at_step
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +260,7 @@ class Args:
     wandb_project: str = "idm-mouse"
     wandb_entity: str = "instant-uv"
     wandb_run_name: str = "idm_mouse_run"
-    wandb_mode: str = "online"
+    wandb_mode: str = "offline"
     mfu_peak_flops: float = 0.0
 
 

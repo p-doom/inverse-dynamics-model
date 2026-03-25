@@ -9,7 +9,7 @@ from array_record.python.array_record_module import ArrayRecordReader
 import grain
 import numpy as np
 
-from idm.utils.actions import action_is_no_op_b
+from utils.actions import action_is_no_op_b
 
 
 def derive_record_key(rec_d: dict[str, Any]) -> str:

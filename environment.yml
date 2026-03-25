@@ -1,0 +1,9 @@
+name: idm
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.3
+  - pip
+  - pip:
+    - -r requirements.txt

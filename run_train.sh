@@ -1,31 +1,36 @@
 #!/usr/bin/env bash
-
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH --time=24:00:00
-#SBATCH --partition=accelerated
-#SBATCH --cpus-per-task=9
+#SBATCH --partition=booster
+#SBATCH --account=envcomp
+#SBATCH --cpus-per-task=5
 #SBATCH --gres=gpu:4
-#SBATCH --output=/home/hk-project-p0023960/tum_ddk3888/inverse-dynamics-model/logs/mouse_%x_%j.out
-#SBATCH --error=/home/hk-project-p0023960/tum_ddk3888/inverse-dynamics-model/logs/mouse_%x_%j.err
-#SBATCH --job-name=preprocess_crowd_code
-
-module unload mpi/openmpi/5.0
-module unload devel/cuda/12.4
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+#SBATCH --job-name=mouse_gen
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-conda init
 
-cd data
+source /p/project1/envcomp/idm/miniforge3/etc/profile.d/conda.sh
+conda activate idm
 
-uv run python mouse_generation.py \
-    --frame_path /home/hk-project-p0023960/tum_ddk3888/inverse-dynamics-model/data/frame.png  \
-    --output_path /hkfs/work/workspace/scratch/tum_cte0515-crowd-cast/simulated_mouse_ds  \
-    --num_frames 1500000
+export NCCL_SOCKET_IFNAME=eth0,en,eth,em,bond,enp
+export GLOO_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME
+export MASTER_ADDR=127.0.0.1 
+export MASTER_PORT=29500
+export HF_HUB_CACHE=/p/scratch/envcomp/idm/huggingface
+export HF_HOME=/p/scratch/envcomp/idm/huggingface
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
 
-cd ..
+
 cd idm
 
-srun uv run torchrun --nproc_per_node=4 train_mouse.py \
-    --data_root /hkfs/work/workspace/scratch/tum_cte0515-crowd-cast/simulated_mouse_ds \
+srun /p/project1/envcomp/idm/miniforge3/envs/idm/bin/torchrun \
+    --nproc_per_node=4 \
+    --master_addr=$MASTER_ADDR \
+    --master_port=$MASTER_PORT \
+    train_mouse.py \
+    --data_root /p/scratch/envcomp/idm/sim_mouse_ds \
     --out_dir ./runs/mouse_sim

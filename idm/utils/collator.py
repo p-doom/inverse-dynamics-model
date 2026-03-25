@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from idm.utils.actions import action_has_nonzero_mouse_b, action_is_no_op_b
+from utils.actions import action_has_nonzero_mouse_b, action_is_no_op_b
 
 
 class VideoSFTCollator:
