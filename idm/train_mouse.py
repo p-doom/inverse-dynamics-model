@@ -237,18 +237,18 @@ class Args:
     read_num_threads: int = 4
     worker_buffer_size: int = 4
     collator_prefetch: bool = True
-    log_every: int = 1
-    val_every: int = 1
-    val_steps: int = 4
+    log_every: int = 5
+    val_every: int = 50
+    val_steps: int = 32
     val_generate_max_new_tokens: int = 512
     val_log_examples: int = 2
-    val_visual_every: int = 1
+    val_visual_every: int = 200
     """Log visual cursor overlay frames to WandB every N optimizer steps (0=off)."""
-    val_visual_max_frames: int = 16
+    val_visual_max_frames: int = 8
     """Max frames per visual sample to render."""
     val_visual_upscale: int = 4
     """Upscale factor for rendered cursor frames."""
-    save_every: int = 1000
+    save_every: int = 100
     out_dir: str = "./runs/mouse_sim"
     resume_from: str = ""
     instruction_text: str = (
@@ -581,6 +581,14 @@ def _run_validation_steps(
             if label_weights is not None:
                 label_weights = label_weights.to(device, non_blocking=True)
             with torch.autocast(device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                if "mm_token_type_ids" in model_batch:
+                    has_image_grid = (
+                        "image_grid_thw" in model_batch
+                        and model_batch["image_grid_thw"] is not None
+                    )
+                    if not has_image_grid:
+                        del model_batch["mm_token_type_ids"]
+
                 outputs = ddp_model(**model_batch)
                 loss = _weighted_causal_lm_loss(
                     outputs.logits, model_batch["labels"], label_weights,
@@ -604,6 +612,9 @@ def _run_validation_steps(
             if eos_id is not None:
                 gen_kwargs["eos_token_id"] = int(eos_id)
             with torch.autocast(device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                if "mm_token_type_ids" in prompt_model:
+                    if "image_grid_thw" not in prompt_model or prompt_model["image_grid_thw"] is None:
+                        del prompt_model["mm_token_type_ids"]
                 gen_ids = gen_model.generate(**prompt_model, **gen_kwargs)
             pred_text_B = _decode_pred_text_B_from_generated_ids(
                 gen_ids, prompt_lens, collator.tokenizer,
@@ -959,6 +970,14 @@ def main() -> None:
                 tok_n = int((model_batch["labels"] != -100).sum().item())
 
                 with torch.autocast("cuda", dtype=dtype):
+                    if "mm_token_type_ids" in model_batch:
+                        has_image_grid = (
+                            "image_grid_thw" in model_batch
+                            and model_batch["image_grid_thw"] is not None
+                        )
+                        if not has_image_grid:
+                            del model_batch["mm_token_type_ids"]
+
                     outputs = ddp_model(**model_batch)
                     loss = _weighted_causal_lm_loss(
                         outputs.logits, model_batch["labels"], label_weights,

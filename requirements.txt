@@ -75,7 +75,7 @@ tokenizers==0.22.2
 torch==2.10.0
 torchvision==0.25.0
 tqdm==4.67.3
-transformers==4.51.3
+transformers>=4.53.0
 triton==3.6.0 
 typeguard==4.5.0
 typer==0.24.0
