@@ -508,6 +508,46 @@ def _wandb_confusion_chart(counts_NM: list[list[int]]) -> Any | None:
     )
 
 
+def _mouse_vector_metrics_from_texts(
+    pred_text_B: list[str],
+    target_text_B: list[str],
+) -> tuple[float, float, int]:
+    """Return (cosine_sim_sum, euclidean_dist_sum, count) over matched mouse actions."""
+    cos_sum = 0.0
+    euc_sum = 0.0
+    count = 0
+    for pred_s, target_s in zip(pred_text_B, target_text_B):
+        pred_actions = _actions_from_target_text(pred_s)
+        target_actions = _actions_from_target_text(target_s)
+        for idx, target_a in enumerate(target_actions):
+            if _action_class_s(target_a) != "mouse":
+                continue
+            if idx >= len(pred_actions):
+                continue
+            pred_a = pred_actions[idx]
+            if _action_class_s(pred_a) != "mouse":
+                continue
+            t_parsed = _parse_mouse_delta(target_a)
+            p_parsed = _parse_mouse_delta(pred_a)
+            if t_parsed is None or p_parsed is None:
+                continue
+            t_dx, t_dy = _deltas_to_pixel_offsets(t_parsed[0], t_parsed[1])
+            p_dx, p_dy = _deltas_to_pixel_offsets(p_parsed[0], p_parsed[1])
+            t_vec = np.array([t_dx, t_dy, float(t_parsed[2])], dtype=np.float64)
+            p_vec = np.array([p_dx, p_dy, float(p_parsed[2])], dtype=np.float64)
+            # Euclidean distance
+            euc_sum += float(np.linalg.norm(p_vec - t_vec))
+            # Cosine similarity
+            t_norm = np.linalg.norm(t_vec)
+            p_norm = np.linalg.norm(p_vec)
+            if t_norm > 1e-9 and p_norm > 1e-9:
+                cos_sum += float(np.dot(t_vec, p_vec) / (t_norm * p_norm))
+            else:
+                cos_sum += 1.0 if (t_norm <= 1e-9 and p_norm <= 1e-9) else 0.0
+            count += 1
+    return cos_sum, euc_sum, count
+
+
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
@@ -552,7 +592,7 @@ def _run_validation_steps(
     action_stats_out_d: dict[str, int] | None = None,
     visual_samples_out_L: list[dict[str, Any]] | None = None,
     visual_max_frames: int = 16,
-) -> tuple[float, int, int, int]:
+) -> tuple[float, int, int, int, float, float, int]:
     """Run val steps.  When `visual_samples_out_L` is not None, the first
     batch's raw data (jpeg_frames, gt actions, pred actions) is saved for
     cursor-overlay rendering on rank 0."""
@@ -567,6 +607,9 @@ def _run_validation_steps(
     val_target_no_op_n = 0
     val_target_mouse_n = 0
     val_target_total_n = 0
+    val_mouse_cos_sum = 0.0
+    val_mouse_euc_sum = 0.0
+    val_mouse_vec_n = 0
     class_counts_d: dict[str, int] = {}
     confusion_d: dict[str, int] = {}
 
@@ -659,6 +702,12 @@ def _run_validation_steps(
             )
             pno, pmo, pto = _action_type_counts_from_texts(pred_text_B)
             tno, tmo, tto = _action_type_counts_from_texts(target_text_B)
+            cos_s, euc_s, vec_n = _mouse_vector_metrics_from_texts(
+                pred_text_B, target_text_B,
+            )
+            val_mouse_cos_sum += cos_s
+            val_mouse_euc_sum += euc_s
+            val_mouse_vec_n += vec_n
             val_correct_n += c
             val_total_n += t
             val_pred_no_op_n += pno
@@ -688,7 +737,7 @@ def _run_validation_steps(
             for p_s in _ACTION_CONFUSION_PRED_CLASS_NAMES:
                 k = _action_confusion_count_key(t_s, p_s)
                 action_stats_out_d[k] = confusion_d.get(k, 0)
-    return val_loss_f, val_tok_n, val_correct_n, val_total_n
+    return val_loss_f, val_tok_n, val_correct_n, val_total_n, val_mouse_cos_sum, val_mouse_euc_sum, val_mouse_vec_n
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1145,7 @@ def main() -> None:
                     )
                     visual_samples: list[dict[str, Any]] = [] if do_visual else None
 
-                    vl, vtok, vc, vt = _run_validation_steps(
+                    vl, vtok, vc, vt, v_cos_sum, v_euc_sum, v_vec_n = _run_validation_steps(
                         ddp_model, val_collator, val_it,
                         args.val_steps, args.val_generate_max_new_tokens,
                         device, dtype,
@@ -1125,11 +1174,16 @@ def main() -> None:
                         _action_confusion_matrix_counts(val_stats),
                         device=device, dtype=torch.float32,
                     )
+                    vcos_t = torch.tensor(v_cos_sum, device=device)
+                    veuc_t = torch.tensor(v_euc_sum, device=device)
+                    vvecn_t = torch.tensor(float(v_vec_n), device=device)
+
                     if world_i > 1:
                         for t in (vl_num_t, vtok_t, vc_t, vt_t, vpno_t, vpmo_t,
                                   vpto_t, vtno_t, vtmo_t, vtto_t, cnoc_t, cnot_t,
-                                  cmoc_t, cmot_t, conf_t):
+                                  cmoc_t, cmot_t, conf_t, vcos_t, veuc_t, vvecn_t):
                             dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
 
                     val_loss_f = (vl_num_t / torch.clamp(vtok_t, min=1.0)).item()
                     val_dt = max(time.time() - val_t0, 1e-9)
@@ -1142,6 +1196,8 @@ def main() -> None:
                     tmor = vtmo_t.item() / max(vtto_t.item(), 1.0)
                     acc_no = cnoc_t.item() / max(cnot_t.item(), 1.0)
                     acc_mo = cmoc_t.item() / max(cmot_t.item(), 1.0)
+                    val_mouse_cos_sim = vcos_t.item() / max(vvecn_t.item(), 1.0)
+                    val_mouse_euc_dist = veuc_t.item() / max(vvecn_t.item(), 1.0)
                     conf_NM = [[int(x) for x in row] for row in conf_t.detach().cpu().tolist()]
 
                     if rank_i == 0:
@@ -1149,6 +1205,8 @@ def main() -> None:
                             f"step={global_step} val_loss={val_loss_f:.6f} "
                             f"val_acc={val_acc:.6f} val_f1={val_f1:.6f} "
                             f"acc_no_op={acc_no:.4f} acc_mouse={acc_mo:.4f} "
+                            f"mouse_cos_sim={val_mouse_cos_sim:.4f} "
+                            f"mouse_euc_dist={val_mouse_euc_dist:.2f} "
                             f"pred_no_op_rate={pnor:.4f} target_no_op_rate={tnor:.4f} "
                             f"pred_mouse_rate={pmor:.4f} target_mouse_rate={tmor:.4f}"
                         )
@@ -1172,6 +1230,9 @@ def main() -> None:
                                 "val_action/total_mouse": cmot_t.item(),
                                 "val_action/pred_total": vpto_t.item(),
                                 "val_action/target_total": vtto_t.item(),
+                                "val_action/mouse_cosine_sim": val_mouse_cos_sim,
+                                "val_action/mouse_euclidean_dist": val_mouse_euc_dist,
+                                "val_action/mouse_vector_pairs_n": vvecn_t.item(),
                             }
                             chart = _wandb_confusion_chart(conf_NM)
                             if chart is not None:
