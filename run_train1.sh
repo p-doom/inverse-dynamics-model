@@ -36,7 +36,7 @@ srun /p/project1/envcomp/idm/miniforge3/envs/idm/bin/torchrun \
     --out_dir /p/scratch/envcomp/idm/mouse_log_dir \
     --focal_loss_gamma 2.0 \
     --label_smoothing 0.05 \
-    --format_loss_weight 0.0 \
+    --format_loss_weight 1.0 \
     --val_temperature 0.8 \
     --ema_decay 0.999 \
     --mouse_soft_label_sigma 1.5 \

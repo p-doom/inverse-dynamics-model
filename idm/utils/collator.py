@@ -17,6 +17,7 @@ class VideoSFTCollator:
         video_fps: float | None = None,
         no_op_loss_weight: float = 1.0,
         mouse_loss_weight: float = 1.0,
+        format_loss_weight: float = 0.0,
     ):
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -24,6 +25,7 @@ class VideoSFTCollator:
         self.video_fps = video_fps
         self.no_op_loss_weight = float(no_op_loss_weight)
         self.mouse_loss_weight = float(mouse_loss_weight)
+        self.format_loss_weight = float(format_loss_weight)
         prompt_msgs, _ = self._messages("")
         self._prompt_text = self.processor.apply_chat_template(
             prompt_msgs,
@@ -89,9 +91,9 @@ class VideoSFTCollator:
         target_B: Any,
         prompt_lens_B: list[int],
     ) -> None:
-        if self.no_op_loss_weight == 1.0 and self.mouse_loss_weight == 1.0:
-            label_weights_BS[labels_BS == -100] = 0.0
-            return
+        # Structural/format tokens (Frame X:, newlines, etc.) get format_loss_weight.
+        # Action tokens get their per-class weight on top of that.
+        label_weights_BS.fill_(self.format_loss_weight)
 
         seq_len_i = int(label_weights_BS.shape[1])
         for b_i, (target_s, prompt_len_i) in enumerate(zip(target_B, prompt_lens_B)):
@@ -99,14 +101,14 @@ class VideoSFTCollator:
                 str(target_s)
             ):
                 weight_f = self._action_loss_weight(action_s)
-                if weight_f == 1.0:
-                    continue
                 start_i = int(prompt_len_i) + int(start_tok_i)
                 end_i = int(prompt_len_i) + int(end_tok_i)
                 start_i = max(start_i, 0)
                 end_i = min(end_i, seq_len_i)
                 if end_i > start_i:
                     label_weights_BS[b_i, start_i:end_i] = weight_f
+
+        # Always zero out prompt tokens and padding.
         label_weights_BS[labels_BS == -100] = 0.0
 
     def _messages(

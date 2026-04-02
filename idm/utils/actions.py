@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+_BARE_TRIPLET_RE = re.compile(r"^(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*$")
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,17 @@ def action_info(action_s: str) -> ActionInfo:
             is_no_op_b=True,
             has_mouse_b=False,
             has_nonzero_mouse_b=False,
+            has_keyboard_b=False,
+        )
+
+    # Bare triplet format: "dx,dy,scroll" (used when noop_format='zeros')
+    m = _BARE_TRIPLET_RE.match(action_s)
+    if m is not None:
+        has_nonzero = any(int(m.group(i)) != 0 for i in (1, 2, 3))
+        return ActionInfo(
+            is_no_op_b=not has_nonzero,
+            has_mouse_b=True,
+            has_nonzero_mouse_b=has_nonzero,
             has_keyboard_b=False,
         )
 

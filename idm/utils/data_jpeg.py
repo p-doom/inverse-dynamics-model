@@ -198,9 +198,21 @@ class ActionDensityFilter(grain.transforms.Filter):
 
 
 class BuildSFTExampleFromFrames(grain.transforms.Map):
+    def __init__(self, noop_format: str = "token", skip_noop_frames: bool = False):
+        self.noop_format = noop_format
+        self.skip_noop_frames = skip_noop_frames
+
     def map(self, element: dict[str, Any]) -> dict[str, Any]:
         actions_L = element["actions"]
-        target_text = "\n".join(f"Frame {i}: {a}" for i, a in enumerate(actions_L))
+        lines = []
+        for i, a in enumerate(actions_L):
+            is_noop = action_is_no_op_b(a)
+            if self.skip_noop_frames and is_noop:
+                continue
+            if is_noop and self.noop_format == "zeros":
+                a = "0,0,0"
+            lines.append(f"Frame {i}: {a}")
+        target_text = "\n".join(lines)
         result = {
             "frames": element["frames"],
             "target_text": target_text,
@@ -271,6 +283,8 @@ def get_dataloader(
     read_num_threads: int = 4,
     worker_buffer_size: int = 4,
     min_action_density: float = 0.0,
+    noop_format: str = "token",
+    skip_noop_frames: bool = False,
 ) -> grain.DataLoader:
     if not array_record_paths:
         raise ValueError("array_record_paths list cannot be empty.")
@@ -320,7 +334,10 @@ def get_dataloader(
         ops.append(ActionDensityFilter(min_action_density=min_action_density))
     ops.extend(
         [
-            BuildSFTExampleFromFrames(),
+            BuildSFTExampleFromFrames(
+                noop_format=noop_format,
+                skip_noop_frames=skip_noop_frames,
+            ),
             grain.transforms.Batch(
                 batch_size=global_batch_size // world_size,
                 drop_remainder=True,
