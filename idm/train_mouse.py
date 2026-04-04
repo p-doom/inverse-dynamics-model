@@ -448,6 +448,7 @@ def main() -> None:
                         val_temperature=args.val_temperature,
                         diversity_penalty=args.diversity_penalty,
                         mouse_prox_px_threshold=args.mouse_prox_px_threshold,
+                        skip_noop_frames=args.skip_noop_frames,
                     )
                     if ema_backup is not None:
                         ema.restore(ddp_model.module, ema_backup)

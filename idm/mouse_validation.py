@@ -4,6 +4,7 @@ from typing import Any
 
 import cv2
 import torch
+from transformers import LogitsProcessorList
 
 from mouse_actions import (
     _ACTION_CLASS_NAMES,
@@ -20,6 +21,72 @@ from mouse_metrics import (
     _mouse_vector_metrics_from_texts,
 )
 from mouse_train_utils import _to_device
+
+
+class _MouseFormatLogitsProcessor:
+    """Forces 'Frame N: ACTION\\n' output format during generation.
+
+    At each generation step, checks whether the next token should be a
+    specific header token (part of 'Frame N: ').  If so, sets all other
+    logits to -inf.  At action positions (between a completed header and the
+    next newline / EOS) the scores are left untouched.
+    """
+
+    def __init__(self, tokenizer: Any, seq_len: int) -> None:
+        self._seq_len = seq_len
+        self._initial_len: int | None = None
+        # Pre-tokenize "Frame N: " for each frame index.
+        self._headers: list[list[int]] = [
+            tokenizer.encode(f"Frame {i}: ", add_special_tokens=False)
+            for i in range(seq_len)
+        ]
+        self._nl_ids: frozenset[int] = frozenset(
+            tokenizer.encode("\n", add_special_tokens=False)
+        )
+        _eos = tokenizer.eos_token_id
+        self._eos_id: int | None = int(_eos) if _eos is not None else None
+
+    def _next_required(self, generated: list[int]) -> int | None:
+        """Return the token ID that must be generated next, or None (free)."""
+        frame_i = 0
+        hdr_pos = 0
+        in_action = False
+        for tok in generated:
+            if frame_i >= self._seq_len:
+                break
+            if not in_action:
+                hdr = self._headers[frame_i]
+                if hdr_pos < len(hdr) and tok == hdr[hdr_pos]:
+                    hdr_pos += 1
+                if hdr_pos >= len(hdr):
+                    in_action = True
+            else:
+                if tok in self._nl_ids or tok == self._eos_id:
+                    frame_i += 1
+                    hdr_pos = 0
+                    in_action = False
+        # Determine required next token.
+        if frame_i >= self._seq_len:
+            return self._eos_id  # all frames done — force EOS
+        if not in_action:
+            hdr = self._headers[frame_i]
+            if hdr_pos < len(hdr):
+                return hdr[hdr_pos]
+        return None  # inside action — free generation
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        if self._initial_len is None:
+            # First call: record the padded-prompt length so we can slice
+            # generated tokens for every subsequent call.
+            self._initial_len = int(input_ids.shape[1])
+        gen_start = self._initial_len
+        for b_i in range(input_ids.shape[0]):
+            generated = input_ids[b_i, gen_start:].tolist()
+            req = self._next_required(generated)
+            if req is not None:
+                scores[b_i].fill_(float("-inf"))
+                scores[b_i][req] = 0.0
+        return scores
 
 
 def _run_validation_steps(
@@ -41,6 +108,7 @@ def _run_validation_steps(
     val_temperature: float = 1.0,
     diversity_penalty: float = 0.0,
     mouse_prox_px_threshold: float = 50.0,
+    skip_noop_frames: bool = False,
 ) -> tuple[float, int, int, int, float, float, int, int, int]:
     """Run val steps.  When `visual_samples_out_L` is not None, the first
     batch's raw data (jpeg_frames, gt actions, pred actions) is saved for
@@ -114,6 +182,12 @@ def _run_validation_steps(
                 gen_kwargs["pad_token_id"] = int(pad_id)
             if eos_id is not None:
                 gen_kwargs["eos_token_id"] = int(eos_id)
+            frames_np = raw_batch.get("frames")
+            if not skip_noop_frames and frames_np is not None and len(frames_np) > 0:
+                seq_len_i = int(frames_np.shape[1])
+                gen_kwargs["logits_processor"] = LogitsProcessorList([
+                    _MouseFormatLogitsProcessor(collator.tokenizer, seq_len_i)
+                ])
             with torch.autocast(device.type, dtype=dtype, enabled=(device.type == "cuda")):
                 if "mm_token_type_ids" in prompt_model:
                     if "image_grid_thw" not in prompt_model or prompt_model["image_grid_thw"] is None:
