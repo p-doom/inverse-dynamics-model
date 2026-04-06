@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import os
 import random
 import time
@@ -12,9 +12,9 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 import tyro
+import wandb
 
 from idm.utils.checkpoint import (
     find_latest_checkpoint,
@@ -61,6 +61,7 @@ class Args:
     wsd_decay_steps: int = 200
     weight_decay: float = 0.0
     precision: str = "bf16"
+    master_weights_fp32: bool = False
     grad_checkpointing: bool = True
     use_lora: bool = True
     lora_r: int = 16
@@ -74,6 +75,12 @@ class Args:
     save_every: int = 100
     out_dir: str = "./runs/default"
     resume_from: str = ""
+    wandb_enable: bool = True
+    wandb_tags: list[str] = field(default_factory=list)
+    wandb_project: str = "idm"
+    wandb_entity: str = ""
+    wandb_run_name: str = ""
+    wandb_mode: str = "offline"
     mfu_peak_flops: float = 0.0
 
 
@@ -263,7 +270,8 @@ def _run_validation_steps(
     val_loader: Any,
     val_steps: int,
     device: torch.device,
-    dtype: torch.dtype,
+    compute_dtype: torch.dtype,
+    use_amp: bool,
 ) -> tuple[float, int]:
     """Run *val_steps* forward passes and return ``(mean_loss, total_tokens)``."""
     ddp_model.eval()
@@ -280,8 +288,8 @@ def _run_validation_steps(
             model_batch_d = _to_device(batch_d, device)
             with torch.autocast(
                 device_type=device.type,
-                dtype=dtype,
-                enabled=(device.type == "cuda"),
+                dtype=compute_dtype,
+                enabled=use_amp,
             ):
                 outputs = ddp_model(**model_batch_d)
                 loss = outputs.loss
@@ -387,9 +395,22 @@ def main() -> None:
             print(f"val_dataset: {len(val_dataset)} conversations")
 
     # ── model ──
-    dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
+    if args.precision == "bf16":
+        compute_dtype = torch.bfloat16
+    elif args.precision == "fp16":
+        compute_dtype = torch.float16
+    else:
+        compute_dtype = torch.float32
+
+    param_dtype = (
+        torch.float32
+        if args.master_weights_fp32 or args.precision == "fp32"
+        else compute_dtype
+    )
+    use_amp = compute_dtype != torch.float32
+
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
-    model = _build_model(args, dtype, device)
+    model = _build_model(args, param_dtype, device)
     train_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_n = sum(p.numel() for p in model.parameters())
     mfu_n_layers_i, mfu_n_heads_i, mfu_head_dim_i = _transformer_dims_for_mfu(model)
@@ -466,11 +487,17 @@ def main() -> None:
     scaler = torch.amp.GradScaler(enabled=args.precision == "fp16")
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # ── TensorBoard ──
-    tb_writer: SummaryWriter | None = None
-    if rank_i == 0:
-        tb_writer = SummaryWriter(log_dir=os.path.join(args.out_dir, "tb"))
-        tb_writer.add_hparams(args.__dict__, {}, name="hparams")
+    wandb_run = None
+    if rank_i == 0 and args.wandb_enable:
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.wandb_run_name or None,
+            mode=args.wandb_mode,
+            tags=args.wandb_tags,
+            dir=args.out_dir,
+            config=asdict(args),
+        )
 
     # ── resume ──
     global_step = 0
@@ -533,7 +560,7 @@ def main() -> None:
             model_batch_d = _to_device(batch_d, device)
             tok_n = int((model_batch_d["labels"] != -100).sum().item())
 
-            with torch.autocast("cuda", dtype=dtype):
+            with torch.autocast("cuda", dtype=compute_dtype, enabled=use_amp):
                 outputs = ddp_model(**model_batch_d)
                 loss = outputs.loss
 
@@ -629,29 +656,19 @@ def main() -> None:
                         f"steps/s={steps_per_s:.3f} "
                         f"tok/s={toks_per_s:.1f}{mfu_s}"
                     )
-                    if tb_writer is not None:
-                        tb_writer.add_scalar(
-                            "train/loss", mean_loss_t.item(), global_step
-                        )
-                        tb_writer.add_scalar(
-                            "train/grad_norm",
-                            mean_grad_norm_t.item(),
-                            global_step,
-                        )
-                        tb_writer.add_scalar("train/lr", lr_f, global_step)
-                        tb_writer.add_scalar(
-                            "train/steps_per_s", steps_per_s, global_step
-                        )
-                        tb_writer.add_scalar(
-                            "train/tokens_per_s", toks_per_s, global_step
-                        )
-                        tb_writer.add_scalar(
-                            "train/epoch_estimate", epoch_i, global_step
-                        )
+                    if wandb_run is not None:
+                        log_d = {
+                            "train/loss": mean_loss_t.item(),
+                            "train/grad_norm": mean_grad_norm_t.item(),
+                            "train/lr": lr_f,
+                            "train/steps_per_s": steps_per_s,
+                            "train/tokens_per_s": toks_per_s,
+                            "train/supervised_tokens": tok_t.item() / max(log_step_n, 1),
+                            "train/epoch_estimate": epoch_i,
+                        }
                         if mfu_f is not None:
-                            tb_writer.add_scalar(
-                                "train/mfu", mfu_f, global_step
-                            )
+                            log_d["train/mfu"] = mfu_f
+                        wandb_run.log(log_d, step=global_step)
 
                 log_loss_sum = 0.0
                 log_micro_n = 0
@@ -675,7 +692,8 @@ def main() -> None:
                     val_loader=val_loader,
                     val_steps=args.val_steps,
                     device=device,
-                    dtype=dtype,
+                    compute_dtype=compute_dtype,
+                    use_amp=use_amp,
                 )
                 val_loss_num_t = torch.tensor(
                     val_loss_f * max(float(val_tok_n), 1.0), device=device
@@ -694,12 +712,13 @@ def main() -> None:
                         f"val_loss={val_loss_t.item():.6f} "
                         f"val_tok/s={val_toks_per_s:.1f}"
                     )
-                    if tb_writer is not None:
-                        tb_writer.add_scalar(
-                            "val/loss", val_loss_t.item(), global_step
-                        )
-                        tb_writer.add_scalar(
-                            "val/tokens_per_s", val_toks_per_s, global_step
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "val/loss": val_loss_t.item(),
+                                "val/tokens_per_s": val_toks_per_s,
+                            },
+                            step=global_step,
                         )
 
             # ── checkpoint ──
@@ -738,8 +757,8 @@ def main() -> None:
 
     if rank_i == 0:
         print(f"Training complete. global_step={global_step}")
-        if tb_writer is not None:
-            tb_writer.close()
+        if wandb_run is not None:
+            wandb_run.finish()
     dist.barrier()
     dist.destroy_process_group()
 

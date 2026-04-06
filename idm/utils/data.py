@@ -8,22 +8,16 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 
-def _swap_and_truncate(example: dict[str, Any], max_turns: int) -> dict[str, Any]:
-    """Swap assistant/user roles and truncate to *max_turns* messages.
+def _truncate(example: dict[str, Any], max_turns: int) -> dict[str, Any]:
+    """Truncate to *max_turns* messages.
 
-    The JSONL has ``assistant=image, user=action``.  We swap so that
-    ``user=image, assistant=action`` which makes standard SFT label
-    masking work (predict assistant turns).  A trailing user message
-    (image with no paired action) is dropped.
+    Expected format: ``user=image, assistant=action``.
+    A trailing user message (image with no paired action) is dropped.
     """
     messages = example["messages"][:max_turns]
-    swapped = []
-    for msg in messages:
-        new_role = "user" if msg["role"] == "assistant" else "assistant"
-        swapped.append({"role": new_role, "content": msg["content"]})
-    if swapped and swapped[-1]["role"] == "user":
-        swapped = swapped[:-1]
-    return {"messages": swapped}
+    if messages and messages[-1]["role"] == "user":
+        messages = messages[:-1]
+    return {"messages": messages}
 
 
 def load_chat_dataset(data_path: str, max_turns: int = 32) -> Dataset:
@@ -33,7 +27,7 @@ def load_chat_dataset(data_path: str, max_turns: int = 32) -> Dataset:
     conversation (list of ``{role, content}`` dicts).
     """
     dataset = load_dataset("json", data_files=data_path, split="train")
-    dataset = dataset.map(lambda ex: _swap_and_truncate(ex, max_turns))
+    dataset = dataset.map(lambda ex: _truncate(ex, max_turns))
     dataset = dataset.filter(lambda ex: len(ex["messages"]) >= 2)
     return dataset
 
