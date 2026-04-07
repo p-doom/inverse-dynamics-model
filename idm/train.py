@@ -658,7 +658,8 @@ def main() -> None:
                     )
                     if wandb_run is not None:
                         log_d = {
-                            "train/loss": mean_loss_t.item(),
+                            "train/loss": loss.item(),
+                            "train/mean_loss": mean_loss_t.item(),
                             "train/grad_norm": mean_grad_norm_t.item(),
                             "train/lr": lr_f,
                             "train/steps_per_s": steps_per_s,
