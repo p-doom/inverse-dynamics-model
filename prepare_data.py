@@ -6,13 +6,13 @@ same JSON format used by the eval pipeline.
 """
 
 import json
-import multiprocessing as mp
 import os
 import random
 import re
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +25,8 @@ from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Key / button name normalization
+# Maps raw crowd-cast event key names (e.g. "KeyA", "MetaLeft", "ShiftRight")
+# to the display names used in the eval format (e.g. "A", "Cmd", "Shift").
 # ---------------------------------------------------------------------------
 
 KEY_NAME_MAP = {
@@ -55,6 +57,7 @@ KEY_NAME_MAP = {
     "PageDown": "PageDown",
 }
 
+# Keys that modify other keys (Cmd+C, Shift+A) rather than producing their own action.
 MODIFIER_KEYS = {"Shift", "Ctrl", "Alt", "AltGr", "Cmd"}
 
 
@@ -87,13 +90,17 @@ def format_key_with_modifiers(key: str, held_modifiers: set[str]) -> str:
 # Raw keylog → sparse events
 # ---------------------------------------------------------------------------
 
+
 def parse_keylog_events(entries: list, fps: int, num_frames: int) -> list[dict]:
-    """Convert raw msgpack keylog entries to sparse events in eval format.
+    """Convert raw msgpack keylog entries to per-frame held-state events.
+
+    Tracks KeyPress/KeyRelease and MousePress/MouseRelease to determine which
+    keys/buttons are held on each frame. Emits one event per frame per held
+    key/button. Scrolls are emitted as instantaneous events (one per tick).
 
     Returns list of {"frame_idx": int, "type": str, "details": str}.
     """
     held_modifiers: set[str] = set()
-    events: list[dict] = []
 
     # Sort by timestamp, then original order
     sortable = []
@@ -110,6 +117,23 @@ def parse_keylog_events(entries: list, fps: int, num_frames: int) -> list[dict]:
         sortable.append((ts, order_i, ev))
     sortable.sort(key=lambda x: (x[0], x[1]))
 
+    # Track held state as spans — keyed by raw key name, storing (frame, detail)
+    held_keys: dict[str, tuple[int, str]] = {}  # raw_key -> (press_frame, detail)
+    held_buttons: dict[str, int] = {}  # button -> press_frame
+    key_spans: list[tuple[int, int, str]] = []  # (start, end, detail)
+    button_spans: list[tuple[int, int, str]] = []  # (start, end, button)
+    scroll_events: list[dict] = []
+
+    def _release_all(frame: int) -> None:
+        """Close all held key/button spans at the given frame."""
+        for start, detail in held_keys.values():
+            key_spans.append((start, frame, detail))
+        held_keys.clear()
+        held_modifiers.clear()
+        for button, start in held_buttons.items():
+            button_spans.append((start, frame, button))
+        held_buttons.clear()
+
     for ts, _, ev in sortable:
         frame_idx = (ts * fps) // 1_000_000
         if frame_idx < 0 or frame_idx >= num_frames:
@@ -118,7 +142,13 @@ def parse_keylog_events(entries: list, fps: int, num_frames: int) -> list[dict]:
         etype = str(ev[0])
         payload = ev[1] if len(ev) > 1 else None
 
-        if etype == "KeyPress":
+        if etype == "ContextChanged":
+            # Release all held keys/buttons when switching to uncaptured app
+            ctx = ev[1] if len(ev) > 1 else None
+            if isinstance(ctx, list) and "UNCAPTURED" in ctx:
+                _release_all(frame_idx)
+
+        elif etype == "KeyPress":
             raw_key = _parse_key_name(payload)
             if raw_key == "UNKNOWN":
                 continue
@@ -127,30 +157,64 @@ def parse_keylog_events(entries: list, fps: int, num_frames: int) -> list[dict]:
                 held_modifiers.add(key)
                 continue
             detail = format_key_with_modifiers(key, held_modifiers)
-            events.append({"frame_idx": frame_idx, "type": "KeyPress", "details": detail})
+            if key not in held_keys:
+                held_keys[key] = (frame_idx, detail)
 
         elif etype == "KeyRelease":
             raw_key = _parse_key_name(payload)
             if raw_key == "UNKNOWN":
                 continue
             key = normalize_key_name(raw_key)
-            held_modifiers.discard(key)
+            if key in MODIFIER_KEYS:
+                held_modifiers.discard(key)
+                continue
+            if key in held_keys:
+                start, detail = held_keys.pop(key)
+                key_spans.append((start, frame_idx, detail))
 
         elif etype == "MousePress":
             button = _parse_button(payload)
-            if button != "UNKNOWN":
-                events.append({"frame_idx": frame_idx, "type": "MouseClick", "details": button})
+            if button != "UNKNOWN" and button not in held_buttons:
+                held_buttons[button] = frame_idx
 
         elif etype == "MouseRelease":
-            pass  # ignored
+            button = _parse_button(payload)
+            if button != "UNKNOWN" and button in held_buttons:
+                button_spans.append((held_buttons.pop(button), frame_idx, button))
 
         elif etype == "MouseScroll":
             direction = _parse_scroll_direction(payload)
             if direction:
-                events.append({"frame_idx": frame_idx, "type": "MouseScroll", "details": direction})
+                scroll_events.append(
+                    {
+                        "frame_idx": frame_idx,
+                        "type": "MouseScroll",
+                        "details": direction,
+                    }
+                )
 
-        # MouseMove: ignored
+    # Close unclosed spans at end of clip
+    for detail, start in held_keys.items():
+        key_spans.append((start, num_frames - 1, detail))
+    for button, start in held_buttons.items():
+        button_spans.append((start, num_frames - 1, button))
 
+    # Emit per-frame events from spans
+    events: list[dict] = []
+    for start, end, detail in key_spans:
+        for f in range(start, max(end, start + 1)):
+            if f >= num_frames:
+                break
+            events.append({"frame_idx": f, "type": "KeyPress", "details": detail})
+
+    for start, end, button in button_spans:
+        for f in range(start, max(end, start + 1)):
+            if f >= num_frames:
+                break
+            events.append({"frame_idx": f, "type": "MouseClick", "details": button})
+
+    events.extend(scroll_events)
+    events.sort(key=lambda x: (x["frame_idx"], x["type"], x["details"]))
     return events
 
 
@@ -211,7 +275,13 @@ def coalesce_scroll_events(events: list[dict]) -> list[dict]:
                 break  # direction reversal
             last_frame = nxt["frame_idx"]
             j += 1
-        result.append({"frame_idx": gesture_frame, "type": "MouseScroll", "details": gesture_direction})
+        result.append(
+            {
+                "frame_idx": gesture_frame,
+                "type": "MouseScroll",
+                "details": gesture_direction,
+            }
+        )
         i = j
     return result
 
@@ -223,12 +293,16 @@ def filter_event_types(events: list[dict], action_types: set[str]) -> list[dict]
 
 def events_to_eval_format(events: list[dict]) -> list[dict]:
     """Convert frame_idx-based events to eval format with 'frame' key."""
-    return [{"frame": f"F{e['frame_idx']:02d}", "type": e["type"], "details": e["details"]} for e in events]
+    return [
+        {"frame": f"F{e['frame_idx']:02d}", "type": e["type"], "details": e["details"]}
+        for e in events
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Frame extraction and filtering
 # ---------------------------------------------------------------------------
+
 
 def extract_frames(
     video_path: str,
@@ -240,7 +314,9 @@ def extract_frames(
     """Decode video to JPEG frames. Returns list of output paths."""
     vf_parts = []
     if top_bar_fraction > 0:
-        vf_parts.append(f"crop=in_w:in_h*{1 - top_bar_fraction}:0:in_h*{top_bar_fraction}")
+        vf_parts.append(
+            f"crop=in_w:in_h*{1 - top_bar_fraction}:0:in_h*{top_bar_fraction}"
+        )
     vf_parts.append(f"fps={fps}")
     if resolution:
         w, h = resolution
@@ -249,7 +325,19 @@ def extract_frames(
 
     pattern = os.path.join(output_dir, "frame_%06d.jpg")
     subprocess.run(
-        ["ffmpeg", "-i", video_path, "-vf", vf, "-q:v", "2", pattern, "-y", "-loglevel", "error"],
+        [
+            "ffmpeg",
+            "-i",
+            video_path,
+            "-vf",
+            vf,
+            "-q:v",
+            "2",
+            pattern,
+            "-y",
+            "-loglevel",
+            "error",
+        ],
         check=True,
     )
     return sorted(str(p) for p in Path(output_dir).glob("frame_*.jpg"))
@@ -298,6 +386,7 @@ def filter_black_frames(
 # Clip chunking
 # ---------------------------------------------------------------------------
 
+
 def chunk_into_clips(
     frame_paths: list[str],
     events: list[dict],
@@ -327,12 +416,15 @@ def chunk_into_clips(
 # Frame labeling
 # ---------------------------------------------------------------------------
 
+
 def label_frame(img: Image.Image, label: str) -> Image.Image:
     """Burn a text label (e.g. 'F00') into the top-left corner."""
     img = img.copy()
     draw = ImageDraw.Draw(img)
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12
+        )
     except (OSError, IOError):
         font = ImageFont.load_default()
     bbox = draw.textbbox((0, 0), label, font=font)
@@ -371,6 +463,7 @@ def discover_recordings(input_dir: Path) -> list[tuple[Path, Path]]:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+# Maps --action-types CLI values to the set of event types to include in output.
 ALLOWED_ACTION_TYPES = {
     "keyboard": {"KeyPress"},
     "keyboard,click": {"KeyPress", "MouseClick"},
@@ -389,15 +482,21 @@ class Args:
     black_threshold: float = 0.95
     clip_length: int = 30
     clip_stride: int = 15
-    min_action_density: float = 0.0
-    keep_empty_ratio: float = 0.05
+    min_actions: int = (
+        1  # minimum actions per clip to keep (clips below this are sampled at keep_empty_ratio)
+    )
+    keep_empty_ratio: float = (
+        0.05  # fraction of below-threshold clips to keep as negative examples
+    )
     label_frames: bool = False
     action_types: str = "keyboard,click,scroll"
     train_ratio: float = 0.85
     val_ratio: float = 0.15
     seed: int = 42
     num_workers: int = 1
-    max_recordings: int = 0
+    max_recordings: int = (
+        0  # process only first N recordings (0=all, useful for debugging)
+    )
 
 
 def _parse_resolution(s: str) -> tuple[int, int]:
@@ -425,7 +524,7 @@ def process_recording(
     black_threshold: float,
     clip_length: int,
     clip_stride: int,
-    min_action_density: float,
+    min_actions: int,
     keep_empty_ratio: float,
     do_label_frames: bool,
     action_type_set: set[str],
@@ -438,7 +537,9 @@ def process_recording(
     # 2. Extract frames to tempdir
     with tempfile.TemporaryDirectory() as tmpdir:
         frame_paths = extract_frames(
-            str(video_path), fps, tmpdir,
+            str(video_path),
+            fps,
+            tmpdir,
             resolution=resolution,
             top_bar_fraction=top_bar_fraction,
         )
@@ -463,14 +564,11 @@ def process_recording(
         # 6. Write clips
         results = []
         for chunk_idx, (clip_frames, clip_events) in enumerate(clips):
-            # Skip most clips with no actions, keep a small fraction
-            if not clip_events:
+            # Filter by action count
+            n_actions = len(clip_events)
+            if n_actions < min_actions:
+                # Below threshold — keep a small fraction as negative examples
                 if keep_empty_ratio <= 0 or random.random() > keep_empty_ratio:
-                    continue
-            # Check min action density
-            if min_action_density > 0:
-                density = len(clip_events) / len(clip_frames)
-                if density < min_action_density:
                     continue
 
             clip_id = _short_clip_id(video_path.name, chunk_idx)
@@ -499,68 +597,69 @@ def process_recording(
     return results
 
 
-def _process_recording_worker(args_tuple: tuple) -> tuple[list[dict], float]:
-    """Multiprocessing-friendly wrapper for process_recording."""
-    (video_path, keylog_path, split_dir, fps, resolution,
-     top_bar_fraction, black_threshold, clip_length, clip_stride,
-     min_action_density, keep_empty_ratio, do_label_frames, action_types_list) = args_tuple
-    action_type_set = set(action_types_list)
+@dataclass
+class RecordingJob:
+    """Picklable job description for parallel processing."""
+
+    video_path: str
+    keylog_path: str
+    split_dir: str
+    fps: int
+    resolution: tuple[int, int]
+    top_bar_fraction: float
+    black_threshold: float
+    clip_length: int
+    clip_stride: int
+    min_actions: int
+    keep_empty_ratio: float
+    do_label_frames: bool
+    action_types: list[str]  # list for pickling (sets aren't picklable)
+
+
+def _process_one(job: RecordingJob) -> tuple[list[dict], float]:
+    """Process one recording. Safe for multiprocessing (catches exceptions, times execution)."""
     t0 = time.monotonic()
     try:
         entries = process_recording(
-            Path(video_path), Path(keylog_path), Path(split_dir),
-            fps=fps, resolution=resolution,
-            top_bar_fraction=top_bar_fraction,
-            black_threshold=black_threshold,
-            clip_length=clip_length, clip_stride=clip_stride,
-            min_action_density=min_action_density,
-            keep_empty_ratio=keep_empty_ratio,
-            do_label_frames=do_label_frames,
-            action_type_set=action_type_set,
+            Path(job.video_path),
+            Path(job.keylog_path),
+            Path(job.split_dir),
+            fps=job.fps,
+            resolution=job.resolution,
+            top_bar_fraction=job.top_bar_fraction,
+            black_threshold=job.black_threshold,
+            clip_length=job.clip_length,
+            clip_stride=job.clip_stride,
+            min_actions=job.min_actions,
+            keep_empty_ratio=job.keep_empty_ratio,
+            do_label_frames=job.do_label_frames,
+            action_type_set=set(job.action_types),
         )
     except Exception as e:
-        print(f"WARNING: Failed to process {video_path}: {e}", flush=True)
+        print(f"WARNING: Failed to process {job.video_path}: {e}", flush=True)
         entries = []
-    elapsed = time.monotonic() - t0
-    return entries, elapsed
-
-
-def _build_worker_args(
-    recs: list[tuple[Path, Path]],
-    split_dir: Path,
-    args: "Args",
-    resolution: tuple[int, int],
-    action_type_set: set[str],
-) -> list[tuple]:
-    """Build picklable argument tuples for each recording."""
-    action_types_list = sorted(action_type_set)  # set → list for pickling
-    return [
-        (str(video_path), str(keylog_path), str(split_dir),
-         args.fps, resolution, args.top_bar_fraction,
-         args.black_threshold, args.clip_length, args.clip_stride,
-         args.min_action_density, args.keep_empty_ratio,
-         args.label_frames, action_types_list)
-        for video_path, keylog_path in recs
-    ]
+    return entries, time.monotonic() - t0
 
 
 def main() -> None:
     args = tyro.cli(Args)
-    assert args.input_dir, "--input-dir is required"
-    assert args.action_types in ALLOWED_ACTION_TYPES, (
-        f"Invalid --action-types: {args.action_types}. "
-        f"Allowed: {list(ALLOWED_ACTION_TYPES.keys())}"
-    )
+    if not args.input_dir:
+        raise ValueError("--input-dir is required")
+    if args.action_types not in ALLOWED_ACTION_TYPES:
+        raise ValueError(
+            f"Invalid --action-types: {args.action_types}. "
+            f"Allowed: {list(ALLOWED_ACTION_TYPES.keys())}"
+        )
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     resolution = _parse_resolution(args.resolution)
-    action_type_set = ALLOWED_ACTION_TYPES[args.action_types]
+    action_types_list = sorted(ALLOWED_ACTION_TYPES[args.action_types])
 
     # Discover recordings
     recordings = discover_recordings(input_dir)
     if args.max_recordings > 0:
-        recordings = recordings[:args.max_recordings]
+        recordings = recordings[: args.max_recordings]
     if not recordings:
         print(f"No recordings found under {input_dir}")
         return
@@ -584,29 +683,40 @@ def main() -> None:
     timing_s: list[float] = []
     num_workers = max(1, args.num_workers)
 
-    for split_name, split_recs, split_dir in [("train", train_recs, train_dir), ("val", val_recs, val_dir)]:
-        worker_args = _build_worker_args(split_recs, split_dir, args, resolution, action_type_set)
+    for split_name, split_recs, split_dir in [
+        ("train", train_recs, train_dir),
+        ("val", val_recs, val_dir),
+    ]:
+        jobs = [
+            RecordingJob(
+                video_path=str(vp),
+                keylog_path=str(kp),
+                split_dir=str(split_dir),
+                fps=args.fps,
+                resolution=resolution,
+                top_bar_fraction=args.top_bar_fraction,
+                black_threshold=args.black_threshold,
+                clip_length=args.clip_length,
+                clip_stride=args.clip_stride,
+                min_actions=args.min_actions,
+                keep_empty_ratio=args.keep_empty_ratio,
+                do_label_frames=args.label_frames,
+                action_types=action_types_list,
+            )
+            for vp, kp in split_recs
+        ]
         entries = []
 
-        if num_workers <= 1:
-            for wa in tqdm(worker_args, desc=f"Processing {split_name}"):
-                clip_entries, elapsed = _process_recording_worker(wa)
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            for clip_entries, elapsed in tqdm(
+                executor.map(_process_one, jobs),
+                total=len(jobs),
+                desc=f"Processing {split_name} ({num_workers} workers)",
+            ):
                 timing_s.append(elapsed)
                 if not clip_entries:
                     num_failed += 1
                 entries.extend(clip_entries)
-        else:
-            ctx = mp.get_context("fork")
-            with ctx.Pool(num_workers) as pool:
-                for clip_entries, elapsed in tqdm(
-                    pool.imap_unordered(_process_recording_worker, worker_args),
-                    total=len(worker_args),
-                    desc=f"Processing {split_name} ({num_workers} workers)",
-                ):
-                    timing_s.append(elapsed)
-                    if not clip_entries:
-                        num_failed += 1
-                    entries.extend(clip_entries)
 
         # Write JSONL index
         jsonl_path = split_dir / f"{split_name}.jsonl"
@@ -649,11 +759,14 @@ def main() -> None:
         total_t = sum(timing_s)
         mean_t = total_t / len(timing_s)
         median_t = sorted(timing_s)[len(timing_s) // 2]
-        print(f"\nTiming: {total_t:.1f}s total, {mean_t:.2f}s/recording avg, "
-              f"{median_t:.2f}s/recording median, {max(timing_s):.2f}s max")
-        n_recs = len(timing_s)
+        print(
+            f"\nTiming: {total_t:.1f}s total, {mean_t:.2f}s/recording avg, "
+            f"{median_t:.2f}s/recording median, {max(timing_s):.2f}s max"
+        )
         est_all = mean_t * 2147  # ~2147 total recordings
-        print(f"Estimated full dataset ({2147} recordings): {est_all/60:.0f}min = {est_all/3600:.1f}h")
+        print(
+            f"Estimated full dataset ({2147} recordings): {est_all/60:.0f}min = {est_all/3600:.1f}h"
+        )
 
     if num_failed:
         print(f"WARNING: {num_failed} recordings failed (corrupt/unreadable)")

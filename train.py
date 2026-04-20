@@ -7,13 +7,17 @@ sequences of screenshot frames, using the same JSON format as the eval pipeline.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import random
 import re
+import subprocess
+import sys
+import tempfile
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +26,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -30,10 +36,20 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 import tyro
 import wandb
 
+# Scoring functions from the eval pipeline (for inline eval)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "eval-models"))
+from score_eval import (
+    filter_gt_actions,
+    coalesce_gt_events,
+    filter_predictions,
+    match_clip,
+)
+
 
 # ---------------------------------------------------------------------------
 # Prompt (identical to eval pipeline)
 # ---------------------------------------------------------------------------
+
 
 def build_prompt(fps: int, num_frames: int) -> str:
     interval_ms = 1000 / fps
@@ -51,7 +67,7 @@ def build_prompt(fps: int, num_frames: int) -> str:
         f'"Space", "Backspace", "Cmd+C", "LeftArrow"). For MouseClick give the '
         f'button ("Left" or "Right"). For MouseScroll give the direction ("up" or "down").\n\n'
         f"IMPORTANT rules:\n"
-        f"- Each KeyPress is ONE key. If \"hello\" is typed, that is 5 separate "
+        f'- Each KeyPress is ONE key. If "hello" is typed, that is 5 separate '
         f"KeyPress events: H, E, L, L, O.\n"
         f"- Do NOT list mouse movements or key releases.\n"
         f"- Ignore screen changes not caused by user input (loading content, "
@@ -67,16 +83,43 @@ def build_prompt(fps: int, num_frames: int) -> str:
     )
 
 
+# Normalize key names from prepare_data.py to eval-format conventions.
+_KEY_NORMALIZE = {
+    "SemiColon": "Semicolon",
+    "BackSlash": "Backslash",
+    "BackQuote": "Backtick",
+}
+
+
+def normalize_actions(actions: list[dict]) -> list[dict]:
+    """Normalize action key names and strip unpredictable keys.
+
+    - SemiColon -> Semicolon, BackSlash -> Backslash, BackQuote -> Backtick
+    - Strips Unknown(...) keys since they have no visual cue.
+    """
+    result = []
+    for a in actions:
+        a = dict(a)
+        detail = a.get("details", "")
+        if "Unknown(" in detail:
+            continue
+        parts = detail.split("+")
+        a["details"] = "+".join(_KEY_NORMALIZE.get(p, p) for p in parts)
+        result.append(a)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Response parsing (from eval pipeline)
 # ---------------------------------------------------------------------------
+
 
 def parse_response(text: str) -> list[dict]:
     """Extract JSON action array from model output."""
     cleaned = text.strip()
     cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
     if "<think>" in cleaned:
-        cleaned = cleaned[:cleaned.index("<think>")]
+        cleaned = cleaned[: cleaned.index("<think>")]
     cleaned = re.sub(r"<\|begin_of_box\|>", "", cleaned)
     cleaned = re.sub(r"<\|end_of_box\|>", "", cleaned)
     cleaned = cleaned.strip()
@@ -104,7 +147,10 @@ def parse_response(text: str) -> list[dict]:
 # Bipartite matching for F1 (from eval/score_eval.py)
 # ---------------------------------------------------------------------------
 
-def compute_f1(predictions: list[dict], ground_truth: list[dict], tolerance: int = 2) -> tuple[float, float, float]:
+
+def compute_f1(
+    predictions: list[dict], ground_truth: list[dict], tolerance: int = 2
+) -> tuple[float, float, float]:
     """Greedy bipartite matching between predicted and GT actions.
 
     Returns (precision, recall, f1).
@@ -138,7 +184,11 @@ def compute_f1(predictions: list[dict], ground_truth: list[dict], tolerance: int
 
     precision = tp / len(predictions) if predictions else 0.0
     recall = tp / len(ground_truth) if ground_truth else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
     return precision, recall, f1
 
 
@@ -146,10 +196,13 @@ def compute_f1(predictions: list[dict], ground_truth: list[dict], tolerance: int
 # Dataset
 # ---------------------------------------------------------------------------
 
+
 class ClipDataset(Dataset):
     """Dataset that does all heavy processing (JPEG decode + processor) in workers."""
 
-    def __init__(self, jsonl_path: str, data_root: str, processor: Any, max_length: int = 8192):
+    def __init__(
+        self, jsonl_path: str, data_root: str, processor: Any, max_length: int = 8192
+    ):
         self.data_root = Path(data_root)
         self.processor = processor
         self.max_length = max_length
@@ -171,7 +224,7 @@ class ClipDataset(Dataset):
         """Find where the assistant response starts by searching for the marker."""
         marker = self._assistant_marker
         for i in range(len(input_ids) - len(marker), -1, -1):
-            if input_ids[i:i + len(marker)] == marker:
+            if input_ids[i : i + len(marker)] == marker:
                 return i + len(marker)
         return 0
 
@@ -180,7 +233,7 @@ class ClipDataset(Dataset):
         clip_dir = self.data_root / clip["clip_dir"]
         num_frames = clip["num_frames"]
         fps = clip["fps"]
-        actions = clip["actions"]
+        actions = normalize_actions(clip["actions"])
 
         # Load frames (CPU-heavy: JPEG decode)
         frames = []
@@ -196,13 +249,16 @@ class ClipDataset(Dataset):
         full_msgs = build_sft_messages(frames, prompt, target, fps)
         full_text = self.processor.apply_chat_template(full_msgs, tokenize=False)
         full_inputs = self.processor(
-            text=[full_text], videos=[frames], video_metadata=video_meta,
-            return_tensors="pt", padding=False,
+            text=[full_text],
+            videos=[frames],
+            video_metadata=video_meta,
+            return_tensors="pt",
+            padding=False,
         )
 
         input_ids = full_inputs["input_ids"].squeeze(0)
         if input_ids.shape[0] > self.max_length:
-            input_ids = input_ids[:self.max_length]
+            input_ids = input_ids[: self.max_length]
 
         # Find prompt length by locating assistant marker (avoids second processor call)
         prompt_len = self._find_prompt_len(input_ids.tolist())
@@ -214,7 +270,7 @@ class ClipDataset(Dataset):
         if mm_token_type_ids is not None:
             mm_token_type_ids = mm_token_type_ids.squeeze(0)
             if mm_token_type_ids.shape[0] > self.max_length:
-                mm_token_type_ids = mm_token_type_ids[:self.max_length]
+                mm_token_type_ids = mm_token_type_ids[: self.max_length]
 
         result = {
             "input_ids": input_ids,
@@ -226,17 +282,38 @@ class ClipDataset(Dataset):
         if mm_token_type_ids is not None:
             result["mm_token_type_ids"] = mm_token_type_ids
         if "pixel_values_videos" in full_inputs:
-            result["pixel_values_videos"] = full_inputs["pixel_values_videos"].squeeze(0)
+            result["pixel_values_videos"] = full_inputs["pixel_values_videos"].squeeze(
+                0
+            )
         if "video_grid_thw" in full_inputs:
             result["video_grid_thw"] = full_inputs["video_grid_thw"]
         return result
 
 
-class RawClipDataset(Dataset):
-    """Lightweight dataset: loads JPEG frames only, defers processing to collator."""
+class ProcessedClipDataset(Dataset):
+    """Dataset that does FULL processing in DataLoader workers (parallel processes).
 
-    def __init__(self, jsonl_path: str, data_root: str):
+    Each worker holds its own processor instance. Returns model-ready tensors.
+    This avoids the single-threaded collator bottleneck.
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        data_root: str,
+        model_id: str,
+        max_pixels: int,
+        max_length: int,
+        video_mode: str,
+        interleave_labels: bool,
+    ):
         self.data_root = Path(data_root)
+        self.model_id = model_id
+        self.max_pixels = max_pixels
+        self.max_length = max_length
+        self.video_mode = video_mode
+        self.interleave_labels = interleave_labels
+        self._processor = None  # lazy init per worker
         self.clips = []
         with open(jsonl_path) as f:
             for line in f:
@@ -244,36 +321,164 @@ class RawClipDataset(Dataset):
                 if line:
                     self.clips.append(json.loads(line))
 
+    def _get_processor(self):
+        """Lazy-init processor in each DataLoader worker process."""
+        if self._processor is None:
+            self._processor = AutoProcessor.from_pretrained(
+                self.model_id,
+                trust_remote_code=True,
+                min_pixels=3136,
+                max_pixels=self.max_pixels,
+            )
+        return self._processor
+
     def __len__(self) -> int:
         return len(self.clips)
 
     def __getitem__(self, idx: int) -> dict:
+        for _attempt in range(5):
+            try:
+                return self._process_clip(idx)
+            except (OSError, SyntaxError, ValueError) as e:
+                print(f"[processed-dataset] skipping corrupt clip idx={idx}: {e}")
+                idx = random.randint(0, len(self.clips) - 1)
+        return self._process_clip(idx)
+
+    def _process_clip(self, idx: int) -> dict:
         clip = self.clips[idx]
         clip_dir = self.data_root / clip["clip_dir"]
         num_frames = clip["num_frames"]
+        fps = clip["fps"]
+        actions = clip["actions"]
+        actions = normalize_actions(actions)
 
-        # JPEG decode in workers (parallel across processes, GIL-free in C)
-        frames = np.stack([
-            np.array(Image.open(clip_dir / f"F{i:02d}.jpg").convert("RGB"))
+        processor = self._get_processor()
+
+        # Load frames
+        frame_list = [
+            Image.open(clip_dir / f"F{i:02d}.jpg").convert("RGB")
             for i in range(num_frames)
-        ])  # (T, H, W, 3) uint8
+        ]
 
-        return {
-            "frames": torch.from_numpy(frames),  # uint8 tensor for efficient shared-memory IPC
-            "actions": clip["actions"],
-            "fps": clip["fps"],
-            "num_frames": clip["num_frames"],
-        }
+        # Build messages + target
+        target = json.dumps(actions, separators=(",", ":"))
+        prompt = build_prompt(fps, num_frames)
+        msgs = build_sft_messages(
+            frame_list,
+            prompt,
+            target,
+            fps,
+            video_mode=self.video_mode,
+            interleave_labels=self.interleave_labels,
+        )
+        text = processor.apply_chat_template(msgs, tokenize=False)
+
+        # Process
+        enc = processor(
+            text=[text], images=frame_list, return_tensors="pt", padding=False
+        )
+        input_ids = enc["input_ids"].squeeze(0)
+        if input_ids.shape[0] > self.max_length:
+            input_ids = input_ids[: self.max_length]
+
+        # Build labels: mask prompt tokens
+        assistant_marker = processor.tokenizer.encode(
+            "<|im_start|>assistant\n", add_special_tokens=False
+        )
+        prompt_len = 0
+        ids_list = input_ids.tolist()
+        for i in range(len(ids_list) - len(assistant_marker), -1, -1):
+            if ids_list[i : i + len(assistant_marker)] == assistant_marker:
+                prompt_len = i + len(assistant_marker)
+                break
+        labels = input_ids.clone()
+        labels[:prompt_len] = -100
+
+        result = {"input_ids": input_ids, "labels": labels}
+
+        # Vision tensors
+        for key in (
+            "pixel_values",
+            "pixel_values_videos",
+            "image_grid_thw",
+            "video_grid_thw",
+        ):
+            if key in enc:
+                val = enc[key]
+                if val.dim() > 0:
+                    result[key] = val.squeeze(0) if val.shape[0] == 1 else val
+        if "mm_token_type_ids" in enc:
+            mm = enc["mm_token_type_ids"].squeeze(0)
+            if mm.shape[0] > self.max_length:
+                mm = mm[: self.max_length]
+            result["mm_token_type_ids"] = mm
+
+        return result
 
 
-# ---------------------------------------------------------------------------
-# Collation
-# ---------------------------------------------------------------------------
+def collate_processed(batch: list[dict], pad_id: int = 0) -> dict[str, torch.Tensor]:
+    """Pad and stack fully-processed items from ProcessedClipDataset."""
+    max_len = max(item["input_ids"].shape[0] for item in batch)
+    bs = len(batch)
 
-def build_sft_messages(frames: list[Image.Image], prompt: str, target: str, fps: float, video_mode: str = "video") -> list[dict]:
+    padded_ids = torch.full((bs, max_len), pad_id, dtype=torch.long)
+    padded_labels = torch.full((bs, max_len), -100, dtype=torch.long)
+    attention_mask = torch.zeros((bs, max_len), dtype=torch.long)
+    has_mm = "mm_token_type_ids" in batch[0]
+    padded_mm = torch.zeros((bs, max_len), dtype=torch.long) if has_mm else None
+
+    all_pv = []
+    all_grid = []
+
+    for i, item in enumerate(batch):
+        seq_len = item["input_ids"].shape[0]
+        padded_ids[i, :seq_len] = item["input_ids"]
+        padded_labels[i, :seq_len] = item["labels"]
+        attention_mask[i, :seq_len] = 1
+        if has_mm:
+            padded_mm[i, :seq_len] = item["mm_token_type_ids"]
+        for key in ("pixel_values", "pixel_values_videos"):
+            if key in item:
+                all_pv.append(item[key])
+        for key in ("image_grid_thw", "video_grid_thw"):
+            if key in item:
+                all_grid.append(item[key])
+
+    result = {
+        "input_ids": padded_ids,
+        "labels": padded_labels,
+        "attention_mask": attention_mask,
+    }
+    if padded_mm is not None:
+        result["mm_token_type_ids"] = padded_mm
+    if all_pv:
+        result[
+            "pixel_values" if "pixel_values" in batch[0] else "pixel_values_videos"
+        ] = torch.cat(all_pv, dim=0)
+    if all_grid:
+        result[
+            "image_grid_thw" if "image_grid_thw" in batch[0] else "video_grid_thw"
+        ] = torch.cat(all_grid, dim=0)
+    return result
+
+
+def build_sft_messages(
+    frames: list[Image.Image],
+    prompt: str,
+    target: str,
+    fps: float,
+    video_mode: str = "video",
+    interleave_labels: bool = False,
+) -> list[dict]:
     """Build Qwen3-VL chat messages with video/images + prompt → target."""
     if video_mode == "image":
-        content = [{"type": "image", "image": f} for f in frames]
+        if interleave_labels:
+            content = []
+            for i, f in enumerate(frames):
+                content.append({"type": "text", "text": f"Frame F{i:02d}:"})
+                content.append({"type": "image", "image": f})
+        else:
+            content = [{"type": "image", "image": f} for f in frames]
     else:
         content = [{"type": "video", "video": frames, "fps": fps}]
     content.append({"type": "text", "text": prompt})
@@ -283,205 +488,10 @@ def build_sft_messages(frames: list[Image.Image], prompt: str, target: str, fps:
     ]
 
 
-def build_prompt_only_messages(frames: list[Image.Image], prompt: str, fps: float, video_mode: str = "video") -> list[dict]:
-    """Build messages for generation (no assistant response)."""
-    if video_mode == "image":
-        content = [{"type": "image", "image": f} for f in frames]
-    else:
-        content = [{"type": "video", "video": frames, "fps": fps}]
-    content.append({"type": "text", "text": prompt})
-    return [{"role": "user", "content": content}]
-
-
-def collate_for_training(batch: list[dict], pad_id: int = 0) -> dict[str, torch.Tensor]:
-    """Pad and stack pre-processed items from ClipDataset into a batch."""
-    max_len = max(item["input_ids"].shape[0] for item in batch)
-
-    padded_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
-    padded_labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
-    attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
-
-    has_mm = "mm_token_type_ids" in batch[0]
-    padded_mm = torch.zeros((len(batch), max_len), dtype=torch.long) if has_mm else None
-
-    all_pixel_values = []
-    all_grid_thw = []
-
-    for i, item in enumerate(batch):
-        seq_len = item["input_ids"].shape[0]
-        padded_ids[i, :seq_len] = item["input_ids"]
-        padded_labels[i, :seq_len] = item["labels"]
-        attention_mask[i, :seq_len] = 1
-        if has_mm:
-            padded_mm[i, :seq_len] = item["mm_token_type_ids"]
-        if "pixel_values_videos" in item:
-            all_pixel_values.append(item["pixel_values_videos"])
-        if "video_grid_thw" in item:
-            all_grid_thw.append(item["video_grid_thw"])
-
-    result = {
-        "input_ids": padded_ids,
-        "labels": padded_labels,
-        "attention_mask": attention_mask,
-    }
-    if padded_mm is not None:
-        result["mm_token_type_ids"] = padded_mm
-    if all_pixel_values:
-        result["pixel_values_videos"] = torch.cat(all_pixel_values, dim=0)
-    if all_grid_thw:
-        result["video_grid_thw"] = torch.cat(all_grid_thw, dim=0)
-    return result
-
-
-class VideoSFTCollator:
-    """Batched collator: one processor call for the entire batch + label construction."""
-
-    def __init__(self, processor: Any, max_length: int = 8192, video_mode: str = "video"):
-        self.processor = processor
-        self.max_length = max_length
-        self.video_mode = video_mode
-        self._assistant_marker = processor.tokenizer.encode(
-            "<|im_start|>assistant\n", add_special_tokens=False
-        )
-
-    def _find_prompt_len(self, input_ids: list[int]) -> int:
-        marker = self._assistant_marker
-        for i in range(len(input_ids) - len(marker), -1, -1):
-            if input_ids[i : i + len(marker)] == marker:
-                return i + len(marker)
-        return 0
-
-    def __call__(self, raw_batch: list[dict]) -> dict:
-        full_text_B: list[str] = []
-        # For video mode: list of frame lists; for image mode: flat list of all images
-        videos_B: list[list] = []
-        images_B: list[Image.Image] = []
-        video_meta_B: list[dict] = []
-
-        for item in raw_batch:
-            frames_np = item["frames"].numpy()  # (T, H, W, 3) uint8
-            frame_list = [Image.fromarray(frames_np[i]) for i in range(frames_np.shape[0])]
-            fps = item["fps"]
-            num_frames = item["num_frames"]
-            target = json.dumps(item["actions"], separators=(",", ":"))
-
-            prompt = build_prompt(fps, num_frames)
-            msgs = build_sft_messages(frame_list, prompt, target, fps, video_mode=self.video_mode)
-            text = self.processor.apply_chat_template(msgs, tokenize=False)
-            full_text_B.append(text)
-
-            if self.video_mode == "image":
-                images_B.extend(frame_list)
-            else:
-                videos_B.append(frame_list)
-                video_meta_B.append({
-                    "fps": float(fps),
-                    "total_num_frames": num_frames,
-                    "frames_indices": list(range(num_frames)),
-                })
-
-        # Single batched processor call for the entire batch
-        proc_kwargs: dict[str, Any] = {
-            "text": full_text_B,
-            "return_tensors": "pt",
-            "padding": True,
-        }
-        if self.video_mode == "image":
-            proc_kwargs["images"] = images_B
-        else:
-            proc_kwargs["videos"] = videos_B
-            proc_kwargs["video_metadata"] = video_meta_B
-
-        enc = self.processor(**proc_kwargs)
-
-        input_ids = enc["input_ids"]
-        if input_ids.shape[1] > self.max_length:
-            input_ids = input_ids[:, : self.max_length]
-
-        attn_mask = enc.get("attention_mask")
-        if attn_mask is not None:
-            if attn_mask.shape[1] > self.max_length:
-                attn_mask = attn_mask[:, : self.max_length]
-        else:
-            attn_mask = torch.ones_like(input_ids)
-
-        # Build labels: mask prompt tokens and padding
-        labels = input_ids.clone()
-        for b in range(len(raw_batch)):
-            prompt_len = self._find_prompt_len(input_ids[b].tolist())
-            labels[b, :prompt_len] = -100
-        labels[attn_mask == 0] = -100
-
-        result = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attn_mask,
-        }
-        if "mm_token_type_ids" in enc:
-            mm = enc["mm_token_type_ids"]
-            if mm.shape[1] > self.max_length:
-                mm = mm[:, : self.max_length]
-            result["mm_token_type_ids"] = mm
-        # Image mode uses pixel_values/image_grid_thw; video mode uses pixel_values_videos/video_grid_thw
-        for key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"):
-            if key in enc:
-                result[key] = enc[key]
-        return result
-
-
-class CollatorPrefetchIterator:
-    """Overlaps collator CPU work with GPU compute via a background thread.
-
-    While the GPU runs forward/backward on the current batch, the background
-    thread prepares the next batch (apply_chat_template + processor + labels).
-    CUDA ops release the GIL, so the collator thread runs during GPU work.
-    """
-
-    def __init__(self, dataloader_iter: Any, collator: VideoSFTCollator):
-        self._dl_iter = dataloader_iter
-        self._collator = collator
-        self._pool = ThreadPoolExecutor(max_workers=1)
-        self._next_fut: Future | None = None
-        self._closed = False
-        self._submit_next()
-
-    def _process_one(self) -> dict:
-        raw_batch = next(self._dl_iter)
-        return self._collator(raw_batch)
-
-    def _submit_next(self) -> None:
-        if self._closed:
-            return
-        self._next_fut = self._pool.submit(self._process_one)
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._pool.shutdown(wait=True, cancel_futures=False)
-        self._next_fut = None
-
-    def __iter__(self) -> CollatorPrefetchIterator:
-        return self
-
-    def __next__(self) -> dict:
-        if self._next_fut is None:
-            raise StopIteration
-        try:
-            batch = self._next_fut.result()
-        except StopIteration:
-            self.close()
-            raise
-        except Exception:
-            self.close()
-            raise
-        self._submit_next()
-        return batch
-
-
 # ---------------------------------------------------------------------------
 # Training utilities
 # ---------------------------------------------------------------------------
+
 
 def causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     shift_logits = logits[:, :-1, :].contiguous()
@@ -496,7 +506,9 @@ def causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return (loss * valid).sum() / valid.sum().clamp(min=1)
 
 
-def lr_at_step(step: int, warmup: int, max_steps: int, decay_steps: int, peak_lr: float) -> float:
+def lr_at_step(
+    step: int, warmup: int, max_steps: int, decay_steps: int, peak_lr: float
+) -> float:
     """WSD schedule: warmup → stable → decay."""
     if step < warmup:
         return peak_lr * step / max(warmup, 1)
@@ -519,6 +531,7 @@ def seed_all(seed: int, rank: int = 0) -> None:
 # Args
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Args:
     model_id: str = "Qwen/Qwen3-VL-2B-Instruct"
@@ -526,8 +539,15 @@ class Args:
     data_dir: str = ""
     val_dir: str = ""
     max_length: int = 8192
-    max_pixels: int = 200704  # 256 * 28 * 28 — tokens per image, controls resolution sent to model
-    video_mode: str = "image"  # "image" = frames as separate images (fast, per-frame ViT); "video" = single video (slow, global ViT attention)
+    max_pixels: int = (
+        200704  # 256 * 28 * 28 — tokens per image, controls resolution sent to model
+    )
+    video_mode: str = (
+        "image"  # "image" = frames as separate images (fast, per-frame ViT); "video" = single video (slow, global ViT attention)
+    )
+    interleave_labels: bool = (
+        False  # Insert "Frame F00:", "Frame F01:", ... text before each image
+    )
     batch_size: int = 1
     grad_accum: int = 4
     max_grad_norm: float = 1.0
@@ -541,12 +561,24 @@ class Args:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    train_vision: bool = (
+        False  # Apply LoRA to ViT layers too (qkv, attn.proj, linear_fc1/fc2)
+    )
+    vision_lr_scale: float = (
+        0.1  # LR multiplier for ViT params when doing full fine-tune
+    )
     save_every: int = 500
     val_every: int = 200
     val_steps: int = 20
+    eval_clips_dir: str = (
+        ""  # Path to eval clips (mp4+json pairs). If set, runs real eval with proper scoring.
+    )
+    eval_coalesce: bool = True  # Match training data format in eval scoring
+    eval_tolerance: int = 2
     log_every: int = 10
     out_dir: str = "./runs/default"
     resume_from: str = ""
+    run_id: str = ""  # Unique run ID for wandb (e.g. SLURM_JOB_ID)
     wandb_enable: bool = True
     wandb_project: str = "idm"
     wandb_entity: str = ""
@@ -559,16 +591,18 @@ class Args:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     args = tyro.cli(Args)
-    assert args.data_dir, "--data-dir is required"
+    if not args.data_dir:
+        raise ValueError("--data-dir is required")
 
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     if world_size > 1:
-        dist.init_process_group("nccl")
+        dist.init_process_group("nccl", timeout=timedelta(minutes=30))
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     seed_all(args.seed, rank)
@@ -588,6 +622,19 @@ def main() -> None:
     model.model.visual.patch_embed = torch.compile(model.model.visual.patch_embed)
 
     if args.use_lora:
+        # LLM targets (always)
+        lora_targets = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "up_proj",
+            "down_proj",
+            "gate_proj",
+        ]
+        if args.train_vision:
+            # Add ViT attention + MLP layers (Qwen3-VL uses fused QKV, not separate q/k/v)
+            lora_targets.extend(["qkv", "attn.proj", "linear_fc1", "linear_fc2"])
         model = get_peft_model(
             model,
             LoraConfig(
@@ -595,9 +642,13 @@ def main() -> None:
                 lora_alpha=args.lora_alpha,
                 lora_dropout=args.lora_dropout,
                 bias="none",
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
+                target_modules=lora_targets,
             ),
         )
+    else:
+        # Full fine-tune: ensure all params are trainable
+        for p in model.parameters():
+            p.requires_grad = True
     model = model.to(device)
 
     trainable_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -605,11 +656,19 @@ def main() -> None:
 
     # MFU setup: detect H100 peak flops
     device_name = torch.cuda.get_device_name(local_rank).lower()
-    peak_flops = 989e12 if "h100" in device_name and "pcie" not in device_name else (
-        756e12 if "h100" in device_name else 312e12 if "a100" in device_name else 0.0)
+    if ("h100" in device_name or "gh200" in device_name) and "pcie" not in device_name:
+        peak_flops = 989e12
+    elif "h100" in device_name:
+        peak_flops = 756e12
+    elif "a100" in device_name:
+        peak_flops = 312e12
+    else:
+        peak_flops = 0.0
 
     if rank == 0:
-        print(f"Params: {trainable_n:,} trainable / {total_n:,} total ({trainable_n/total_n:.4%})")
+        print(
+            f"Params: {trainable_n:,} trainable / {total_n:,} total ({trainable_n/total_n:.4%})"
+        )
         if peak_flops > 0:
             print(f"MFU enabled: peak_flops={peak_flops:.0e} ({device_name})")
 
@@ -620,31 +679,51 @@ def main() -> None:
     raw_model = ddp_model.module if hasattr(ddp_model, "module") else ddp_model
 
     processor = AutoProcessor.from_pretrained(
-        args.model_id, trust_remote_code=True,
-        min_pixels=args.max_pixels, max_pixels=args.max_pixels,
+        args.model_id,
+        trust_remote_code=True,
+        min_pixels=3136,
+        max_pixels=args.max_pixels,  # min=4*28*28, let processor choose grid
     )
     if args.video_mode == "video" and hasattr(processor, "video_processor"):
         # Disable frame sampling so all frames are processed by the ViT.
         # WARNING: this triggers O(N²) global attention over all patches — very slow for many frames.
         processor.video_processor.do_sample_frames = False
 
-    # Data — workers only load JPEGs; processing is batched in collator thread
+    # Data
     data_root = Path(args.data_dir)
     train_jsonl = data_root / "train" / "train.jsonl"
-    assert train_jsonl.exists(), f"Missing {train_jsonl}"
-    train_dataset = RawClipDataset(str(train_jsonl), str(data_root))
-    collator = VideoSFTCollator(processor, args.max_length, video_mode=args.video_mode)
+    if not train_jsonl.exists():
+        raise FileNotFoundError(f"Train JSONL not found: {train_jsonl}")
+
+    train_dataset = ProcessedClipDataset(
+        str(train_jsonl),
+        str(data_root),
+        args.model_id,
+        args.max_pixels,
+        args.max_length,
+        args.video_mode,
+        args.interleave_labels,
+    )
     if rank == 0:
         print(f"Train: {len(train_dataset)} clips")
 
     val_dataset = None
     if args.val_dir:
-        val_root = Path(args.val_dir)
-        val_jsonl = val_root / "val" / "val.jsonl"
-        if val_jsonl.exists():
-            val_dataset = ClipDataset(str(val_jsonl), str(val_root), processor, args.max_length)
-            if rank == 0:
-                print(f"Val: {len(val_dataset)} clips")
+        val_jsonl = Path(args.val_dir) / "val" / "val.jsonl"
+        if not val_jsonl.exists():
+            raise FileNotFoundError(f"Val JSONL not found: {val_jsonl}")
+        val_dataset = ClipDataset(
+            str(val_jsonl), str(Path(args.val_dir)), processor, args.max_length
+        )
+        if rank == 0:
+            print(f"Val: {len(val_dataset)} clips")
+
+    # Load real eval clips (mp4+json) if configured
+    eval_clips = []
+    if args.eval_clips_dir:
+        eval_clips = discover_eval_clips(args.eval_clips_dir)
+        if rank == 0:
+            print(f"Eval clips: {len(eval_clips)} (from {args.eval_clips_dir})")
 
     pad_id = processor.tokenizer.pad_token_id or 0
 
@@ -654,35 +733,62 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=num_dl_workers,
-        collate_fn=lambda batch: batch,  # identity: return list of raw items
+        collate_fn=lambda batch: collate_processed(batch, pad_id),
         drop_last=True,
-        pin_memory=False,  # raw uint8 frames, not model tensors
+        pin_memory=True,
         prefetch_factor=2,
         persistent_workers=True,
     )
     if rank == 0:
-        print(f"DataLoader: {num_dl_workers} workers + prefetch collator thread")
+        print(f"DataLoader: {num_dl_workers} workers (pin_memory)")
 
-    # Optimizer + scheduler
-    optimizer = torch.optim.AdamW(
-        [p for p in ddp_model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    # Optimizer + scheduler — use separate param group for ViT with lower LR in full-FT mode
+    if not args.use_lora and args.vision_lr_scale != 1.0:
+        vision_params = []
+        other_params = []
+        for name, p in ddp_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "visual" in name:
+                vision_params.append(p)
+            else:
+                other_params.append(p)
+        param_groups = [
+            {"params": other_params, "lr": args.lr},
+            {"params": vision_params, "lr": args.lr * args.vision_lr_scale},
+        ]
+        if rank == 0:
+            print(
+                f"Param groups: LLM={len(other_params)} params @ lr={args.lr}, "
+                f"ViT={len(vision_params)} params @ lr={args.lr * args.vision_lr_scale}"
+            )
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(
+            [p for p in ddp_model.parameters() if p.requires_grad],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=lambda step: lr_at_step(step, args.warmup_steps, args.max_steps, args.wsd_decay_steps, args.lr) / max(args.lr, 1e-12),
+        lr_lambda=lambda step: lr_at_step(
+            step, args.warmup_steps, args.max_steps, args.wsd_decay_steps, args.lr
+        )
+        / max(args.lr, 1e-12),
     )
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Wandb
+    # Wandb — use run_id so evals can log to the same run
     wandb_run = None
+    wandb_id = f"train-{args.run_id}" if args.run_id else None
     if rank == 0 and args.wandb_enable:
         wandb_run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity or None,
             name=args.wandb_run_name or None,
+            id=wandb_id,
+            resume="allow",
             mode=args.wandb_mode,
             dir=args.out_dir,
             config=asdict(args),
@@ -693,7 +799,9 @@ def main() -> None:
     if args.resume_from:
         ckpt_path = Path(args.resume_from)
         if ckpt_path.exists():
-            ckpt = torch.load(ckpt_path / "checkpoint.pt", map_location=device, weights_only=False)
+            ckpt = torch.load(
+                ckpt_path / "checkpoint.pt", map_location=device, weights_only=False
+            )
             raw_model.load_state_dict(ckpt["model_state_dict"])
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -709,29 +817,33 @@ def main() -> None:
     log_tok_n = 0
     t0 = time.time()
 
-    # Prefetch iterator: collator runs on background thread while GPU computes
-    dl_iter = iter(train_loader)
-    prefetch_iter = CollatorPrefetchIterator(dl_iter, collator)
+    # Data iteration setup
+    data_iter = iter(train_loader)
 
     if rank == 0:
-        print(f"Starting training: {args.max_steps} steps, batch={args.batch_size}, grad_accum={args.grad_accum}")
+        print(
+            f"Starting training: {args.max_steps} steps, batch={args.batch_size}, grad_accum={args.grad_accum}"
+        )
 
     while global_step < args.max_steps:
         ddp_model.train()
 
-        # Get next batch (already processed by prefetch thread)
+        # Get next batch
         try:
-            batch = next(prefetch_iter)
+            batch = next(data_iter)
         except StopIteration:
-            dl_iter = iter(train_loader)
-            prefetch_iter = CollatorPrefetchIterator(dl_iter, collator)
-            batch = next(prefetch_iter)
+            data_iter = iter(train_loader)
+            batch = next(data_iter)
 
         # Move to device
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
         for key in ("pixel_values", "pixel_values_videos"):
             if key in batch:
                 model_inputs[key] = batch[key].to(device, dtype=dtype)
@@ -746,7 +858,7 @@ def main() -> None:
         loss.backward()
         micro_step += 1
 
-        tok_n = int((labels != -100).sum().item())
+        tok_n = int(attention_mask.sum().item())
         log_loss_sum += float(loss.detach().item()) * args.grad_accum
         log_loss_n += 1
         log_tok_n += tok_n
@@ -776,44 +888,262 @@ def main() -> None:
             # MFU: approx 6 * N * tokens_per_s / peak_flops (forward + backward)
             mfu = (6 * total_n * tps / peak_flops) if peak_flops > 0 else 0.0
             mfu_str = f" mfu={mfu:.4f}" if peak_flops > 0 else ""
-            print(f"step={global_step} loss={avg_loss:.4f} lr={lr_val:.2e} tok/s={tps:.0f} samples/s={samples_per_s:.2f}{mfu_str}")
+            print(
+                f"step={global_step} loss={avg_loss:.4f} lr={lr_val:.2e} tok/s={tps:.0f} samples/s={samples_per_s:.2f}{mfu_str}"
+            )
             if wandb_run:
-                log_d = {"train/loss": avg_loss, "train/lr": lr_val, "train/tok_per_s": tps, "train/samples_per_s": samples_per_s}
+                log_d = {
+                    "step": global_step,
+                    "train/loss": avg_loss,
+                    "train/lr": lr_val,
+                    "train/tok_per_s": tps,
+                    "train/samples_per_s": samples_per_s,
+                }
                 if peak_flops > 0:
                     log_d["train/mfu"] = mfu
-                wandb_run.log(log_d, step=global_step)
+                wandb_run.log(log_d)
             log_loss_sum = 0.0
             log_loss_n = 0
             log_tok_n = 0
             t0 = time.time()
 
-        # Validation
-        if args.val_every > 0 and global_step % args.val_every == 0 and val_dataset and rank == 0:
-            val_metrics = run_validation(raw_model, processor, val_dataset, args, device, dtype, pad_id)
-            print(f"  val: loss={val_metrics['loss']:.4f} f1={val_metrics['f1']:.3f} "
-                  f"p={val_metrics['precision']:.3f} r={val_metrics['recall']:.3f}")
+        # Validation + eval + save — all rank-0-only, so barrier first to prevent NCCL timeout
+        is_val_step = args.val_every > 0 and global_step % args.val_every == 0
+        is_save_step = args.save_every > 0 and global_step % args.save_every == 0
+        if (is_val_step or is_save_step) and world_size > 1:
+            dist.barrier()  # all ranks wait here before rank 0 does slow eval/save
+
+        # Validation (on training val split)
+        if is_val_step and val_dataset and rank == 0:
+            val_metrics = run_validation(
+                raw_model, processor, val_dataset, args, device, dtype, pad_id
+            )
+            print(
+                f"  val: loss={val_metrics['loss']:.4f} f1={val_metrics['f1']:.3f} "
+                f"p={val_metrics['precision']:.3f} r={val_metrics['recall']:.3f}"
+            )
             if wandb_run:
-                wandb_run.log({f"val/{k}": v for k, v in val_metrics.items()}, step=global_step)
+                val_log = {f"val/{k}": v for k, v in val_metrics.items()}
+                val_log["step"] = global_step
+                wandb_run.log(val_log)
+
+        # Real eval on mp4 clips — distributed across all ranks for speed
+        if is_val_step and eval_clips:
+            # Each rank handles a shard of clips
+            my_clips = eval_clips[rank::world_size] if world_size > 1 else eval_clips
+            local_metrics = run_real_eval(
+                raw_model, processor, my_clips, args, device, dtype
+            )
+
+            # All-reduce TP/FP/FN across ranks
+            if world_size > 1:
+                counts = torch.tensor(
+                    [
+                        local_metrics["eval/tp"],
+                        local_metrics["eval/fp"],
+                        local_metrics["eval/fn"],
+                    ],
+                    device=device,
+                    dtype=torch.long,
+                )
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                tp, fp, fn = counts.tolist()
+            else:
+                tp = local_metrics["eval/tp"]
+                fp = local_metrics["eval/fp"]
+                fn = local_metrics["eval/fn"]
+
+            if rank == 0:
+                p = tp / max(tp + fp, 1)
+                r_val = tp / max(tp + fn, 1)
+                f1 = 2 * p * r_val / max(p + r_val, 1e-9)
+                print(
+                    f"  EVAL: f1={f1:.3f} p={p:.3f} r={r_val:.3f} (TP={tp} FP={fp} FN={fn})"
+                )
+                if wandb_run:
+                    wandb_run.log(
+                        {
+                            "step": global_step,
+                            "eval/f1": f1,
+                            "eval/precision": p,
+                            "eval/recall": r_val,
+                            "eval/tp": tp,
+                            "eval/fp": fp,
+                            "eval/fn": fn,
+                        }
+                    )
+
+        # Wait for rank 0 to finish eval before all ranks proceed
+        if (is_val_step or is_save_step) and world_size > 1:
+            dist.barrier()
 
         # Save checkpoint
-        if args.save_every > 0 and global_step % args.save_every == 0 and rank == 0:
+        if is_save_step and rank == 0:
             save_dir = Path(args.out_dir) / f"step_{global_step}"
             save_dir.mkdir(parents=True, exist_ok=True)
-            torch.save({
-                "global_step": global_step,
-                "model_state_dict": raw_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-            }, save_dir / "checkpoint.pt")
+            torch.save(
+                {
+                    "global_step": global_step,
+                    "model_state_dict": raw_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                },
+                save_dir / "checkpoint.pt",
+            )
             print(f"  saved checkpoint to {save_dir}")
 
-    prefetch_iter.close()
     if rank == 0:
         print("Training complete.")
     if wandb_run:
         wandb_run.finish()
     if world_size > 1:
         dist.destroy_process_group()
+
+
+def discover_eval_clips(clips_dir: str) -> list[dict]:
+    """Find all clip mp4/json pairs under clips_dir (same as eval pipeline)."""
+    clips = []
+    for json_path in sorted(Path(clips_dir).rglob("clip_*.json")):
+        mp4_path = json_path.with_suffix(".mp4")
+        if not mp4_path.exists():
+            continue
+        with open(json_path) as f:
+            meta = json.load(f)
+        clips.append(
+            {
+                "mp4_path": str(mp4_path),
+                "clip_name": json_path.stem,
+                "start_s": meta["start_s"],
+                "end_s": meta["end_s"],
+                "tag": meta["tag"],
+                "actions": meta["actions"],
+            }
+        )
+    return clips
+
+
+def extract_frames_for_eval(mp4_path: str, fps: int) -> list[Image.Image]:
+    """Extract frames from mp4 at given fps, return as PIL Images."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pattern = os.path.join(tmpdir, "frame_%04d.png")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i",
+                mp4_path,
+                "-vf",
+                f"fps={fps}",
+                pattern,
+                "-y",
+                "-loglevel",
+                "error",
+            ],
+            check=True,
+        )
+        frame_paths = sorted(glob.glob(os.path.join(tmpdir, "frame_*.png")))
+        return [Image.open(p).convert("RGB") for p in frame_paths]
+
+
+def run_real_eval(
+    model: torch.nn.Module,
+    processor: Any,
+    eval_clips: list[dict],
+    args: Args,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, float]:
+    """Run eval on real mp4 clips with proper scoring (coalesce, detail matching).
+
+    Uses the same frame processing and prompt as training, ensuring config match.
+    """
+    model.eval()
+    # Use the same FPS as training data (read from first training clip)
+    data_root = Path(args.data_dir)
+    train_jsonl = data_root / "train" / "train.jsonl"
+    with open(train_jsonl) as f:
+        first_clip = json.loads(f.readline())
+    fps = first_clip.get("fps", 5)
+    tp_total, fp_total, fn_total = 0, 0, 0
+
+    with torch.no_grad():
+        for i, clip in enumerate(eval_clips):
+            try:
+                frames = extract_frames_for_eval(clip["mp4_path"], fps)
+                if not frames:
+                    continue
+
+                prompt = build_prompt(fps, len(frames))
+
+                # Build messages matching training format exactly
+                if args.interleave_labels:
+                    content = []
+                    for j, f in enumerate(frames):
+                        content.append({"type": "text", "text": f"Frame F{j:02d}:"})
+                        content.append({"type": "image", "image": f})
+                else:
+                    content = [{"type": "image", "image": f} for f in frames]
+                content.append({"type": "text", "text": prompt})
+                messages = [{"role": "user", "content": content}]
+
+                text = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                inputs = processor(
+                    text=[text], images=frames, return_tensors="pt", padding=True
+                )
+                inputs = {
+                    k: v.to(device) if hasattr(v, "to") else v
+                    for k, v in inputs.items()
+                }
+                if "pixel_values" in inputs:
+                    inputs["pixel_values"] = inputs["pixel_values"].to(dtype=dtype)
+                if "pixel_values_videos" in inputs:
+                    inputs["pixel_values_videos"] = inputs["pixel_values_videos"].to(
+                        dtype=dtype
+                    )
+
+                with torch.autocast("cuda", dtype=dtype):
+                    gen_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=1024,
+                        do_sample=False,
+                        use_cache=True,
+                    )
+                prompt_len = inputs["input_ids"].shape[1]
+                pred_text = processor.tokenizer.decode(
+                    gen_ids[0][prompt_len:], skip_special_tokens=True
+                )
+                predictions = parse_response(pred_text)
+
+                # Score with proper matching — filter_predictions handles format normalization
+                gt = filter_gt_actions(clip["actions"], clip["start_s"], fps)
+                if args.eval_coalesce:
+                    gt = coalesce_gt_events(gt)
+                preds_f = filter_predictions(predictions)
+                result = match_clip(gt, preds_f, tolerance=args.eval_tolerance)
+                tp_total += len(result["matches"])
+                fp_total += len(result["unmatched_preds"])
+                fn_total += len(result["unmatched_gt"])
+
+            except Exception as e:
+                print(f"  eval clip {i} error: {e}")
+                continue
+
+            torch.cuda.empty_cache()
+
+    model.train()
+
+    p = tp_total / max(tp_total + fp_total, 1)
+    r = tp_total / max(tp_total + fn_total, 1)
+    f1 = 2 * p * r / max(p + r, 1e-9)
+    return {
+        "eval/f1": f1,
+        "eval/precision": p,
+        "eval/recall": r,
+        "eval/tp": tp_total,
+        "eval/fp": fp_total,
+        "eval/fn": fn_total,
+    }
 
 
 def run_validation(
@@ -833,22 +1163,30 @@ def run_validation(
 
     indices = list(range(len(val_dataset)))
     random.shuffle(indices)
-    indices = indices[:args.val_steps]
+    indices = indices[: args.val_steps]
 
     with torch.no_grad():
         for idx in indices:
             item = val_dataset[idx]
-            batch = collate_for_training([item], pad_id)
+            batch = collate_processed([item], pad_id)
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+            model_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
             if "pixel_values_videos" in batch:
-                model_inputs["pixel_values_videos"] = batch["pixel_values_videos"].to(device, dtype=dtype)
+                model_inputs["pixel_values_videos"] = batch["pixel_values_videos"].to(
+                    device, dtype=dtype
+                )
             if "video_grid_thw" in batch:
                 model_inputs["video_grid_thw"] = batch["video_grid_thw"].to(device)
             if "mm_token_type_ids" in batch:
-                model_inputs["mm_token_type_ids"] = batch["mm_token_type_ids"].to(device)
+                model_inputs["mm_token_type_ids"] = batch["mm_token_type_ids"].to(
+                    device
+                )
 
             with torch.autocast("cuda", dtype=dtype):
                 outputs = model(**model_inputs)
@@ -861,11 +1199,15 @@ def run_validation(
             gen_attn = batch["attention_mask"][:, prompt_mask].contiguous().to(device)
             gen_inputs = {"input_ids": gen_input_ids, "attention_mask": gen_attn}
             if "pixel_values_videos" in batch:
-                gen_inputs["pixel_values_videos"] = batch["pixel_values_videos"].to(device, dtype=dtype)
+                gen_inputs["pixel_values_videos"] = batch["pixel_values_videos"].to(
+                    device, dtype=dtype
+                )
             if "video_grid_thw" in batch:
                 gen_inputs["video_grid_thw"] = batch["video_grid_thw"].to(device)
             if "mm_token_type_ids" in batch:
-                gen_inputs["mm_token_type_ids"] = batch["mm_token_type_ids"][:, prompt_mask].contiguous().to(device)
+                gen_inputs["mm_token_type_ids"] = (
+                    batch["mm_token_type_ids"][:, prompt_mask].contiguous().to(device)
+                )
 
             with torch.autocast("cuda", dtype=dtype):
                 gen_ids = model.generate(
@@ -876,7 +1218,9 @@ def run_validation(
                 )
             # Decode only generated tokens
             prompt_len = gen_inputs["input_ids"].shape[1]
-            pred_text = processor.tokenizer.decode(gen_ids[0][prompt_len:], skip_special_tokens=True)
+            pred_text = processor.tokenizer.decode(
+                gen_ids[0][prompt_len:], skip_special_tokens=True
+            )
             predictions = parse_response(pred_text)
             p, r, f1 = compute_f1(predictions, item["actions"])
             all_p.append(p)

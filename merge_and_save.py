@@ -12,10 +12,19 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", default="Qwen/Qwen3-VL-2B-Instruct")
-    parser.add_argument("--checkpoint", required=True, help="Path to step_N/checkpoint.pt")
-    parser.add_argument("--output-dir", required=True, help="Where to save merged model")
+    parser.add_argument(
+        "--checkpoint", required=True, help="Path to step_N/checkpoint.pt"
+    )
+    parser.add_argument(
+        "--output-dir", required=True, help="Where to save merged model"
+    )
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument(
+        "--train-vision",
+        action="store_true",
+        help="Include ViT LoRA targets (qkv, attn.proj, linear_fc1, linear_fc2)",
+    )
     args = parser.parse_args()
 
     print(f"Loading base model {args.model_id}...")
@@ -24,7 +33,19 @@ def main():
     )
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
 
-    print("Applying LoRA config...")
+    lora_targets = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "up_proj",
+        "down_proj",
+        "gate_proj",
+    ]
+    if args.train_vision:
+        lora_targets.extend(["qkv", "attn.proj", "linear_fc1", "linear_fc2"])
+
+    print(f"Applying LoRA config (targets={lora_targets})...")
     model = get_peft_model(
         model,
         LoraConfig(
@@ -32,7 +53,7 @@ def main():
             lora_alpha=args.lora_alpha,
             lora_dropout=0.0,
             bias="none",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
+            target_modules=lora_targets,
         ),
     )
 
