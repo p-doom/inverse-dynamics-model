@@ -1,6 +1,6 @@
 """Tests for bipartite matching F1 computation."""
 
-from train import compute_f1
+from eval import compute_f1
 
 
 class TestComputeF1:

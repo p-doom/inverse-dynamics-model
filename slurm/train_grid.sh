@@ -64,7 +64,7 @@ torchrun --nnodes=1 --nproc_per_node=4 --rdzv_id=$SLURM_JOB_ID --rdzv_backend=c1
     --lr ${LR} --warmup-steps 100 --wsd-decay-steps 300 \
     --weight-decay 0.01 --max-grad-norm 1.0 \
     ${LORA_FLAGS:---use-lora --train-vision --lora-r ${LORA_R:-16} --lora-alpha ${LORA_ALPHA:-32} --lora-dropout 0.05} \
-    --save-every 400 --val-every 400 --val-steps 20 --log-every 10 \
+    --save-every ${SAVE_EVERY:-400} --val-every ${VAL_EVERY:-400} --val-steps 20 --log-every 10 \
     --eval-clips-dir /fast/project/HFMI_SynergyUnit/p-doom/idm/val-set \
     ${EVAL_COALESCE_FLAG} \
     --eval-tolerance ${EVAL_TOLERANCE:-2} \

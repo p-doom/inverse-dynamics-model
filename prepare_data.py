@@ -194,7 +194,7 @@ def parse_keylog_events(entries: list, fps: int, num_frames: int) -> list[dict]:
                 )
 
     # Close unclosed spans at end of clip
-    for detail, start in held_keys.items():
+    for key, (start, detail) in held_keys.items():
         key_spans.append((start, num_frames - 1, detail))
     for button, start in held_buttons.items():
         button_spans.append((start, num_frames - 1, button))

@@ -3,7 +3,7 @@
 import json
 import re
 
-from train import build_prompt, build_sft_messages, build_prompt_only_messages
+from data import build_prompt, build_sft_messages
 
 
 class TestBuildPrompt:
@@ -42,6 +42,7 @@ class TestBuildPrompt:
 class TestBuildSftMessages:
     def test_structure(self):
         from PIL import Image
+
         frames = [Image.new("RGB", (64, 64), color="red")]
         msgs = build_sft_messages(frames, "test prompt", "test target", fps=10.0)
         assert len(msgs) == 2
@@ -50,6 +51,7 @@ class TestBuildSftMessages:
 
     def test_user_message_has_video_and_text(self):
         from PIL import Image
+
         frames = [Image.new("RGB", (64, 64)) for _ in range(3)]
         msgs = build_sft_messages(frames, "hello", "world", fps=10.0)
         user_content = msgs[0]["content"]
@@ -61,16 +63,8 @@ class TestBuildSftMessages:
 
     def test_assistant_message_has_target(self):
         from PIL import Image
+
         frames = [Image.new("RGB", (64, 64))]
         target = json.dumps([{"frame": "F03", "type": "KeyPress", "details": "A"}])
         msgs = build_sft_messages(frames, "prompt", target, fps=10.0)
         assert msgs[1]["content"][0]["text"] == target
-
-
-class TestBuildPromptOnlyMessages:
-    def test_no_assistant(self):
-        from PIL import Image
-        frames = [Image.new("RGB", (64, 64))]
-        msgs = build_prompt_only_messages(frames, "test", fps=10.0)
-        assert len(msgs) == 1
-        assert msgs[0]["role"] == "user"
