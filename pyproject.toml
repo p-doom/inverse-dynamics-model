@@ -23,6 +23,9 @@ dev = ["pytest"]
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch"]
 
+[tool.setuptools.packages.find]
+include = []
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
