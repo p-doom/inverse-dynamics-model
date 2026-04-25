@@ -241,10 +241,10 @@ def filter_gt_actions(
             result.append({"frame": f, "type": "KeyPress", "detail": detail})
 
     for start, end, button in button_spans:
-        for f in range(start, max(end, start + 1)):
-            if num_frames and f >= num_frames:
-                break
-            result.append({"frame": f, "type": "MouseClick", "detail": button})
+        # Emit only one MouseClick at the press frame (not per-frame for drags)
+        if num_frames and start >= num_frames:
+            continue
+        result.append({"frame": start, "type": "MouseClick", "detail": button})
 
     result.extend(scroll_events)
     result.sort(key=lambda x: (x["frame"], x["type"]))
@@ -252,44 +252,70 @@ def filter_gt_actions(
 
 
 def coalesce_gt_events(gt_actions: list[dict], gap: int = 1) -> list[dict]:
-    """Coalesce consecutive MouseScroll events into gesture-level events.
+    """Coalesce consecutive MouseScroll and MouseClick events into gesture-level events.
 
     Groups scrolls on consecutive frames (within `gap` frames) into single events.
-    Splits on direction reversal. Leaves KeyPress and MouseClick untouched.
+    Splits on direction reversal. Groups clicks on consecutive frames (within `gap`
+    frames) of the same button into single events. Leaves KeyPress untouched.
     """
     scrolls = [a for a in gt_actions if a["type"] == "MouseScroll"]
-    others = [a for a in gt_actions if a["type"] != "MouseScroll"]
+    clicks = [a for a in gt_actions if a["type"] == "MouseClick"]
+    others = [a for a in gt_actions if a["type"] not in ("MouseScroll", "MouseClick")]
 
-    if not scrolls:
-        return gt_actions
+    # --- Coalesce scrolls ---
+    coalesced_scrolls = []
+    if scrolls:
+        scrolls.sort(key=lambda x: x["frame"])
+        gestures = []
+        current_gesture = [scrolls[0]]
 
-    scrolls.sort(key=lambda x: x["frame"])
+        for s in scrolls[1:]:
+            prev = current_gesture[-1]
+            frame_gap = s["frame"] - prev["frame"]
+            direction_flip = s.get("detail", "") != prev.get("detail", "")
 
-    gestures = []
-    current_gesture = [scrolls[0]]
+            if frame_gap <= gap and not direction_flip:
+                current_gesture.append(s)
+            else:
+                gestures.append(current_gesture)
+                current_gesture = [s]
+        gestures.append(current_gesture)
 
-    for s in scrolls[1:]:
-        prev = current_gesture[-1]
-        frame_gap = s["frame"] - prev["frame"]
-        direction_flip = s.get("detail", "") != prev.get("detail", "")
+        for gesture in gestures:
+            direction = gesture[0].get("detail", "")
+            if not direction:
+                continue
+            coalesced_scrolls.append(
+                {
+                    "frame": gesture[0]["frame"],
+                    "type": "MouseScroll",
+                    "detail": direction,
+                }
+            )
 
-        if frame_gap <= gap and not direction_flip:
-            current_gesture.append(s)
-        else:
-            gestures.append(current_gesture)
-            current_gesture = [s]
-    gestures.append(current_gesture)
+    # --- Coalesce clicks ---
+    coalesced_clicks = []
+    if clicks:
+        clicks.sort(key=lambda x: x["frame"])
+        gestures = []
+        current_gesture = [clicks[0]]
 
-    coalesced = []
-    for gesture in gestures:
-        direction = gesture[0].get("detail", "")
-        if not direction:
-            continue
-        coalesced.append(
-            {"frame": gesture[0]["frame"], "type": "MouseScroll", "detail": direction}
-        )
+        for c in clicks[1:]:
+            prev = current_gesture[-1]
+            frame_gap = c["frame"] - prev["frame"]
+            button_change = c.get("detail", "") != prev.get("detail", "")
 
-    result = others + coalesced
+            if frame_gap <= gap and not button_change:
+                current_gesture.append(c)
+            else:
+                gestures.append(current_gesture)
+                current_gesture = [c]
+        gestures.append(current_gesture)
+
+        for gesture in gestures:
+            coalesced_clicks.append(gesture[0])
+
+    result = others + coalesced_scrolls + coalesced_clicks
     result.sort(key=lambda x: (x["frame"], x["type"]))
     return result
 
@@ -910,6 +936,12 @@ def main():
         action="store_true",
         help="Enable thinking mode (Qwen3 via sglang)",
     )
+    parser.add_argument(
+        "--max-resolution",
+        type=int,
+        default=None,
+        help="Downscale frames so longest edge is at most this many pixels",
+    )
     # Re-score mode
     parser.add_argument("--rescore", help="Path to existing results JSON to re-score")
     # Scoring settings
@@ -983,6 +1015,19 @@ def main():
         if not frames:
             print(" no frames, skipping")
             continue
+        if args.max_resolution:
+            from PIL import Image as _PILImage
+
+            resized = []
+            for fr in frames:
+                max_edge = max(fr.size)
+                if max_edge > args.max_resolution:
+                    scale = args.max_resolution / max_edge
+                    new_size = (int(fr.width * scale), int(fr.height * scale))
+                    resized.append(fr.resize(new_size, _PILImage.LANCZOS))
+                else:
+                    resized.append(fr)
+            frames = resized
         frames = label_frames(frames)
         frame_b64s = encode_frames_base64(frames)
 

@@ -122,7 +122,7 @@ def parse_keylog_events(entries: list, fps: int, num_frames: int) -> list[dict]:
     held_buttons: dict[str, int] = {}  # button -> press_frame
     key_spans: list[tuple[int, int, str]] = []  # (start, end, detail)
     button_spans: list[tuple[int, int, str]] = []  # (start, end, button)
-    scroll_events: list[dict] = []
+    scroll_dy_per_frame: dict[int, float] = {}  # frame_idx -> accumulated dy
 
     def _release_all(frame: int) -> None:
         """Close all held key/button spans at the given frame."""
@@ -183,15 +183,17 @@ def parse_keylog_events(entries: list, fps: int, num_frames: int) -> list[dict]:
                 button_spans.append((held_buttons.pop(button), frame_idx, button))
 
         elif etype == "MouseScroll":
-            direction = _parse_scroll_direction(payload)
-            if direction:
-                scroll_events.append(
-                    {
-                        "frame_idx": frame_idx,
-                        "type": "MouseScroll",
-                        "details": direction,
-                    }
-                )
+            if isinstance(payload, list) and len(payload) >= 2:
+                try:
+                    dx, dy = float(payload[0]), float(payload[1])
+                except (TypeError, ValueError):
+                    dx, dy = 0.0, 0.0
+                # Use dy (vertical) if nonzero, else dx (horizontal)
+                delta = dy if dy != 0 else dx
+                if delta != 0:
+                    scroll_dy_per_frame[frame_idx] = (
+                        scroll_dy_per_frame.get(frame_idx, 0.0) + delta
+                    )
 
     # Close unclosed spans at end of clip
     for key, (start, detail) in held_keys.items():
@@ -208,13 +210,44 @@ def parse_keylog_events(entries: list, fps: int, num_frames: int) -> list[dict]:
             events.append({"frame_idx": f, "type": "KeyPress", "details": detail})
 
     for start, end, button in button_spans:
-        for f in range(start, max(end, start + 1)):
-            if f >= num_frames:
-                break
-            events.append({"frame_idx": f, "type": "MouseClick", "details": button})
+        # Emit only one MouseClick at the press frame (not per-frame for drags)
+        if start >= num_frames:
+            continue
+        events.append({"frame_idx": start, "type": "MouseClick", "details": button})
 
-    events.extend(scroll_events)
-    events.sort(key=lambda x: (x["frame_idx"], x["type"], x["details"]))
+    # Emit scroll events: group consecutive frames into gestures, net dy per gesture
+    scroll_frames = sorted(scroll_dy_per_frame.keys())
+    if scroll_frames:
+        gesture_start = scroll_frames[0]
+        gesture_dy = scroll_dy_per_frame[scroll_frames[0]]
+        for k in range(1, len(scroll_frames)):
+            f_cur = scroll_frames[k]
+            if f_cur <= scroll_frames[k - 1] + 1:
+                # Consecutive frame — accumulate into gesture
+                gesture_dy += scroll_dy_per_frame[f_cur]
+            else:
+                # Gap — emit previous gesture and start new one
+                if gesture_dy != 0:
+                    events.append(
+                        {
+                            "frame_idx": gesture_start,
+                            "type": "MouseScroll",
+                            "details": "down" if gesture_dy < 0 else "up",
+                        }
+                    )
+                gesture_start = f_cur
+                gesture_dy = scroll_dy_per_frame[f_cur]
+        # Emit last gesture
+        if gesture_dy != 0:
+            events.append(
+                {
+                    "frame_idx": gesture_start,
+                    "type": "MouseScroll",
+                    "details": "down" if gesture_dy < 0 else "up",
+                }
+            )
+
+    events.sort(key=lambda x: (x["frame_idx"], x["type"]))
     return events
 
 

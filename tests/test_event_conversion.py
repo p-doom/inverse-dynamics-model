@@ -71,11 +71,12 @@ class TestParseKeylogEvents:
         assert events[0]["details"] == "Right"
 
     def test_mouse_drag_held(self):
-        # Press without release = held until end of clip
+        # Press without release = held until end of clip, but only one click emitted at press frame
         entries = [_make_entry(500_000, "MousePress", ["Right", 0.0, 0.0])]
         events = parse_keylog_events(entries, fps=10, num_frames=10)
-        assert len(events) == 4  # F05 through F08 (held to clip end - 1)
-        assert all(e["details"] == "Right" for e in events)
+        assert len(events) == 1  # Single click at the press frame (not per-frame)
+        assert events[0]["details"] == "Right"
+        assert events[0]["frame_idx"] == 5
 
     def test_mouse_scroll_horizontal(self):
         entries = [_make_entry(300_000, "MouseScroll", [-1, 0, 0, 0])]

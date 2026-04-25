@@ -12,46 +12,68 @@ from pathlib import Path
 
 
 def coalesce_actions(actions: list[dict], gap: int = 1) -> list[dict]:
-    """Coalesce consecutive MouseScroll events into gesture-level events.
+    """Coalesce consecutive MouseScroll and MouseClick events into gesture-level events.
 
     Matches the eval scorer's coalesce_gt_events exactly:
-    - Only MouseScroll is coalesced (consecutive frames, same direction)
-    - KeyPress and MouseClick are LEFT UNTOUCHED
-    - Splits on direction reversal
+    - MouseScroll is coalesced (consecutive frames, same direction; splits on direction reversal)
+    - MouseClick is coalesced (consecutive frames, same button)
+    - KeyPress is LEFT UNTOUCHED
     """
     if not actions:
         return actions
 
     scrolls = [a for a in actions if a["type"] == "MouseScroll"]
-    others = [a for a in actions if a["type"] != "MouseScroll"]
+    clicks = [a for a in actions if a["type"] == "MouseClick"]
+    others = [a for a in actions if a["type"] not in ("MouseScroll", "MouseClick")]
 
-    if not scrolls:
-        return actions
+    # --- Coalesce scrolls ---
+    coalesced_scrolls = []
+    if scrolls:
+        scrolls.sort(key=lambda x: int(x["frame"].replace("F", "")))
 
-    scrolls.sort(key=lambda x: int(x["frame"].replace("F", "")))
+        gestures = []
+        current = [scrolls[0]]
 
-    # Group into gestures
-    gestures = []
-    current = [scrolls[0]]
+        for s in scrolls[1:]:
+            prev = current[-1]
+            prev_f = int(prev["frame"].replace("F", ""))
+            curr_f = int(s["frame"].replace("F", ""))
+            direction_flip = s.get("details", "") != prev.get("details", "")
 
-    for s in scrolls[1:]:
-        prev = current[-1]
-        prev_f = int(prev["frame"].replace("F", ""))
-        curr_f = int(s["frame"].replace("F", ""))
-        direction_flip = s.get("details", "") != prev.get("details", "")
+            if (curr_f - prev_f) <= gap and not direction_flip:
+                current.append(s)
+            else:
+                gestures.append(current)
+                current = [s]
+        gestures.append(current)
 
-        if (curr_f - prev_f) <= gap and not direction_flip:
-            current.append(s)
-        else:
-            gestures.append(current)
-            current = [s]
-    gestures.append(current)
+        coalesced_scrolls = [g[0] for g in gestures]
 
-    # Keep only the first event from each gesture
-    coalesced_scrolls = [g[0] for g in gestures]
+    # --- Coalesce clicks ---
+    coalesced_clicks = []
+    if clicks:
+        clicks.sort(key=lambda x: int(x["frame"].replace("F", "")))
 
-    # Merge back with non-scroll events, sort by frame
-    result = others + coalesced_scrolls
+        gestures = []
+        current = [clicks[0]]
+
+        for c in clicks[1:]:
+            prev = current[-1]
+            prev_f = int(prev["frame"].replace("F", ""))
+            curr_f = int(c["frame"].replace("F", ""))
+            button_change = c.get("details", "") != prev.get("details", "")
+
+            if (curr_f - prev_f) <= gap and not button_change:
+                current.append(c)
+            else:
+                gestures.append(current)
+                current = [c]
+        gestures.append(current)
+
+        coalesced_clicks = [g[0] for g in gestures]
+
+    # Merge back, sort by frame
+    result = others + coalesced_scrolls + coalesced_clicks
     result.sort(key=lambda x: int(x["frame"].replace("F", "")))
     return result
 
