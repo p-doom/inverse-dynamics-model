@@ -14,10 +14,10 @@ dependencies = [
     "wandb",
     "msgpack",
     "ffmpeg-python",
-    "flash-attn>=2.5",
 ]
 
 [project.optional-dependencies]
+cuda = ["flash-attn>=2.5"]
 dev = ["pytest"]
 
 [tool.uv.extra-build-dependencies]
