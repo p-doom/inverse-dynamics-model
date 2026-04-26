@@ -1,55 +1,34 @@
 [project]
 name = "idm"
 version = "0.1.0"
-authors = [
-  { email = "nikolas.rieger@tum.de" },
-  { email = "franz@pdoom.org" },
-  { email = "alfred@pdoom.org" },
-  { email = "mihir@pdoom.org" },
-]
-requires-python = "==3.12.3"
+description = "Inverse Dynamics Model — sparse event SFT"
+requires-python = ">=3.11"
 dependencies = [
-  "array-record>=0.7.2",
-  "msgpack>=1.0.8",
-  "grain>=0.2.10",
-  "numpy",
-  "peft",
-  "pydantic==2.12.5",
-  "safetensors",
-  "torch==2.9.1",
-  "torchvision==0.24.1",
-  "transformers==4.57.1",
-  "tyro>=0.8.5",
-  "wandb",
-  "nvidia-cudnn-cu12==9.16.0.29; sys_platform == 'linux'",
-  "ffmpeg-python==0.2.0",
-  "sglang[all]==0.5.9",
+    "torch>=2.4,!=2.8.*",  # 2.8.x has cuDNN init issues on H100; 2.9.x needs torch.compile for Conv3d patch embed
+    "transformers>=4.45",
+    "peft>=0.13",
+    "safetensors",
+    "Pillow",
+    "tqdm",
+    "tyro",
+    "wandb",
+    "msgpack",
+    "ffmpeg-python",
 ]
 
 [project.optional-dependencies]
-dev = [
-  "pre-commit",
-  "pytest",
-]
+cuda = ["flash-attn>=2.5"]
+dev = ["pytest"]
 
-[dependency-groups]
-dev = [
-  "pre-commit",
-  "pytest",
-]
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
+
+[tool.setuptools.packages.find]
+include = []
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-include = ["idm*"]
-
-[tool.uv]
-default-groups = ["dev"]
-override-dependencies = [
-  "nvidia-cudnn-cu12==9.16.0.29; sys_platform == 'linux'",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
